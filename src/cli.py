@@ -1,0 +1,3034 @@
+"""Composition Root for MVP1 training pipeline."""
+
+# Р’С–РґРїРѕРІС–РґРЅРѕ РґРѕ:
+# - AGENT_GUIDE.MD -> СЂРѕР·РґС–Р» 2 (Clean Architecture, MVP1 scope) С– СЂРѕР·РґС–Р» 5 (РїРѕСЃР»С–РґРѕРІРЅС–СЃС‚СЊ РїРѕС‚РѕРєС–РІ)
+# - ARCHITECTURE_RULES.MD -> СЂРѕР·РґС–Р» 2-4 (Application orchestration С‡РµСЂРµР· РїРѕСЂС‚Рё)
+# - DATA_FLOWS_MVP1.MD -> СЂРѕР·РґС–Р» 3.1 (Training Pipeline)
+# - EVF_MVP1.MD -> СЂРѕР·РґС–Р» 3 (Strict Temporal Split) С– СЂРѕР·РґС–Р» 5 (MLflow tracking)
+
+from __future__ import annotations
+
+import argparse
+import gc
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import logging
+import random
+
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Sequence, Tuple
+
+import numpy as np
+import psutil
+import torch
+from torch_geometric.data import Data
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
+from src.adapters.ingestion.camunda_trace_adapter import CamundaTraceAdapter
+from src.adapters.ingestion.xes_adapter import XESAdapter
+from src.application.ports.xes_adapter_port import IXESAdapter
+from src.application.use_cases.topology_mask_uniform_evaluator import TopologyMaskUniformEvaluator
+from src.application.use_cases.trainer import ModelTrainer
+from src.domain.entities.raw_trace import RawTrace
+from src.domain.entities.feature_config import parse_feature_configs
+from src.domain.models.factory import create_model
+from src.domain.services.dynamic_graph_builder import DynamicGraphBuilder
+from src.domain.services.feature_encoder import FeatureEncoder
+from src.domain.services.prefix_policy import PrefixPolicy
+from src.domain.services.schema_resolver import SchemaResolver
+from src.domain.services.torch_serialization import load_trusted_torch_artifact
+from src.infrastructure.config.yaml_loader import load_yaml_with_includes
+from src.infrastructure.repositories.knowledge_graph_repository_factory import (
+    build_knowledge_graph_repository,
+    get_knowledge_graph_settings,
+)
+from src.infrastructure.tracking.mlflow_trace_recorder import MLflowTraceRecorder
+from src.infrastructure.tracking.mlflow_tracker import MLflowTracker
+from src.infrastructure.runtime.progress_events import ProgressReporter, emit_progress_event, progress_events_enabled
+
+GRAPH_DATASET_CACHE_SCHEMA = 8
+GRAPH_DATASET_CACHE_FORMAT_LEGACY = "list_v1"
+GRAPH_DATASET_CACHE_FORMAT_SHARDED = "sharded_v2"
+GRAPH_DATASET_SHARD_FORMAT_DEDUP_STRUCTURAL = "dedup_structural_payloads"
+DEFAULT_IMPULSE_STATE_CHANNELS = [
+    "is_last_event",
+    "prefix_executed_count_log1p",
+    "prefix_recency_norm",
+]
+TOPOLOGY_MASK_UNIFORM_MODE = "eval_topology_mask_uniform"
+CANONICAL_RS01_ADMISSIBILITY_POLICY = {
+    "source": "lifecycle_active_set",
+    "include_direct_successors": True,
+    "include_active_candidates": True,
+    "relaxed_lookback_events": 8,
+    "relaxed_max_depth": 1,
+    "relaxed_max_cardinality_ratio": 0.35,
+    "relaxed_suppress_completed": True,
+    "relaxed_anchor_policy": "open_successors",
+    "relaxed_loop_policy": "keep_direct_successor_repeats",
+}
+
+
+def _resolve_config_path(config_arg: str) -> Path:
+    """Resolve config path; if filename only, lookup in ./configs."""
+    path = Path(config_arg)
+    if path.exists():
+        return path
+
+    fallback = Path("configs") / config_arg
+    if fallback.exists():
+        return fallback
+
+    raise FileNotFoundError(f"Config file not found: {config_arg}")
+
+
+def load_yaml_config(config_arg: str) -> Dict[str, Any]:
+    """Load runtime configuration from YAML file with recursive include support."""
+    config_path = _resolve_config_path(config_arg)
+
+    # Р—Р°РІР°РЅС‚Р°Р¶СѓС”РјРѕ РєРѕРЅС„С–Рі С–Р· РїС–РґС‚СЂРёРјРєРѕСЋ include/deep-merge РґР»СЏ РјРѕРґСѓР»СЊРЅРёС… playbook-С–РІ.
+    loaded = load_yaml_with_includes(config_path)
+
+    # РќРѕСЂРјР°Р»С–Р·СѓС”РјРѕ СЃРµРєС†С–СЋ experiment РґР»СЏ РјР°Р№Р±СѓС‚РЅСЊРѕРіРѕ СЂРѕСѓС‚РёРЅРіСѓ СЂРµР¶РёРјС–РІ (train/eval/infer).
+    experiment_cfg = loaded.get("experiment")
+    if experiment_cfg is None:
+        loaded["experiment"] = {"mode": "train"}
+    elif isinstance(experiment_cfg, dict):
+        experiment_cfg.setdefault("mode", "train")
+    else:
+        raise ValueError("Config key 'experiment' must be a mapping if provided.")
+
+    return loaded
+
+
+def _flatten_config_dict(config: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    """Flatten nested config dict into dotted-key mapping."""
+    flat: Dict[str, Any] = {}
+    for key, value in config.items():
+        full_key = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flat.update(_flatten_config_dict(value, prefix=full_key))
+            continue
+        if isinstance(value, (list, tuple, set)):
+            flat[full_key] = ",".join(str(item) for item in value)
+            continue
+        flat[full_key] = "None" if value is None else value
+    return flat
+
+
+def _truncate_param_value(value: Any, max_len: int = 480) -> Any:
+    """Ensure MLflow param value stays within safe length limits."""
+    if isinstance(value, (int, float, bool)) and not isinstance(value, bool):
+        return value
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return f"{text[:max_len]}...[truncated]"
+
+
+def _iter_mlflow_param_blocks(config: Dict[str, Any]) -> Iterable[tuple[str, Any]]:
+    """Yield only config blocks that should be logged as params."""
+    if "seed" in config:
+        yield ("seed", config["seed"])
+    for section in ("experiment", "data", "model", "training"):
+        if section in config:
+            yield (section, config[section])
+
+
+def _build_mlflow_params(config: Dict[str, Any], max_value_len: int = 480) -> Dict[str, Any]:
+    """Build sanitized flattened params subset for MLflow logging."""
+    params: Dict[str, Any] = {}
+    for prefix, payload in _iter_mlflow_param_blocks(config):
+        if isinstance(payload, dict):
+            flat = _flatten_config_dict(payload, prefix=prefix)
+            for key, value in flat.items():
+                params[key] = _truncate_param_value(value, max_len=max_value_len)
+        else:
+            params[prefix] = _truncate_param_value(payload, max_len=max_value_len)
+    if _resolve_rs01_admissibility_policy(config) is not None:
+        params["rs01.audit_enabled"] = "true"
+    _apply_tracking_model_identity(params, config, max_value_len=max_value_len)
+    return params
+
+
+def _apply_tracking_model_identity(
+    params: Dict[str, Any],
+    config: Mapping[str, Any],
+    *,
+    max_value_len: int,
+) -> None:
+    model_cfg = config.get("model", {})
+    if not isinstance(model_cfg, Mapping):
+        model_cfg = {}
+    raw_model_type = str(model_cfg.get("type", model_cfg.get("model_type", params.get("model.type", "")))).strip()
+    if not raw_model_type:
+        return
+    tracking_model_type = _resolve_tracking_model_type(config)
+    params["model.type"] = _truncate_param_value(tracking_model_type, max_len=max_value_len)
+    params["model_type"] = _truncate_param_value(tracking_model_type, max_len=max_value_len)
+    if tracking_model_type != raw_model_type:
+        params["model.base_type"] = _truncate_param_value(raw_model_type, max_len=max_value_len)
+
+
+def _resolve_tracking_model_type(config: Mapping[str, Any]) -> str:
+    model_cfg = config.get("model", {})
+    training_cfg = config.get("training", {})
+    experiment_cfg = config.get("experiment", {})
+    if not isinstance(model_cfg, Mapping):
+        model_cfg = {}
+    if not isinstance(training_cfg, Mapping):
+        training_cfg = {}
+    if not isinstance(experiment_cfg, Mapping):
+        experiment_cfg = {}
+
+    model_type = str(model_cfg.get("type", model_cfg.get("model_type", "unknown_model"))).strip() or "unknown_model"
+    mask_guided_enabled = _as_bool(
+        training_cfg.get("mask_guided_enabled", experiment_cfg.get("mask_guided_enabled")),
+        default=False,
+    )
+    if model_type == "BaselineGATv2" and mask_guided_enabled:
+        return "BaselineGATv2Mask"
+    return model_type
+
+
+def _build_trace_recorder(
+    *,
+    tracking_cfg: Dict[str, Any],
+    run_id: str | None,
+    experiment_id: str | None,
+    output_dir: str | None,
+) -> MLflowTraceRecorder | None:
+    """Build optional structural trace recorder from tracking.tracing config."""
+    tracing_cfg = tracking_cfg.get("tracing", {}) if isinstance(tracking_cfg, dict) else {}
+    if not isinstance(tracing_cfg, dict):
+        return None
+    if not _as_bool(tracing_cfg.get("enabled"), default=False):
+        return None
+
+    fallback_dir: str | None = None
+    if _as_bool(tracing_cfg.get("log_json_artifact_fallback"), default=True):
+        fallback_dir = str(tracing_cfg.get("fallback_dir") or output_dir or Path("outputs") / "mlflow_trace_fallback")
+
+    return MLflowTraceRecorder(
+        enabled=True,
+        fallback_dir=fallback_dir,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        allow_nonzero_rank_fallback=_as_bool(
+            tracing_cfg.get("allow_nonzero_rank_fallback"),
+            default=False,
+        ),
+    )
+
+
+def _resolve_resume_mlflow_run_id(
+    *,
+    mode: str,
+    retrain: bool,
+    checkpoint_payload: Dict[str, Any] | None,
+    checkpoint_epoch: int,
+    target_epochs: int,
+    experiment_name: str,
+    run_name: str,
+    tracking_uri: str,
+) -> str | None:
+    """Resolve MLflow run id for resume-train scenarios; eval modes always start a new run."""
+    mode_key = str(mode).strip().lower()
+    if mode_key in {"eval_drift", "eval_drift_finetune", "eval_cross_dataset"}:
+        return None
+    if mode_key != "train" or bool(retrain):
+        return None
+    if checkpoint_payload is None:
+        return None
+    if int(checkpoint_epoch) >= int(target_epochs):
+        return None
+
+    embedded_run_id = str(checkpoint_payload.get("mlflow_run_id", "")).strip()
+    if embedded_run_id:
+        return embedded_run_id
+
+    try:
+        return MLflowTracker.find_latest_run_id(
+            experiment_name=str(experiment_name).strip(),
+            run_name=str(run_name).strip(),
+            tracking_uri=str(tracking_uri).strip() or None,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resolve_tracking_experiment_name(base_project: str, mode: str) -> str:
+    """Resolve MLflow experiment name without mutating base project name."""
+    base = str(base_project or "DefaultExperiment").strip() or "DefaultExperiment"
+    return base
+
+
+def _as_bool(raw: Any, *, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _resolve_rs01_admissibility_policy(config: Mapping[str, Any]) -> Dict[str, Any] | None:
+    """Return the single common-mask audit policy for evaluation modes."""
+    experiment_cfg = config.get("experiment", {})
+    if not isinstance(experiment_cfg, Mapping):
+        return None
+    if not _as_bool(experiment_cfg.get("rs01_enabled"), default=True):
+        return None
+    mode = str(experiment_cfg.get("mode", "train")).strip().lower()
+    if not mode.startswith("eval_"):
+        return None
+    return dict(CANONICAL_RS01_ADMISSIBILITY_POLICY)
+
+
+def _load_uniform_mask_encoder_state(experiment_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    checkpoint_path = str(experiment_cfg.get("uniform_mask_encoder_checkpoint", "")).strip()
+    if not checkpoint_path:
+        raise ValueError("experiment.uniform_mask_encoder_checkpoint is required for eval_topology_mask_uniform.")
+    if not Path(checkpoint_path).exists():
+        raise ValueError(f"Uniform mask encoder checkpoint was not found: {checkpoint_path}")
+    checkpoint_payload = load_trusted_torch_artifact(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint_payload, dict):
+        raise ValueError("Uniform mask encoder checkpoint payload must be a dictionary.")
+    encoder_state = checkpoint_payload.get("encoder_state")
+    if encoder_state is None:
+        raise ValueError("Uniform mask encoder checkpoint must contain encoder_state.")
+    return encoder_state
+
+
+def _apply_experiment_switch_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Map experiment-level convenience toggles to canonical runtime keys."""
+    if not isinstance(config, dict):
+        return config
+    experiment_cfg = config.get("experiment", {})
+    if not isinstance(experiment_cfg, dict):
+        return config
+
+    model_cfg = config.setdefault("model", {})
+    training_cfg = config.setdefault("training", {})
+    mapping_cfg = config.setdefault("mapping", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+        config["model"] = model_cfg
+    if not isinstance(training_cfg, dict):
+        training_cfg = {}
+        config["training"] = training_cfg
+    if not isinstance(mapping_cfg, dict):
+        mapping_cfg = {}
+        config["mapping"] = mapping_cfg
+
+    if "structural_mode" in experiment_cfg:
+        model_cfg["structural_mode"] = _as_bool(experiment_cfg.get("structural_mode"), default=True)
+    if "mask_guided_enabled" in experiment_cfg:
+        training_cfg["mask_guided_enabled"] = _as_bool(experiment_cfg.get("mask_guided_enabled"), default=False)
+    if "retrain" in experiment_cfg:
+        training_cfg["retrain"] = _as_bool(experiment_cfg.get("retrain"), default=False)
+    if "finetune_start_ratio" in experiment_cfg:
+        training_cfg.pop("finetune_start_ratio", None)
+    if "statistic_enabled" in experiment_cfg:
+        graph_feature_mapping_cfg = mapping_cfg.setdefault("graph_feature_mapping", {})
+        if not isinstance(graph_feature_mapping_cfg, dict):
+            graph_feature_mapping_cfg = {}
+            mapping_cfg["graph_feature_mapping"] = graph_feature_mapping_cfg
+        graph_feature_mapping_cfg["enabled"] = _as_bool(experiment_cfg.get("statistic_enabled"), default=False)
+    if "rs01_enabled" in experiment_cfg:
+        experiment_cfg["rs01_enabled"] = _as_bool(experiment_cfg.get("rs01_enabled"), default=True)
+    rs01_policy = _resolve_rs01_admissibility_policy(config)
+    experiment_cfg.pop("rs01_audit_enabled", None)
+    experiment_cfg.pop("rs01_audit_batch_id", None)
+    experiment_cfg.pop("rs01_admissibility_policy", None)
+    if rs01_policy is not None:
+        experiment_cfg["rs01_admissibility_policy"] = rs01_policy
+    return config
+
+
+def _normalize_impulse_state_channels(raw_value: Any) -> list[str]:
+    if raw_value is None:
+        return list(DEFAULT_IMPULSE_STATE_CHANNELS)
+    if isinstance(raw_value, (list, tuple)):
+        cleaned = [str(item).strip() for item in raw_value if str(item).strip()]
+        return cleaned or list(DEFAULT_IMPULSE_STATE_CHANNELS)
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return list(DEFAULT_IMPULSE_STATE_CHANNELS)
+        if "\n" in text:
+            cleaned = [
+                line.strip()[2:].strip()
+                for line in text.splitlines()
+                if line.strip().startswith("- ") and line.strip()[2:].strip()
+            ]
+            return cleaned or list(DEFAULT_IMPULSE_STATE_CHANNELS)
+        if "," in text:
+            cleaned = [item.strip() for item in text.split(",") if item.strip()]
+            return cleaned or list(DEFAULT_IMPULSE_STATE_CHANNELS)
+    return list(DEFAULT_IMPULSE_STATE_CHANNELS)
+
+
+def _build_model_factory_kwargs(
+    *,
+    model_cfg: Dict[str, Any],
+    feature_layout: Any,
+    output_dim: int,
+) -> Dict[str, Any]:
+    """Build model factory kwargs from YAML model config."""
+    hidden_dim = int(model_cfg.get("hidden_dim", 64))
+    return {
+        "model_type": str(model_cfg.get("type", model_cfg.get("model_type", "BaselineGCN"))),
+        "feature_layout": feature_layout,
+        "hidden_dim": hidden_dim,
+        "output_dim": int(output_dim),
+        "dropout": float(model_cfg.get("dropout", 0.2)),
+        "pooling_strategy": str(model_cfg.get("pooling_strategy", "global_mean")).strip().lower(),
+        "recurrent_type": str(model_cfg.get("recurrent_type", "lstm")).strip().lower(),
+        "recurrent_layers": int(model_cfg.get("recurrent_layers", 1)),
+        "recurrent_bidirectional": _as_bool(model_cfg.get("recurrent_bidirectional"), default=False),
+        "structural_mode": model_cfg.get("structural_mode", True),
+        "struct_encoder_type": str(model_cfg.get("struct_encoder_type", "GATv2Conv")),
+        "struct_hidden_dim": int(model_cfg.get("struct_hidden_dim", hidden_dim)),
+        "cross_attention_heads": int(model_cfg.get("cross_attention_heads", 4)),
+        "fusion_mode": str(model_cfg.get("fusion_mode", "Attention")),
+        "structural_score_mode": str(model_cfg.get("structural_score_mode", "bilinear_with_prior")),
+        "structural_logit_scale_init": float(model_cfg.get("structural_logit_scale_init", 0.1)),
+        "structural_logit_scale_max": float(model_cfg.get("structural_logit_scale_max", 2.0)),
+        "structural_observed_scale_min": float(model_cfg.get("structural_observed_scale_min", 1.0)),
+        "structural_observed_scale_max": float(model_cfg.get("structural_observed_scale_max", 10.0)),
+        "structural_stats_beta": float(model_cfg.get("structural_stats_beta", 0.1)),
+        "topology_state_beta": float(model_cfg.get("topology_state_beta", 0.5)),
+        "topology_state_beta_max": float(model_cfg.get("topology_state_beta_max", 2.0)),
+        "topology_state_gate_init_bias": float(model_cfg.get("topology_state_gate_init_bias", -2.0)),
+        "topology_state_class_pooling": str(model_cfg.get("topology_state_class_pooling", "logmeanexp")),
+        "topology_graph_pooling": str(model_cfg.get("topology_graph_pooling", "mean")),
+        "topology_state_dropout": float(model_cfg.get("topology_state_dropout", model_cfg.get("dropout", 0.2))),
+        "structural_prior_pooling": str(model_cfg.get("structural_prior_pooling", "mean")),
+        "structural_prior_fusion": str(model_cfg.get("structural_prior_fusion", "concat")),
+        "structural_prior_gate_init_bias": float(model_cfg.get("structural_prior_gate_init_bias", -1.0)),
+        "struct_xattn_layers": str(model_cfg.get("struct_xattn_layers", "post_conv2")),
+        "struct_xattn_heads": int(model_cfg.get("struct_xattn_heads", model_cfg.get("cross_attention_heads", 4))),
+        "struct_xattn_dropout": float(model_cfg.get("struct_xattn_dropout", model_cfg.get("dropout", 0.2))),
+        "struct_xattn_scale_init": float(model_cfg.get("struct_xattn_scale_init", 0.1)),
+        "struct_xattn_scale_max": float(model_cfg.get("struct_xattn_scale_max", 2.0)),
+        "struct_xattn_use_layer_norm": _as_bool(model_cfg.get("struct_xattn_use_layer_norm"), default=True),
+        "struct_xattn_use_gate": _as_bool(model_cfg.get("struct_xattn_use_gate"), default=True),
+        "struct_xattn_gate_init_bias": float(model_cfg.get("struct_xattn_gate_init_bias", -2.0)),
+        "struct_xattn_merge_mode": str(model_cfg.get("struct_xattn_merge_mode", "post_norm_residual")),
+        "struct_xattn_delta_ratio_max": model_cfg.get("struct_xattn_delta_ratio_max"),
+        "observed_encoder": str(model_cfg.get("observed_encoder", "GATv2")),
+        "struct_encoder": str(model_cfg.get("struct_encoder", "GATv2")),
+        "candidate_scoring": str(model_cfg.get("candidate_scoring", "cosine")),
+        "candidate_pooling": str(model_cfg.get("candidate_pooling", "logmeanexp")),
+        "candidate_temperature_init": float(model_cfg.get("candidate_temperature_init", 0.1)),
+        "candidate_temperature_min": float(model_cfg.get("candidate_temperature_min", 0.05)),
+        "candidate_temperature_max": float(model_cfg.get("candidate_temperature_max", 2.0)),
+        "candidate_temperature_trainable": _as_bool(
+            model_cfg.get("candidate_temperature_trainable"),
+            default=False,
+        ),
+        "topology_conditioning_mode": str(model_cfg.get("topology_conditioning_mode", "static_candidates")),
+        "impulse_activation_enabled": _as_bool(model_cfg.get("impulse_activation_enabled"), default=False),
+        "impulse_state_channels": _normalize_impulse_state_channels(model_cfg.get("impulse_state_channels")),
+        "impulse_scale_init": float(model_cfg.get("impulse_scale_init", 0.1)),
+        "impulse_scale_max": float(model_cfg.get("impulse_scale_max", 2.0)),
+        "impulse_gnn_layers": int(model_cfg.get("impulse_gnn_layers", 1)),
+        "impulse_residual_h0": _as_bool(model_cfg.get("impulse_residual_h0"), default=True),
+    }
+
+
+def _derive_last_checkpoint_path(checkpoint_path: str) -> str:
+    """Derive companion last-checkpoint path from effective checkpoint path."""
+    path = Path(str(checkpoint_path).strip())
+    name = path.name
+    if name.endswith("_best.pth"):
+        return str(path.with_name(f"{name[:-9]}_last.pth"))
+    stem = path.stem
+    suffix = path.suffix or ".pth"
+    if stem.endswith("_best"):
+        return str(path.with_name(f"{stem[:-5]}_last{suffix}"))
+    return str(path.with_name(f"{stem}_last{suffix}"))
+
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility across random/numpy/torch backends."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _configure_cpu_threading(training_cfg: Dict[str, Any], logger: logging.Logger) -> None:
+    """Apply optional torch CPU threading overrides from training config."""
+    raw_num_threads = training_cfg.get("torch_num_threads")
+    if raw_num_threads is not None and str(raw_num_threads).strip() != "":
+        num_threads = max(1, int(raw_num_threads))
+        torch.set_num_threads(num_threads)
+
+    raw_num_interop_threads = training_cfg.get("torch_num_interop_threads")
+    if raw_num_interop_threads is not None and str(raw_num_interop_threads).strip() != "":
+        num_interop_threads = max(1, int(raw_num_interop_threads))
+        try:
+            torch.set_num_interop_threads(num_interop_threads)
+        except RuntimeError as exc:
+            logger.warning(
+                "Could not apply training.torch_num_interop_threads=%s: %s",
+                raw_num_interop_threads,
+                exc,
+            )
+
+    logger.info(
+        "CPU_THREADING torch_num_threads=%d torch_num_interop_threads=%d",
+        int(torch.get_num_threads()),
+        int(torch.get_num_interop_threads()),
+    )
+
+
+def _extract_base_vocabularies(feature_encoder: FeatureEncoder) -> Tuple[Dict[str, int], Dict[str, int], str]:
+    """Extract activity/resource vocabularies from feature encoder artifacts."""
+    activity_feature = feature_encoder.activity_feature_name
+    resource_feature = feature_encoder.role_to_feature.get("resource", "org:resource")
+    activity_vocab = feature_encoder.categorical_vocabs.get(activity_feature, {"<UNK>": 0})
+    resource_vocab = feature_encoder.categorical_vocabs.get(resource_feature, {"<UNK>": 0})
+    return activity_vocab, resource_vocab, activity_feature
+
+
+def _build_normalization_stats() -> Dict[str, Dict[str, float]]:
+    """Create MVP1 placeholder normalization stats (mu=0, sigma=1)."""
+    return {
+        "duration": {"mu": 0.0, "sigma": 1.0},
+        "time_since_case_start": {"mu": 0.0, "sigma": 1.0},
+        "time_since_previous_event": {"mu": 0.0, "sigma": 1.0},
+    }
+
+
+def _parse_split_ratio(experiment_cfg: Dict[str, Any]) -> Tuple[float, float, float]:
+    """Parse split ratio with strict validation for train/val/test proportions."""
+    raw_ratio = experiment_cfg.get("split_ratio", [0.7, 0.2, 0.1])
+    if not isinstance(raw_ratio, Sequence) or isinstance(raw_ratio, (str, bytes)) or len(raw_ratio) != 3:
+        raise ValueError("experiment.split_ratio must be a 3-item list [train, val, test].")
+
+    ratios = [float(item) for item in raw_ratio]
+    if any(item < 0.0 for item in ratios):
+        raise ValueError("experiment.split_ratio must contain non-negative values.")
+
+    ratio_sum = sum(ratios)
+    if not math.isclose(ratio_sum, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(f"experiment.split_ratio must sum to 1.0, got {ratio_sum:.6f}")
+
+    return ratios[0], ratios[1], ratios[2]
+
+
+def _resolve_dataset_name(data_cfg: Dict[str, Any], log_path: str) -> str:
+    """Resolve stable dataset name used as process_version fallback in adapters."""
+    candidates = [
+        data_cfg.get("dataset_name"),
+        data_cfg.get("dataset_label"),
+    ]
+    if str(log_path).strip():
+        candidates.append(Path(log_path).stem)
+    for candidate in candidates:
+        value = str(candidate).strip() if candidate is not None else ""
+        if value:
+            return value
+    return "default_dataset"
+
+
+def _inject_dataset_name_mapping(mapping_cfg: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
+    """Attach dataset_name to xes_adapter mapping block without mutating input config."""
+    result = dict(mapping_cfg)
+    xes_cfg_raw = result.get("xes_adapter", {})
+    xes_cfg = dict(xes_cfg_raw) if isinstance(xes_cfg_raw, dict) else {}
+    xes_cfg.setdefault("dataset_name", dataset_name)
+    result["xes_adapter"] = xes_cfg
+    camunda_cfg_raw = result.get("camunda_adapter", {})
+    camunda_cfg = dict(camunda_cfg_raw) if isinstance(camunda_cfg_raw, dict) else {}
+    camunda_cfg.setdefault("dataset_name", dataset_name)
+    camunda_cfg.setdefault("process_name", dataset_name)
+    result["camunda_adapter"] = camunda_cfg
+    result.setdefault("dataset_name", dataset_name)
+    return result
+
+
+def _resolve_trace_adapter_kind(mapping_cfg: Dict[str, Any]) -> str:
+    """Resolve ingestion adapter kind from mapping config."""
+    adapter_name = str(mapping_cfg.get("adapter", "")).strip().lower()
+    if adapter_name:
+        return adapter_name
+    if isinstance(mapping_cfg.get("camunda_adapter"), dict):
+        return "camunda"
+    return "xes"
+
+
+def _build_trace_adapter(mapping_cfg: Dict[str, Any]) -> IXESAdapter:
+    """Construct trace adapter by mapping config without affecting model wiring."""
+    kind = _resolve_trace_adapter_kind(mapping_cfg)
+    if kind == "camunda":
+        return CamundaTraceAdapter()
+    return XESAdapter()
+
+
+def _apply_fraction(traces: Sequence[RawTrace], fraction: float) -> List[RawTrace]:
+    """Apply chronological fraction on traces after temporal ordering."""
+    traces_with_events = [trace for trace in traces if trace.events]
+    ordered = sorted(traces_with_events, key=lambda tr: tr.events[0].timestamp)
+
+    if fraction >= 1.0:
+        return ordered
+    if fraction <= 0.0:
+        raise ValueError("experiment.fraction must be within (0.0, 1.0].")
+
+    keep_count = max(1, int(len(ordered) * fraction))
+    return ordered[:keep_count]
+
+
+def _trace_version_label(trace: RawTrace) -> str:
+    return str(getattr(trace, "process_version", "")).strip() or "__missing__"
+
+
+def _first_event_ts(trace: RawTrace) -> Any:
+    return trace.events[0].timestamp if trace.events else 0
+
+
+def _group_traces_by_version(traces: Sequence[RawTrace]) -> Dict[str, List[RawTrace]]:
+    grouped: Dict[str, List[RawTrace]] = {}
+    for trace in traces:
+        grouped.setdefault(_trace_version_label(trace), []).append(trace)
+    return dict(sorted(grouped.items(), key=lambda item: item[0]))
+
+
+def _apply_versioned_fraction(traces: Sequence[RawTrace], fraction: float) -> List[RawTrace]:
+    if fraction <= 0.0 or fraction > 1.0:
+        raise ValueError("experiment.fraction must be within (0.0, 1.0].")
+    grouped = _group_traces_by_version([trace for trace in traces if trace.events])
+    selected: List[RawTrace] = []
+    for _, version_traces in grouped.items():
+        ordered = sorted(version_traces, key=_first_event_ts)
+        keep_count = len(ordered) if fraction >= 1.0 else max(1, int(len(ordered) * fraction))
+        selected.extend(ordered[:keep_count])
+    return selected
+
+
+def _apply_version_scope(
+    ordered: Sequence[RawTrace],
+    *,
+    mode: str,
+    train_ratio: float,
+    version_scope_policy: str,
+) -> List[RawTrace]:
+    split_idx = int(len(ordered) * train_ratio)
+    mode_key = str(mode).strip().lower()
+    if version_scope_policy == "all":
+        if mode_key == "train":
+            return list(ordered[:split_idx])
+        if mode_key in {"eval_drift", "eval_cross_dataset"}:
+            return list(ordered[split_idx:])
+        return list(ordered)
+
+    known_versions = {_trace_version_label(trace) for trace in ordered[:split_idx]}
+    if mode_key == "train":
+        return [trace for trace in ordered if _trace_version_label(trace) in known_versions]
+    if mode_key in {"eval_drift", "eval_cross_dataset"}:
+        return [trace for trace in ordered[split_idx:] if _trace_version_label(trace) not in known_versions]
+    return list(ordered)
+
+
+def _versioned_split(
+    traces: Sequence[RawTrace],
+    split_ratio: Tuple[float, float, float],
+) -> Tuple[List[RawTrace], List[RawTrace], List[RawTrace]]:
+    grouped = _group_traces_by_version([trace for trace in traces if trace.events])
+    train: List[RawTrace] = []
+    val: List[RawTrace] = []
+    test: List[RawTrace] = []
+    train_ratio, val_ratio, _ = split_ratio
+    for _, version_traces in grouped.items():
+        ordered = sorted(version_traces, key=_first_event_ts)
+        train_end = int(len(ordered) * train_ratio)
+        val_end = train_end + int(len(ordered) * val_ratio)
+        train.extend(ordered[:train_end])
+        val.extend(ordered[train_end:val_end])
+        test.extend(ordered[val_end:])
+    return train, val, test
+
+
+def _strict_temporal_split(
+    traces: Sequence[RawTrace],
+    split_ratio: Tuple[float, float, float],
+    split_strategy: str,
+) -> Tuple[List[RawTrace], List[RawTrace], List[RawTrace]]:
+    """Apply strict chronological split by configured strategy and ratio."""
+    if split_strategy == "time":
+        split_strategy = "temporal"
+    if split_strategy not in {"temporal", "none", "versioned"}:
+        raise ValueError(f"Unsupported experiment.split_strategy '{split_strategy}'.")
+    if split_strategy == "versioned":
+        return _versioned_split(traces, split_ratio)
+
+    train_ratio, val_ratio, _ = split_ratio
+    traces_with_events = [trace for trace in traces if trace.events]
+    ordered = sorted(traces_with_events, key=lambda tr: tr.events[0].timestamp)
+
+    total = len(ordered)
+    train_end = int(total * train_ratio)
+    val_end = train_end + int(total * val_ratio)
+    return list(ordered[:train_end]), list(ordered[train_end:val_end]), list(ordered[val_end:])
+
+
+def _apply_cascade_prepare(
+    traces: Sequence[RawTrace],
+    *,
+    mode: str,
+    split_strategy: str,
+    train_ratio: float,
+    fraction: float,
+    fraction_strategy: str = "temporal",
+    version_scope_policy: str = "all",
+) -> List[RawTrace]:
+    """Apply cascade filter in contract order: temporal sort -> macro split -> fraction."""
+    if split_strategy == "time":
+        split_strategy = "temporal"
+    if split_strategy not in {"temporal", "none", "versioned"}:
+        raise ValueError("experiment.split_strategy must be 'temporal', 'none', or 'versioned'.")
+    fraction_strategy = str(fraction_strategy).strip().lower()
+    if fraction_strategy not in {"temporal", "versioned"}:
+        raise ValueError("experiment.fraction_strategy must be 'temporal' or 'versioned'.")
+    version_scope_policy = str(version_scope_policy).strip().lower()
+    if version_scope_policy not in {"all", "train_cut"}:
+        raise ValueError("experiment.version_scope_policy must be 'all' or 'train_cut'.")
+    if train_ratio < 0.0 or train_ratio > 1.0:
+        raise ValueError("experiment.train_ratio must be within [0.0, 1.0].")
+    if fraction <= 0.0 or fraction > 1.0:
+        raise ValueError("experiment.fraction must be within (0.0, 1.0].")
+
+    traces_with_events = [trace for trace in traces if trace.events]
+    if split_strategy == "temporal":
+        ordered = sorted(traces_with_events, key=lambda tr: tr.events[0].timestamp)
+    else:
+        ordered = list(traces_with_events)
+
+    macro = _apply_version_scope(
+        ordered,
+        mode=mode,
+        train_ratio=train_ratio,
+        version_scope_policy=version_scope_policy,
+    )
+
+    if fraction >= 1.0:
+        filtered = macro
+    elif fraction_strategy == "versioned":
+        filtered = _apply_versioned_fraction(macro, fraction)
+    else:
+        keep_count = int(len(macro) * fraction)
+        filtered = macro[:keep_count]
+    if split_strategy in {"temporal", "versioned"}:
+        return sorted(filtered, key=_first_event_ts)
+    return filtered
+
+
+def _trace_version_counts(traces: Sequence[RawTrace]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for trace in traces:
+        version = str(getattr(trace, "process_version", "")).strip() or "__missing__"
+        counts[version] = counts.get(version, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _format_trace_version_counts(counts: Dict[str, int], *, max_items: int = 12) -> str:
+    if not counts:
+        return "none"
+    items = list(counts.items())
+    rendered = [f"{version}:{count}" for version, count in items[:max_items]]
+    if len(items) > max_items:
+        rendered.append(f"...+{len(items) - max_items}")
+    return ",".join(rendered)
+
+
+def _safe_iso_to_epoch(value: Any) -> float | None:
+    """Parse ISO datetime string into UTC epoch seconds; return None on invalid values."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return float(parsed.timestamp())
+
+
+def _prefix_last_activity_idx_from_contract(contract: Mapping[str, Any]) -> int:
+    raw = contract.get("prefix_last_activity_idx")
+    if isinstance(raw, torch.Tensor) and raw.numel() > 0:
+        return int(raw.detach().cpu().view(-1)[0].item())
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    return -1
+
+
+def _safe_cache_token(raw: str) -> str:
+    text = str(raw).strip()
+    if not text:
+        return "__auto__"
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+    return cleaned or "__auto__"
+
+
+def _normalize_for_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _normalize_for_json(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_for_json(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _resolve_graph_dataset_cache_policy(experiment_cfg: Dict[str, Any]) -> str:
+    raw = experiment_cfg.get("graph_dataset_cache_policy", experiment_cfg.get("graph_cache_policy", "off"))
+    text = str(raw).strip().lower() or "off"
+    if text in {"none", "false", "disabled"}:
+        text = "off"
+    if text in {"on", "true"}:
+        text = "full"
+    if text not in {"off", "read", "write", "full"}:
+        return "off"
+    return text
+
+
+def _resolve_graph_dataset_cache_dir(experiment_cfg: Dict[str, Any]) -> str:
+    raw = experiment_cfg.get("graph_dataset_cache_dir", experiment_cfg.get("graph_cache_dir", ".cache/graph_datasets"))
+    text = str(raw).strip()
+    return text or ".cache/graph_datasets"
+
+
+def _trace_split_signature(traces: Sequence[RawTrace]) -> Dict[str, Any]:
+    digest = hashlib.sha1()
+    events_total = 0
+    for trace in traces:
+        case_id = str(getattr(trace, "case_id", "")).strip()
+        version = str(getattr(trace, "process_version", "")).strip()
+        events = list(getattr(trace, "events", []) or [])
+        event_count = int(len(events))
+        events_total += event_count
+        first_ts = float(getattr(events[0], "timestamp", 0.0)) if event_count > 0 else 0.0
+        last_ts = float(getattr(events[-1], "timestamp", 0.0)) if event_count > 0 else 0.0
+        digest.update(f"{case_id}|{version}|{event_count}|{first_ts:.6f}|{last_ts:.6f};".encode("utf-8", errors="ignore"))
+    return {
+        "traces": int(len(traces)),
+        "events": int(events_total),
+        "digest": digest.hexdigest(),
+    }
+
+
+def _resolve_log_path_identity(log_path: str) -> str:
+    text = str(log_path).strip()
+    if not text or text == "__adapter_source__":
+        return text or "__adapter_source__"
+    path = Path(text).expanduser()
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _graph_dataset_cache_fingerprint(
+    *,
+    config: Dict[str, Any],
+    dataset_name: str,
+    adapter_kind: str,
+    mode: str,
+    split_strategy: str,
+    split_ratio: Tuple[float, float, float],
+    train_ratio: float,
+    fraction: float,
+    stats_time_policy: str,
+    on_missing_asof_snapshot: str,
+    log_path: str,
+    traces_all: Sequence[RawTrace],
+    train_traces: Sequence[RawTrace],
+    val_traces: Sequence[RawTrace],
+    test_traces: Sequence[RawTrace],
+    activity_vocab: Dict[str, int],
+    resource_vocab: Dict[str, int],
+    graph_feature_mapping: Dict[str, Any],
+    fraction_strategy: str = "temporal",
+    version_scope_policy: str = "all",
+) -> str:
+    mapping_cfg = config.get("mapping", {})
+    features_cfg = config.get("features", None)
+    if features_cfg is None:
+        if isinstance(mapping_cfg, dict):
+            features_cfg = mapping_cfg.get("features", [])
+        else:
+            features_cfg = []
+    payload = {
+        "schema": int(GRAPH_DATASET_CACHE_SCHEMA),
+        "dataset_name": str(dataset_name),
+        "adapter": str(adapter_kind),
+        "mode": str(mode),
+        "split_strategy": str(split_strategy),
+        "fraction_strategy": str(fraction_strategy),
+        "version_scope_policy": str(version_scope_policy),
+        "split_ratio": [float(item) for item in split_ratio],
+        "train_ratio": float(train_ratio),
+        "fraction": float(fraction),
+        "stats_time_policy": str(stats_time_policy),
+        "on_missing_asof_snapshot": str(on_missing_asof_snapshot),
+        "log_path": _resolve_log_path_identity(log_path),
+        "traces_signature": {
+            "all": _trace_split_signature(traces_all),
+            "train": _trace_split_signature(train_traces),
+            "validation": _trace_split_signature(val_traces),
+            "test": _trace_split_signature(test_traces),
+        },
+        "activity_vocab": sorted((str(key), int(value)) for key, value in activity_vocab.items()),
+        "resource_vocab": sorted((str(key), int(value)) for key, value in resource_vocab.items()),
+        "graph_feature_mapping": graph_feature_mapping,
+        "mapping": mapping_cfg if isinstance(mapping_cfg, dict) else {},
+        "policies": config.get("policies", {}),
+        "features": features_cfg,
+        "model": config.get("model", {}),
+        "rs01_admissibility_policy": config.get("experiment", {}).get("rs01_admissibility_policy"),
+    }
+    encoded = json.dumps(_normalize_for_json(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(encoded.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _graph_dataset_cache_entry_dir(cache_dir: str, dataset_name: str, fingerprint: str) -> Path:
+    root = Path(cache_dir).expanduser().resolve()
+    return root / _safe_cache_token(dataset_name) / str(fingerprint)
+
+
+def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _read_json_file(path: Path) -> Dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _resolve_graph_dataset_shard_size(experiment_cfg: Dict[str, Any]) -> int:
+    raw = experiment_cfg.get("graph_dataset_shard_size", 2000)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 2000
+    return max(128, value)
+
+
+def _resolve_graph_dataset_disk_spill_enabled(experiment_cfg: Dict[str, Any]) -> bool:
+    raw = experiment_cfg.get("graph_dataset_disk_spill_enabled", False)
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _resolve_max_ram_bytes(experiment_cfg: Dict[str, Any]) -> int | None:
+    raw = experiment_cfg.get("max_ram_gb", 0.0)
+    try:
+        max_ram_gb = float(raw)
+    except (TypeError, ValueError):
+        max_ram_gb = 0.0
+    if max_ram_gb <= 0.0:
+        return None
+    return int(max_ram_gb * 1024.0 * 1024.0 * 1024.0)
+
+
+def _process_rss_bytes() -> int:
+    try:
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return 0
+
+
+def _dataset_payload_graph_count(payload: Any) -> int:
+    if isinstance(payload, dict) and payload.get("kind") == "sharded_cache_split":
+        return int(payload.get("graphs", 0))
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, dict)):
+        return int(len(payload))
+    return 0
+
+
+def _iter_graphs_from_dataset_payload(payload: Any) -> Iterator[Data]:
+    if isinstance(payload, dict) and payload.get("kind") == "sharded_cache_split":
+        entry_dir_text = str(payload.get("entry_dir", "")).strip()
+        if not entry_dir_text:
+            return
+        entry_dir = Path(entry_dir_text)
+        shards = payload.get("shards", [])
+        if not isinstance(shards, list):
+            return
+        for shard in shards:
+            if not isinstance(shard, dict):
+                continue
+            rel_path = str(shard.get("path", "")).strip()
+            if not rel_path:
+                continue
+            shard_path = entry_dir / rel_path
+            if not shard_path.exists():
+                continue
+            try:
+                loaded = load_trusted_torch_artifact(shard_path, map_location="cpu")
+            except Exception:
+                continue
+            if isinstance(loaded, dict) and loaded.get("format") == GRAPH_DATASET_SHARD_FORMAT_DEDUP_STRUCTURAL:
+                graphs = loaded.get("graphs", [])
+                registry = loaded.get("structural_payloads", {})
+                if not isinstance(graphs, list) or not isinstance(registry, dict):
+                    continue
+                for item in graphs:
+                    if isinstance(item, Data):
+                        yield _attach_structural_payload(item, registry)
+                continue
+            if not isinstance(loaded, list):
+                continue
+            for item in loaded:
+                if isinstance(item, Data):
+                    yield item
+        return
+
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, dict)):
+        for item in payload:
+            if isinstance(item, Data):
+                yield item
+
+
+def _tensor_digest(tensor: torch.Tensor | None) -> str:
+    if not isinstance(tensor, torch.Tensor):
+        return "none"
+    cpu = tensor.detach().cpu().contiguous()
+    payload = {
+        "shape": list(cpu.shape),
+        "dtype": str(cpu.dtype),
+        "bytes": cpu.numpy().tobytes().hex(),
+    }
+    text = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _structural_payload_key_from_data(data: Data) -> str:
+    names = (
+        "struct_x",
+        "structural_edge_index",
+        "structural_edge_weight",
+        "struct_node_to_class_index",
+    )
+    parts: list[str] = []
+    for name in names:
+        tensor = getattr(data, name, None)
+        if isinstance(tensor, torch.Tensor):
+            parts.append(f"{name}:{id(tensor)}")
+    snapshot_idx = getattr(data, "stats_snapshot_version_idx", None)
+    if isinstance(snapshot_idx, torch.Tensor):
+        parts.append(f"stats_snapshot_version_idx:{id(snapshot_idx)}")
+    return "|".join(parts) if parts else "no_structural_payload"
+
+
+def _strip_structural_payload(
+    data: Data,
+    registry: dict[str, dict[str, Any]],
+) -> tuple[Data, dict[str, dict[str, Any]]]:
+    names = (
+        "struct_x",
+        "structural_edge_index",
+        "structural_edge_weight",
+        "struct_node_to_class_index",
+        "struct_node_to_candidate_index",
+        "candidate_class_index",
+        "candidate_is_unseen",
+        "candidate_ids",
+        "candidate_labels",
+    )
+    has_payload = any(getattr(data, name, None) is not None for name in names)
+    if not has_payload:
+        return data, registry
+    key = _structural_payload_key_from_data(data)
+    if key not in registry:
+        payload = {}
+        for name in names:
+            val = getattr(data, name, None)
+            if val is not None:
+                if isinstance(val, torch.Tensor):
+                    payload[name] = val.detach().cpu()
+                else:
+                    payload[name] = val
+        registry[key] = payload
+    stripped = data.clone()
+    for name in names:
+        if hasattr(stripped, name):
+            delattr(stripped, name)
+    stripped.structural_payload_key = key
+    return stripped, registry
+
+
+def _attach_structural_payload(data: Data, registry: dict[str, Any]) -> Data:
+    key = getattr(data, "structural_payload_key", None)
+    if key is None:
+        return data
+    payload = registry.get(str(key))
+    if not isinstance(payload, dict):
+        return data
+    for name, value in payload.items():
+        setattr(data, name, value)
+    if hasattr(data, "structural_payload_key"):
+        delattr(data, "structural_payload_key")
+    return data
+
+
+def _tensor_scale_diagnostics(
+    payload: Any,
+    *,
+    tensor_name: str,
+    sample_limit: int = 5000,
+    warn_abs_threshold: float = 1_000_000.0,
+) -> Dict[str, Any]:
+    values: List[torch.Tensor] = []
+    seen = 0
+    for graph in _iter_graphs_from_dataset_payload(payload):
+        tensor = getattr(graph, tensor_name, None)
+        if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+            values.append(tensor.detach().float().flatten().cpu())
+        seen += 1
+        if seen >= sample_limit:
+            break
+    if not values:
+        return {
+            "sampled_graphs": int(seen),
+            "values": 0,
+            "finite_values": 0,
+            "max_abs": 0.0,
+            "p99_abs": 0.0,
+            "has_non_finite": False,
+            "scale_warning": False,
+        }
+
+    joined = torch.cat(values)
+    finite_mask = torch.isfinite(joined)
+    finite = joined[finite_mask]
+    if finite.numel() == 0:
+        return {
+            "sampled_graphs": int(seen),
+            "values": int(joined.numel()),
+            "finite_values": 0,
+            "max_abs": float("inf"),
+            "p99_abs": float("inf"),
+            "has_non_finite": True,
+            "scale_warning": True,
+        }
+    abs_values = torch.abs(finite)
+    max_abs = float(torch.max(abs_values).item())
+    p99_abs = float(torch.quantile(abs_values, 0.99).item())
+    has_non_finite = bool(int(finite_mask.sum().item()) != int(joined.numel()))
+    return {
+        "sampled_graphs": int(seen),
+        "values": int(joined.numel()),
+        "finite_values": int(finite.numel()),
+        "max_abs": max_abs,
+        "p99_abs": p99_abs,
+        "has_non_finite": has_non_finite,
+        "scale_warning": bool(has_non_finite or max_abs > float(warn_abs_threshold)),
+    }
+
+
+def _load_graph_dataset_cache(
+    *,
+    cache_dir: str,
+    dataset_name: str,
+    fingerprint: str,
+) -> Dict[str, Any] | None:
+    entry_dir = _graph_dataset_cache_entry_dir(cache_dir, dataset_name, fingerprint)
+    meta_path = entry_dir / "meta.json"
+    meta = _read_json_file(meta_path)
+    if meta is None:
+        return None
+    if int(meta.get("schema", -1)) != int(GRAPH_DATASET_CACHE_SCHEMA):
+        return None
+    if str(meta.get("fingerprint", "")).strip() != str(fingerprint):
+        return None
+    cache_format = str(meta.get("format", GRAPH_DATASET_CACHE_FORMAT_LEGACY)).strip() or GRAPH_DATASET_CACHE_FORMAT_LEGACY
+
+    if cache_format == GRAPH_DATASET_CACHE_FORMAT_SHARDED:
+        splits = meta.get("splits", {})
+        if not isinstance(splits, dict):
+            return None
+        split_payloads: Dict[str, Dict[str, Any]] = {}
+        for split_key in ("train", "validation", "test"):
+            split_meta = splits.get(split_key, {})
+            if not isinstance(split_meta, dict):
+                return None
+            shard_rows = split_meta.get("shards", [])
+            if not isinstance(shard_rows, list):
+                return None
+            normalized_shards: List[Dict[str, Any]] = []
+            graph_count = 0
+            for shard in shard_rows:
+                if not isinstance(shard, dict):
+                    continue
+                rel_path = str(shard.get("path", "")).strip()
+                count = int(shard.get("count", 0))
+                if not rel_path:
+                    continue
+                shard_path = entry_dir / rel_path
+                if not shard_path.exists():
+                    return None
+                normalized_shard: Dict[str, Any] = {"path": rel_path, "count": count}
+                topology_segments = shard.get("topology_segments")
+                if isinstance(topology_segments, list):
+                    normalized_shard["topology_segments"] = topology_segments
+                normalized_shards.append(normalized_shard)
+                graph_count += max(0, count)
+            split_payloads[split_key] = {
+                "kind": "sharded_cache_split",
+                "entry_dir": str(entry_dir),
+                "split": split_key,
+                "graphs": int(graph_count),
+                "shards": normalized_shards,
+            }
+        version_to_idx_raw = meta.get("version_to_idx", {})
+        snapshot_to_idx_raw = meta.get("stats_snapshot_version_to_idx", {})
+        version_to_idx = {
+            str(key): int(value)
+            for key, value in version_to_idx_raw.items()
+        } if isinstance(version_to_idx_raw, dict) else {}
+        stats_snapshot_version_to_idx = {
+            str(key): int(value)
+            for key, value in snapshot_to_idx_raw.items()
+        } if isinstance(snapshot_to_idx_raw, dict) else {}
+        meta["last_access_utc"] = datetime.now(timezone.utc).isoformat()
+        try:
+            _write_json_file(meta_path, meta)
+        except OSError:
+            pass
+        return {
+            "meta": meta,
+            "entry_dir": entry_dir,
+            "train_dataset": split_payloads["train"],
+            "val_dataset": split_payloads["validation"],
+            "test_dataset": split_payloads["test"],
+            "version_to_idx": version_to_idx,
+            "stats_snapshot_version_to_idx": stats_snapshot_version_to_idx,
+        }
+
+    train_path = entry_dir / "train.pt"
+    val_path = entry_dir / "validation.pt"
+    test_path = entry_dir / "test.pt"
+    if (not train_path.exists()) or (not val_path.exists()) or (not test_path.exists()):
+        return None
+    try:
+        train_dataset = load_trusted_torch_artifact(train_path, map_location="cpu")
+        val_dataset = load_trusted_torch_artifact(val_path, map_location="cpu")
+        test_dataset = load_trusted_torch_artifact(test_path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(train_dataset, list) or not isinstance(val_dataset, list) or not isinstance(test_dataset, list):
+        return None
+    version_to_idx_raw = meta.get("version_to_idx", {})
+    snapshot_to_idx_raw = meta.get("stats_snapshot_version_to_idx", {})
+    version_to_idx = {
+        str(key): int(value)
+        for key, value in version_to_idx_raw.items()
+    } if isinstance(version_to_idx_raw, dict) else {}
+    stats_snapshot_version_to_idx = {
+        str(key): int(value)
+        for key, value in snapshot_to_idx_raw.items()
+    } if isinstance(snapshot_to_idx_raw, dict) else {}
+
+    meta["last_access_utc"] = datetime.now(timezone.utc).isoformat()
+    try:
+        _write_json_file(meta_path, meta)
+    except OSError:
+        pass
+    return {
+        "meta": meta,
+        "entry_dir": entry_dir,
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "version_to_idx": version_to_idx,
+        "stats_snapshot_version_to_idx": stats_snapshot_version_to_idx,
+    }
+
+
+def _save_graph_dataset_cache(
+    *,
+    cache_dir: str,
+    dataset_name: str,
+    fingerprint: str,
+    train_dataset: Sequence[Data],
+    val_dataset: Sequence[Data],
+    test_dataset: Sequence[Data],
+    version_to_idx: Dict[str, int],
+    stats_snapshot_version_to_idx: Dict[str, int],
+    payload_meta: Dict[str, Any] | None = None,
+) -> Path:
+    entry_dir = _graph_dataset_cache_entry_dir(cache_dir, dataset_name, fingerprint)
+    entry_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_tensor_list(path: Path, dataset: Sequence[Data]) -> None:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        torch.save(list(dataset), tmp_path)
+        tmp_path.replace(path)
+
+    _save_tensor_list(entry_dir / "train.pt", train_dataset)
+    _save_tensor_list(entry_dir / "validation.pt", val_dataset)
+    _save_tensor_list(entry_dir / "test.pt", test_dataset)
+
+    meta_payload = {
+        "schema": int(GRAPH_DATASET_CACHE_SCHEMA),
+        "format": GRAPH_DATASET_CACHE_FORMAT_LEGACY,
+        "fingerprint": str(fingerprint),
+        "dataset_name": str(dataset_name),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "last_access_utc": datetime.now(timezone.utc).isoformat(),
+        "counts": {
+            "train_graphs": int(len(train_dataset)),
+            "validation_graphs": int(len(val_dataset)),
+            "test_graphs": int(len(test_dataset)),
+        },
+        "version_to_idx": {str(key): int(value) for key, value in version_to_idx.items()},
+        "stats_snapshot_version_to_idx": {
+            str(key): int(value)
+            for key, value in stats_snapshot_version_to_idx.items()
+        },
+        "payload_meta": payload_meta or {},
+    }
+    _write_json_file(entry_dir / "meta.json", meta_payload)
+    return entry_dir
+
+
+def _save_graph_dataset_cache_sharded(
+    *,
+    cache_dir: str,
+    dataset_name: str,
+    fingerprint: str,
+    train_split: Dict[str, Any],
+    val_split: Dict[str, Any],
+    test_split: Dict[str, Any],
+    version_to_idx: Dict[str, int],
+    stats_snapshot_version_to_idx: Dict[str, int],
+    payload_meta: Dict[str, Any] | None = None,
+) -> Path:
+    entry_dir = _graph_dataset_cache_entry_dir(cache_dir, dataset_name, fingerprint)
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    meta_payload = {
+        "schema": int(GRAPH_DATASET_CACHE_SCHEMA),
+        "format": GRAPH_DATASET_CACHE_FORMAT_SHARDED,
+        "fingerprint": str(fingerprint),
+        "dataset_name": str(dataset_name),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "last_access_utc": datetime.now(timezone.utc).isoformat(),
+        "counts": {
+            "train_graphs": int(train_split.get("graphs", 0)),
+            "validation_graphs": int(val_split.get("graphs", 0)),
+            "test_graphs": int(test_split.get("graphs", 0)),
+        },
+        "structural_payloads": {
+            "train": sum(int(row.get("structural_payloads", 0)) for row in train_split.get("shards", [])),
+            "validation": sum(int(row.get("structural_payloads", 0)) for row in val_split.get("shards", [])),
+            "test": sum(int(row.get("structural_payloads", 0)) for row in test_split.get("shards", [])),
+        },
+        "splits": {
+            "train": {
+                "graphs": int(train_split.get("graphs", 0)),
+                "shards": list(train_split.get("shards", [])),
+            },
+            "validation": {
+                "graphs": int(val_split.get("graphs", 0)),
+                "shards": list(val_split.get("shards", [])),
+            },
+            "test": {
+                "graphs": int(test_split.get("graphs", 0)),
+                "shards": list(test_split.get("shards", [])),
+            },
+        },
+        "version_to_idx": {str(key): int(value) for key, value in version_to_idx.items()},
+        "stats_snapshot_version_to_idx": {
+            str(key): int(value)
+            for key, value in stats_snapshot_version_to_idx.items()
+        },
+        "payload_meta": payload_meta or {},
+    }
+    _write_json_file(entry_dir / "meta.json", meta_payload)
+    return entry_dir
+
+
+def _build_graph_dataset_sharded(
+    traces: Sequence[RawTrace],
+    prefix_policy: PrefixPolicy,
+    graph_builder: DynamicGraphBuilder,
+    version_to_idx: Dict[str, int],
+    stats_snapshot_version_to_idx: Dict[str, int],
+    *,
+    show_progress: bool,
+    tqdm_disable: bool,
+    desc: str,
+    progress_stage: str,
+    entry_dir: Path,
+    split_key: str,
+    shard_size: int,
+    max_ram_bytes: int | None,
+) -> Dict[str, Any]:
+    """Build graph dataset and spill buffered Data objects into on-disk shards."""
+    split_dir = entry_dir / f"{split_key}_shards"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    dataset_payload = {
+        "kind": "sharded_cache_split",
+        "entry_dir": str(entry_dir),
+        "split": split_key,
+        "graphs": 0,
+        "shards": [],
+    }
+
+    total_traces = int(len(traces))
+    structured_progress = bool(progress_events_enabled())
+    reporter = ProgressReporter(stage=progress_stage, total=total_traces, min_interval_sec=0.8)
+    reporter.start(message=desc, current=0, total=total_traces)
+    iterator = tqdm(
+        traces,
+        desc=desc,
+        unit="trace",
+        leave=False,
+        disable=(not show_progress) or tqdm_disable or structured_progress,
+    )
+
+    buffer: List[Data] = []
+    shard_rows: List[Dict[str, Any]] = []
+    shard_idx = 0
+    total_graphs = 0
+    last_ram_check = 0
+
+    def _flush_buffer(force: bool = False) -> None:
+        nonlocal shard_idx
+        if not buffer:
+            return
+        if not force and len(buffer) < shard_size:
+            return
+        shard_idx += 1
+        shard_name = f"{split_key}_{shard_idx:05d}.pt"
+        shard_path = split_dir / shard_name
+        tmp_path = shard_path.with_suffix(".pt.tmp")
+        stripped_buffer: list[Data] = []
+        structural_payloads: dict[str, dict[str, torch.Tensor]] = {}
+        for item in buffer:
+            stripped, structural_payloads = _strip_structural_payload(item, structural_payloads)
+            stripped_buffer.append(stripped)
+        topology_segments: list[dict[str, Any]] = []
+        last_key: str | None = None
+        last_count = 0
+        for item in stripped_buffer:
+            raw_version = getattr(item, "process_version_idx", None)
+            if isinstance(raw_version, torch.Tensor) and raw_version.numel() > 0:
+                version = f"v:{int(raw_version.view(-1)[0].item())}"
+            else:
+                version = "v:__missing__"
+            raw_snapshot = getattr(item, "stats_snapshot_version_idx", None)
+            if isinstance(raw_snapshot, torch.Tensor) and raw_snapshot.numel() > 0:
+                snapshot = f"s:{int(raw_snapshot.view(-1)[0].item())}"
+            else:
+                snapshot = "s:__none__"
+            key = f"{version}|{snapshot}"
+            if last_key is None:
+                last_key = key
+                last_count = 1
+            elif key == last_key:
+                last_count += 1
+            else:
+                topology_segments.append({"key": last_key, "count": int(last_count)})
+                last_key = key
+                last_count = 1
+        if last_key is not None:
+            topology_segments.append({"key": last_key, "count": int(last_count)})
+        shard_payload = {
+            "schema": 2,
+            "format": GRAPH_DATASET_SHARD_FORMAT_DEDUP_STRUCTURAL,
+            "graphs": stripped_buffer,
+            "structural_payloads": structural_payloads,
+        }
+        torch.save(shard_payload, tmp_path)
+        if shard_path.exists():
+            try:
+                shard_path.unlink()
+            except OSError:
+                pass
+        try:
+            tmp_path.replace(shard_path)
+        except OSError:
+            import shutil
+            shutil.move(str(tmp_path), str(shard_path))
+        shard_rows.append(
+            {
+                "path": str(shard_path.relative_to(entry_dir).as_posix()),
+                "count": int(len(buffer)),
+                "structural_payloads": int(len(structural_payloads)),
+                "topology_segments": topology_segments,
+            }
+        )
+        buffer.clear()
+        gc.collect()
+
+    for idx, trace in enumerate(iterator, start=1):
+        trace_index = int(idx - 1)
+        trace_start_ts = float(trace.events[0].timestamp) if trace.events else 0.0
+        trace_end_ts = float(trace.events[-1].timestamp) if trace.events else trace_start_ts
+        prefix_slices = prefix_policy.generate_slices(trace)
+        trace_slice_total = int(len(prefix_slices))
+        if trace_slice_total <= 0:
+            reporter.update(
+                message=desc,
+                current=float(idx),
+                total=total_traces,
+                payload={"graphs": int(total_graphs), "shards": int(len(shard_rows))},
+                force=(idx == 1 or idx == total_traces),
+            )
+            continue
+        for slice_idx, prefix_slice in enumerate(prefix_slices, start=1):
+            contract = graph_builder.build_graph(prefix_slice)
+            version_label = str(prefix_slice.process_version)
+            version_idx = version_to_idx.setdefault(version_label, len(version_to_idx))
+            prefix_len = int(len(prefix_slice.prefix_events))
+            prefix_last_activity_idx = _prefix_last_activity_idx_from_contract(contract)
+            payload: Dict[str, Any] = {
+                "x_cat": contract["x_cat"],
+                "x_num": contract["x_num"],
+                "edge_index": contract["edge_index"],
+                "edge_type": contract["edge_type"],
+                "y": contract["y"],
+                "num_nodes": int(contract["num_nodes"]),
+                "prefix_len": torch.tensor([prefix_len], dtype=torch.long),
+                "process_version_idx": torch.tensor([version_idx], dtype=torch.long),
+                "trace_idx": torch.tensor([trace_index], dtype=torch.long),
+                "prefix_idx": torch.tensor([int(slice_idx - 1)], dtype=torch.long),
+                "prefix_last_activity_idx": torch.tensor([prefix_last_activity_idx], dtype=torch.long),
+                "trace_start_ts": torch.tensor([trace_start_ts], dtype=torch.float64),
+                "trace_end_ts": torch.tensor([trace_end_ts], dtype=torch.float64),
+            }
+            allowed_mask = contract.get("allowed_target_mask")
+            if isinstance(allowed_mask, torch.Tensor):
+                payload["allowed_target_mask"] = (
+                    allowed_mask.unsqueeze(0) if allowed_mask.dim() == 1 else allowed_mask
+                )
+            candidate_allowed_mask = contract.get("candidate_allowed_target_mask")
+            if isinstance(candidate_allowed_mask, torch.Tensor):
+                payload["candidate_allowed_target_mask"] = (
+                    candidate_allowed_mask.unsqueeze(0)
+                    if candidate_allowed_mask.dim() == 1
+                    else candidate_allowed_mask
+                )
+            if "audit_payload_json" in contract:
+                payload["audit_payload_json"] = contract["audit_payload_json"]
+            target_label = contract.get("target_label")
+            if target_label is not None:
+                payload["target_label"] = str(target_label)
+            struct_x = contract.get("struct_x")
+            if isinstance(struct_x, torch.Tensor):
+                payload["struct_x"] = struct_x
+            structural_edge_index = contract.get("structural_edge_index")
+            if isinstance(structural_edge_index, torch.Tensor):
+                payload["structural_edge_index"] = structural_edge_index
+            structural_edge_weight = contract.get("structural_edge_weight")
+            if isinstance(structural_edge_weight, torch.Tensor):
+                payload["structural_edge_weight"] = structural_edge_weight
+            struct_node_to_class_index = contract.get("struct_node_to_class_index")
+            if isinstance(struct_node_to_class_index, torch.Tensor):
+                payload["struct_node_to_class_index"] = struct_node_to_class_index
+            for tensor_key in (
+                "struct_node_to_candidate_index",
+                "candidate_class_index",
+                "candidate_is_unseen",
+            ):
+                tensor_value = contract.get(tensor_key)
+                if isinstance(tensor_value, torch.Tensor):
+                    payload[tensor_key] = tensor_value
+            for meta_key in ("candidate_ids", "candidate_labels"):
+                meta_value = contract.get(meta_key)
+                if isinstance(meta_value, (list, tuple)):
+                    payload[meta_key] = tuple(str(item) for item in meta_value)
+            struct_prefix_state_x = contract.get("struct_prefix_state_x")
+            if isinstance(struct_prefix_state_x, torch.Tensor):
+                payload["struct_prefix_state_x"] = struct_prefix_state_x
+            stats_allowed = contract.get("stats_allowed")
+            if isinstance(stats_allowed, bool):
+                payload["stats_allowed"] = torch.tensor([1 if stats_allowed else 0], dtype=torch.long)
+            stats_missing_asof_snapshot = contract.get("stats_missing_asof_snapshot")
+            if isinstance(stats_missing_asof_snapshot, bool):
+                payload["stats_missing_asof_snapshot"] = torch.tensor(
+                    [1 if stats_missing_asof_snapshot else 0],
+                    dtype=torch.long,
+                )
+            snapshot_seq_raw = contract.get("stats_snapshot_version_seq")
+            if isinstance(snapshot_seq_raw, (int, float)) and not isinstance(snapshot_seq_raw, bool):
+                snapshot_idx = int(snapshot_seq_raw)
+                snapshot_version = f"k{snapshot_idx:06d}"
+                stats_snapshot_version_to_idx.setdefault(snapshot_version, snapshot_idx)
+                payload["stats_snapshot_version_idx"] = torch.tensor([snapshot_idx], dtype=torch.long)
+            else:
+                stats_snapshot_version = contract.get("stats_snapshot_version")
+                if stats_snapshot_version is not None:
+                    snapshot_version = str(stats_snapshot_version).strip()
+                    if snapshot_version:
+                        snapshot_idx = stats_snapshot_version_to_idx.setdefault(
+                            snapshot_version,
+                            len(stats_snapshot_version_to_idx),
+                        )
+                        payload["stats_snapshot_version_idx"] = torch.tensor([snapshot_idx], dtype=torch.long)
+
+            snapshot_as_of_epoch = None
+            snapshot_as_of_epoch_raw = contract.get("stats_snapshot_as_of_epoch")
+            if isinstance(snapshot_as_of_epoch_raw, (int, float)) and not isinstance(snapshot_as_of_epoch_raw, bool):
+                snapshot_as_of_epoch = float(snapshot_as_of_epoch_raw)
+            if snapshot_as_of_epoch is None:
+                snapshot_as_of_ts = contract.get("stats_snapshot_as_of_ts")
+                snapshot_as_of_epoch = _safe_iso_to_epoch(snapshot_as_of_ts)
+            if snapshot_as_of_epoch is not None:
+                payload["stats_snapshot_as_of_epoch"] = torch.tensor([snapshot_as_of_epoch], dtype=torch.float64)
+
+            buffer.append(Data(**payload))
+            total_graphs += 1
+            if len(buffer) >= shard_size:
+                _flush_buffer(force=True)
+            else:
+                last_ram_check += 1
+                if max_ram_bytes is not None and last_ram_check >= 128:
+                    last_ram_check = 0
+                    rss_bytes = _process_rss_bytes()
+                    if rss_bytes >= max_ram_bytes:
+                        _flush_buffer(force=True)
+
+            current_progress = float(idx - 1) + (float(slice_idx) / float(trace_slice_total))
+            reporter.update(
+                message=desc,
+                current=current_progress,
+                total=total_traces,
+                payload={"graphs": int(total_graphs), "shards": int(len(shard_rows))},
+                force=(idx == 1 and slice_idx == 1),
+            )
+
+        reporter.update(
+            message=desc,
+            current=float(idx),
+            total=total_traces,
+            payload={"graphs": int(total_graphs), "shards": int(len(shard_rows))},
+            force=(idx == total_traces),
+        )
+        if idx % 1000 == 0:
+            iterator.set_postfix({"graphs": total_graphs, "shards": len(shard_rows)})
+
+    _flush_buffer(force=True)
+    dataset_payload["graphs"] = int(total_graphs)
+    dataset_payload["shards"] = shard_rows
+    structural_payload_count = sum(int(row.get("structural_payloads", 0)) for row in shard_rows)
+    logger.info(
+        "GRAPH_DATASET_STRUCT_PAYLOADS split=%s graphs=%d shards=%d structural_payloads=%d",
+        split_key,
+        int(total_graphs),
+        int(len(shard_rows)),
+        int(structural_payload_count),
+    )
+    reporter.done(
+        message=f"{desc} completed",
+        current=total_traces,
+        total=total_traces,
+        payload={"graphs": int(total_graphs), "shards": int(len(shard_rows))},
+    )
+    return dataset_payload
+
+
+def _build_graph_dataset(
+    traces: Sequence[RawTrace],
+    prefix_policy: PrefixPolicy,
+    graph_builder: DynamicGraphBuilder,
+    version_to_idx: Dict[str, int],
+    stats_snapshot_version_to_idx: Dict[str, int],
+    *,
+    show_progress: bool,
+    tqdm_disable: bool,
+    desc: str,
+    progress_stage: str | None = None,
+) -> List[Data]:
+    """Convert traces into a list of PyG Data graphs via prefix slicing + graph builder."""
+    dataset: List[Data] = []
+    total_traces = int(len(traces))
+    structured_progress = bool(progress_events_enabled())
+    stage = str(progress_stage or "").strip()
+    reporter: ProgressReporter | None = None
+    if stage:
+        reporter = ProgressReporter(stage=stage, total=total_traces, min_interval_sec=0.8)
+        reporter.start(message=desc, current=0, total=total_traces)
+    iterator = tqdm(
+        traces,
+        desc=desc,
+        unit="trace",
+        leave=False,
+        disable=(not show_progress) or tqdm_disable or structured_progress,
+    )
+    for idx, trace in enumerate(iterator, start=1):
+        trace_index = int(idx - 1)
+        trace_start_ts = float(trace.events[0].timestamp) if trace.events else 0.0
+        trace_end_ts = float(trace.events[-1].timestamp) if trace.events else trace_start_ts
+        prefix_slices = prefix_policy.generate_slices(trace)
+        trace_slice_total = int(len(prefix_slices))
+        if trace_slice_total <= 0:
+            if reporter is not None:
+                reporter.update(
+                    message=desc,
+                    current=float(idx),
+                    total=total_traces,
+                    payload={"graphs": int(len(dataset))},
+                    force=(idx == 1 or idx == total_traces),
+                )
+            continue
+        for slice_idx, prefix_slice in enumerate(prefix_slices, start=1):
+            contract = graph_builder.build_graph(prefix_slice)
+            version_label = str(prefix_slice.process_version)
+            version_idx = version_to_idx.setdefault(version_label, len(version_to_idx))
+            prefix_len = int(len(prefix_slice.prefix_events))
+            prefix_last_activity_idx = _prefix_last_activity_idx_from_contract(contract)
+            payload: Dict[str, Any] = {
+                "x_cat": contract["x_cat"],
+                "x_num": contract["x_num"],
+                "edge_index": contract["edge_index"],
+                "edge_type": contract["edge_type"],
+                "y": contract["y"],
+                "num_nodes": int(contract["num_nodes"]),
+                "prefix_len": torch.tensor([prefix_len], dtype=torch.long),
+                "process_version_idx": torch.tensor([version_idx], dtype=torch.long),
+                "trace_idx": torch.tensor([trace_index], dtype=torch.long),
+                "prefix_idx": torch.tensor([int(slice_idx - 1)], dtype=torch.long),
+                "prefix_last_activity_idx": torch.tensor([prefix_last_activity_idx], dtype=torch.long),
+                "trace_start_ts": torch.tensor([trace_start_ts], dtype=torch.float64),
+                "trace_end_ts": torch.tensor([trace_end_ts], dtype=torch.float64),
+            }
+            allowed_mask = contract.get("allowed_target_mask")
+            if isinstance(allowed_mask, torch.Tensor):
+                payload["allowed_target_mask"] = (
+                    allowed_mask.unsqueeze(0) if allowed_mask.dim() == 1 else allowed_mask
+                )
+            candidate_allowed_mask = contract.get("candidate_allowed_target_mask")
+            if isinstance(candidate_allowed_mask, torch.Tensor):
+                payload["candidate_allowed_target_mask"] = (
+                    candidate_allowed_mask.unsqueeze(0)
+                    if candidate_allowed_mask.dim() == 1
+                    else candidate_allowed_mask
+                )
+            if "audit_payload_json" in contract:
+                payload["audit_payload_json"] = contract["audit_payload_json"]
+            target_label = contract.get("target_label")
+            if target_label is not None:
+                payload["target_label"] = str(target_label)
+            struct_x = contract.get("struct_x")
+            if isinstance(struct_x, torch.Tensor):
+                payload["struct_x"] = struct_x
+            structural_edge_index = contract.get("structural_edge_index")
+            if isinstance(structural_edge_index, torch.Tensor):
+                payload["structural_edge_index"] = structural_edge_index
+            structural_edge_weight = contract.get("structural_edge_weight")
+            if isinstance(structural_edge_weight, torch.Tensor):
+                payload["structural_edge_weight"] = structural_edge_weight
+            struct_node_to_class_index = contract.get("struct_node_to_class_index")
+            if isinstance(struct_node_to_class_index, torch.Tensor):
+                payload["struct_node_to_class_index"] = struct_node_to_class_index
+            for tensor_key in (
+                "struct_node_to_candidate_index",
+                "candidate_class_index",
+                "candidate_is_unseen",
+            ):
+                tensor_value = contract.get(tensor_key)
+                if isinstance(tensor_value, torch.Tensor):
+                    payload[tensor_key] = tensor_value
+            for meta_key in ("candidate_ids", "candidate_labels"):
+                meta_value = contract.get(meta_key)
+                if isinstance(meta_value, (list, tuple)):
+                    payload[meta_key] = tuple(str(item) for item in meta_value)
+            struct_prefix_state_x = contract.get("struct_prefix_state_x")
+            if isinstance(struct_prefix_state_x, torch.Tensor):
+                payload["struct_prefix_state_x"] = struct_prefix_state_x
+            stats_allowed = contract.get("stats_allowed")
+            if isinstance(stats_allowed, bool):
+                payload["stats_allowed"] = torch.tensor([1 if stats_allowed else 0], dtype=torch.long)
+            stats_missing_asof_snapshot = contract.get("stats_missing_asof_snapshot")
+            if isinstance(stats_missing_asof_snapshot, bool):
+                payload["stats_missing_asof_snapshot"] = torch.tensor(
+                    [1 if stats_missing_asof_snapshot else 0],
+                    dtype=torch.long,
+                )
+            snapshot_seq_raw = contract.get("stats_snapshot_version_seq")
+            if isinstance(snapshot_seq_raw, (int, float)) and not isinstance(snapshot_seq_raw, bool):
+                snapshot_idx = int(snapshot_seq_raw)
+                snapshot_version = f"k{snapshot_idx:06d}"
+                stats_snapshot_version_to_idx.setdefault(snapshot_version, snapshot_idx)
+                payload["stats_snapshot_version_idx"] = torch.tensor([snapshot_idx], dtype=torch.long)
+            else:
+                # Backward compatibility for contracts that still expose text metadata.
+                stats_snapshot_version = contract.get("stats_snapshot_version")
+                if stats_snapshot_version is not None:
+                    snapshot_version = str(stats_snapshot_version).strip()
+                    if snapshot_version:
+                        snapshot_idx = stats_snapshot_version_to_idx.setdefault(snapshot_version, len(stats_snapshot_version_to_idx))
+                        payload["stats_snapshot_version_idx"] = torch.tensor([snapshot_idx], dtype=torch.long)
+
+            snapshot_as_of_epoch = None
+            snapshot_as_of_epoch_raw = contract.get("stats_snapshot_as_of_epoch")
+            if isinstance(snapshot_as_of_epoch_raw, (int, float)) and not isinstance(snapshot_as_of_epoch_raw, bool):
+                snapshot_as_of_epoch = float(snapshot_as_of_epoch_raw)
+            if snapshot_as_of_epoch is None:
+                snapshot_as_of_ts = contract.get("stats_snapshot_as_of_ts")
+                snapshot_as_of_epoch = _safe_iso_to_epoch(snapshot_as_of_ts)
+            if snapshot_as_of_epoch is not None:
+                payload["stats_snapshot_as_of_epoch"] = torch.tensor([snapshot_as_of_epoch], dtype=torch.float64)
+            dataset.append(
+                Data(**payload)
+            )
+            if reporter is not None:
+                current_progress = float(idx - 1) + (float(slice_idx) / float(trace_slice_total))
+                reporter.update(
+                    message=desc,
+                    current=current_progress,
+                    total=total_traces,
+                    payload={"graphs": int(len(dataset))},
+                    force=(idx == 1 and slice_idx == 1),
+                )
+        if reporter is not None:
+            reporter.update(
+                message=desc,
+                current=float(idx),
+                total=total_traces,
+                payload={"graphs": int(len(dataset))},
+                force=(idx == total_traces),
+            )
+        if idx % 1000 == 0:
+            iterator.set_postfix({"graphs": len(dataset)})
+    if reporter is not None:
+        reporter.done(
+            message=f"{desc} completed",
+            current=total_traces,
+            total=total_traces,
+            payload={"graphs": int(len(dataset))},
+        )
+    return dataset
+
+
+def _resolve_model_family(model_type: str) -> str:
+    text = str(model_type).strip().lower()
+    if text.startswith("eopkg"):
+        return "eopkg"
+    if text.startswith("baseline"):
+        return "baseline"
+    return "custom"
+
+
+def _summarize_graph_feature_mapping(graph_feature_mapping: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(graph_feature_mapping, dict):
+        return {
+            "enabled": False,
+            "node_feature_count": 0,
+            "node_scopes": [],
+            "edge_weight_enabled": False,
+            "edge_weight_metric": "none",
+            "stats_quality_gate_enabled": False,
+            "stats_quality_gate_on_fail": "none",
+        }
+
+    enabled = bool(graph_feature_mapping.get("enabled", False))
+    node_raw = graph_feature_mapping.get("node_numeric", [])
+    node_specs = [item for item in node_raw if isinstance(item, dict)] if isinstance(node_raw, list) else []
+    node_scopes = sorted(
+        {
+            str(item.get("scope", "version")).strip() or "version"
+            for item in node_specs
+            if str(item.get("metric", "")).strip()
+        }
+    )
+
+    edge_cfg = graph_feature_mapping.get("edge_weight", {})
+    edge_weight_enabled = isinstance(edge_cfg, dict) and bool(str(edge_cfg.get("metric", "")).strip())
+    edge_weight_metric = str(edge_cfg.get("metric", "")).strip() if isinstance(edge_cfg, dict) else ""
+
+    quality_gate_cfg = graph_feature_mapping.get("stats_quality_gate", {})
+    stats_quality_gate_enabled = bool(quality_gate_cfg.get("enabled", False)) if isinstance(quality_gate_cfg, dict) else False
+    stats_quality_gate_on_fail = (
+        str(quality_gate_cfg.get("on_fail", "ignore_with_warning")).strip()
+        if isinstance(quality_gate_cfg, dict)
+        else "ignore_with_warning"
+    )
+    projection_cfg = graph_feature_mapping.get("topology_projection", {})
+    gateway_mode = (
+        str(projection_cfg.get("gateway_mode", "preserve")).strip()
+        if isinstance(projection_cfg, dict)
+        else "preserve"
+    )
+    if gateway_mode not in {"preserve", "collapse_for_prediction"}:
+        gateway_mode = "preserve"
+
+    return {
+        "enabled": enabled,
+        "node_feature_count": int(len(node_specs)),
+        "node_scopes": node_scopes,
+        "edge_weight_enabled": bool(edge_weight_enabled),
+        "edge_weight_metric": edge_weight_metric or "none",
+        "stats_quality_gate_enabled": bool(stats_quality_gate_enabled),
+        "stats_quality_gate_on_fail": stats_quality_gate_on_fail or "ignore_with_warning",
+        "topology_gateway_mode": gateway_mode,
+    }
+
+
+def prepare_data(config: Dict[str, Any], trace_adapter: IXESAdapter | None = None) -> Dict[str, Any]:
+    """Prepare shared data artifacts for CLI and inspector without logic duplication."""
+    logger = logging.getLogger(__name__)
+    emit_progress_event(stage="prepare_data", status="start", message="Preparing data artifacts")
+    data_cfg = config.get("data", {})
+    experiment_cfg = config.get("experiment", {})
+    model_cfg = config.get("model", {})
+    training_cfg = config.get("training", {})
+    mapping_cfg_raw = config.get("mapping", {})
+    adapter = trace_adapter or _build_trace_adapter(mapping_cfg_raw)
+    adapter_kind = _resolve_trace_adapter_kind(mapping_cfg_raw)
+
+    log_path = str(data_cfg.get("log_path", "")).strip()
+    if adapter_kind == "xes" and not log_path:
+        raise ValueError("Config must define data.log_path for XES adapter")
+    if not log_path:
+        log_path = "__adapter_source__"
+    dataset_name = _resolve_dataset_name(data_cfg, log_path)
+    mapping_cfg = _inject_dataset_name_mapping(mapping_cfg_raw, dataset_name)
+
+    fraction = float(experiment_cfg.get("fraction", 1.0))
+    split_strategy = str(experiment_cfg.get("split_strategy", "temporal")).strip().lower()
+    if split_strategy == "time":
+        split_strategy = "temporal"
+    fraction_strategy = str(experiment_cfg.get("fraction_strategy", "temporal")).strip().lower()
+    version_scope_policy = str(experiment_cfg.get("version_scope_policy", "all")).strip().lower()
+    split_ratio = _parse_split_ratio(experiment_cfg)
+    train_ratio = float(experiment_cfg.get("train_ratio", 0.7))
+    mode = str(config.get("experiment", {}).get("mode", "train")).strip().lower()
+    if mode in {"eval_cross_dataset", "eval_drift", "eval_drift_finetune", TOPOLOGY_MASK_UNIFORM_MODE}:
+        split_ratio = (0.0, 0.0, 1.0)
+
+    prefix_policy = PrefixPolicy()
+
+    logger.info("Preparing data artifacts for mode=%s...", mode)
+    read_reporter = ProgressReporter(stage="prepare.read_events", min_interval_sec=0.8)
+    read_reporter.start(message=f"Reading events via {adapter.__class__.__name__}")
+    logger.info("Reading events for preparation via adapter=%s...", adapter.__class__.__name__)
+    traces: List[RawTrace] = []
+    event_count = 0
+    for trace_idx, trace in enumerate(adapter.read(log_path, mapping_cfg), start=1):
+        traces.append(trace)
+        event_count += int(len(trace.events))
+        read_reporter.update(
+            message=f"Reading events via {adapter.__class__.__name__}",
+            current=int(trace_idx),
+            total=None,
+            payload={"events": int(event_count)},
+            force=(trace_idx == 1),
+        )
+    logger.info("Event read finished: traces=%d", len(traces))
+    read_reporter.done(
+        message="Event read finished",
+        current=int(len(traces)),
+        total=int(len(traces)),
+        payload={"events": int(event_count)},
+    )
+    all_traces = list(traces)
+    all_version_counts = _trace_version_counts(all_traces)
+    traces = _apply_cascade_prepare(
+        traces,
+        mode=mode,
+        split_strategy=split_strategy,
+        train_ratio=train_ratio,
+        fraction=fraction,
+        fraction_strategy=fraction_strategy,
+        version_scope_policy=version_scope_policy,
+    )
+    logger.info(
+        "Applied cascade filter (mode=%s, fraction=%.4f, fraction_strategy=%s, split_strategy=%s, version_scope_policy=%s) -> traces=%d",
+        mode,
+        fraction,
+        fraction_strategy,
+        split_strategy,
+        version_scope_policy,
+        len(traces),
+    )
+    data_num_traces = len(traces)
+    data_num_events = sum(len(trace.events) for trace in traces)
+    prepared_version_counts = _trace_version_counts(traces)
+
+    feature_configs = parse_feature_configs(config)
+    schema_resolver = SchemaResolver()
+    policy_cfg = config.get("policies", {})
+    emit_progress_event(
+        stage="prepare.feature_encoder",
+        status="start",
+        message=f"Fitting feature encoder from {len(traces)} traces",
+    )
+    logger.info("Fitting feature encoder from %d traces...", len(traces))
+    feature_encoder = FeatureEncoder(
+        feature_configs=feature_configs,
+        traces=traces,
+        state_dict=config.get("encoder_state"),
+        schema_resolver=schema_resolver,
+        policy_config=policy_cfg,
+    )
+    logger.info("Feature encoder ready.")
+    emit_progress_event(stage="prepare.feature_encoder", status="done", message="Feature encoder ready")
+    feature_layout = feature_encoder.feature_layout
+
+    activity_vocab, resource_vocab, activity_feature = _extract_base_vocabularies(feature_encoder)
+    reverse_activity_vocab = {idx: key for key, idx in activity_vocab.items()}
+    reverse_resource_vocab = {idx: key for key, idx in resource_vocab.items()}
+
+    train_traces, val_traces, test_traces = _strict_temporal_split(traces, split_ratio, split_strategy)
+    train_version_counts = _trace_version_counts(train_traces)
+    val_version_counts = _trace_version_counts(val_traces)
+    test_version_counts = _trace_version_counts(test_traces)
+    version_collapse_warning = len(all_version_counts) > 1 and len(prepared_version_counts) <= 1
+    logger.info(
+        "DATA_SPLIT versions all=%s prepared=%s train=%s val=%s test=%s",
+        _format_trace_version_counts(all_version_counts),
+        _format_trace_version_counts(prepared_version_counts),
+        _format_trace_version_counts(train_version_counts),
+        _format_trace_version_counts(val_version_counts),
+        _format_trace_version_counts(test_version_counts),
+    )
+    if version_collapse_warning:
+        logger.warning(
+            "DATA_SPLIT_VERSION_COLLAPSE: source log has %d versions but cascade-selected data has %d version. "
+            "mode=%s train_ratio=%.4f fraction=%.4f selected=%s all=%s. "
+            "For versioned training, increase experiment.train_ratio or use eval_drift for the tail.",
+            len(all_version_counts),
+            len(prepared_version_counts),
+            mode,
+            train_ratio,
+            fraction,
+            _format_trace_version_counts(prepared_version_counts),
+            _format_trace_version_counts(all_version_counts),
+        )
+    knowledge_repo = build_knowledge_graph_repository(config)
+    knowledge_cfg = get_knowledge_graph_settings(config)
+    available_versions = knowledge_repo.list_versions(process_name=dataset_name)
+    if bool(knowledge_cfg.get("strict_load", False)):
+        if not available_versions:
+            raise ValueError(
+                "knowledge_graph.strict_load=true but no topology artifacts were found for "
+                f"process '{dataset_name}'. Run 'main.py ingest-topology --config ...' first."
+            )
+    elif not available_versions:
+        logger.warning(
+            "No topology artifacts found for process '%s'. Training will continue in baseline fallback mode. "
+            "Run 'python main.py ingest-topology --config <experiment.yaml>' to build structure from BPMN, "
+            "or set mapping.camunda_adapter.structure.structure_from_logs=true for explicit logs-based fallback ingestion.",
+            dataset_name,
+        )
+    logger.info(
+        "Knowledge graph backend=%s, strict_load=%s, available_versions=%s",
+        str(knowledge_cfg.get("backend", "in_memory")),
+        bool(knowledge_cfg.get("strict_load", False)),
+        len(available_versions),
+    )
+    normalization_stats = _build_normalization_stats()
+    graph_feature_mapping_raw = mapping_cfg.get("graph_feature_mapping", {})
+    graph_feature_mapping = (
+        dict(graph_feature_mapping_raw) if isinstance(graph_feature_mapping_raw, dict) else {}
+    )
+    topology_projection_cfg = graph_feature_mapping.get("topology_projection")
+    if not isinstance(topology_projection_cfg, dict):
+        topology_projection_cfg = {}
+        graph_feature_mapping["topology_projection"] = topology_projection_cfg
+    if not str(topology_projection_cfg.get("gateway_mode", "")).strip():
+        topology_projection_cfg["gateway_mode"] = (
+            "collapse_for_prediction" if adapter_kind == "xes" else "preserve"
+        )
+    mapping_cfg["graph_feature_mapping"] = graph_feature_mapping
+    feature_summary = _summarize_graph_feature_mapping(graph_feature_mapping)
+    stats_time_policy = str(experiment_cfg.get("stats_time_policy", "latest")).strip().lower() or "latest"
+    on_missing_asof_snapshot = str(
+        experiment_cfg.get("on_missing_asof_snapshot", "disable_stats")
+    ).strip().lower() or "disable_stats"
+    if on_missing_asof_snapshot not in {"disable_stats", "use_base", "raise"}:
+        on_missing_asof_snapshot = "disable_stats"
+    cache_policy = str(experiment_cfg.get("cache_policy", "full")).strip().lower() or "full"
+    if cache_policy in {"none", "disabled", "false"}:
+        cache_policy = "off"
+    if cache_policy not in {"off", "dto", "full"}:
+        cache_policy = "full"
+    cache_dir = str(experiment_cfg.get("cache_dir", "")).strip()
+    graph_dataset_cache_policy = _resolve_graph_dataset_cache_policy(experiment_cfg)
+    graph_dataset_cache_dir = _resolve_graph_dataset_cache_dir(experiment_cfg)
+    graph_dataset_disk_spill_enabled = _resolve_graph_dataset_disk_spill_enabled(experiment_cfg)
+    graph_dataset_shard_size = _resolve_graph_dataset_shard_size(experiment_cfg)
+    max_ram_bytes = _resolve_max_ram_bytes(experiment_cfg)
+    graph_dataset_cache_read = graph_dataset_cache_policy in {"read", "full"}
+    graph_dataset_cache_write = graph_dataset_cache_policy in {"write", "full"}
+    if graph_dataset_disk_spill_enabled and not graph_dataset_cache_write:
+        logger.warning(
+            "graph_dataset_disk_spill_enabled=true requires cache write mode. Forcing graph_dataset_cache_policy=write for this run."
+        )
+        graph_dataset_cache_write = True
+    model_type = str(model_cfg.get("type", model_cfg.get("model_type", "unknown_model"))).strip() or "unknown_model"
+    model_family = _resolve_model_family(model_type)
+    xes_cfg = mapping_cfg.get("xes_adapter", {})
+    xes_use_classifier = None
+    xes_activity_key = ""
+    xes_version_key = ""
+    if isinstance(xes_cfg, dict):
+        xes_use_classifier = bool(xes_cfg.get("use_classifier", True))
+        xes_activity_key = str(xes_cfg.get("activity_key", "concept:name")).strip() or "concept:name"
+        xes_version_key = str(xes_cfg.get("version_key", "concept:version")).strip() or "concept:version"
+    run_profile = {
+        "mode": mode,
+        "adapter_kind": adapter_kind,
+        "dataset_name": dataset_name,
+        "model_type": model_type,
+        "model_family": model_family,
+        "graph_features_enabled": bool(feature_summary.get("enabled", False)),
+        "node_feature_count": int(feature_summary.get("node_feature_count", 0)),
+        "node_scopes": list(feature_summary.get("node_scopes", [])),
+        "edge_weight_enabled": bool(feature_summary.get("edge_weight_enabled", False)),
+        "edge_weight_metric": str(feature_summary.get("edge_weight_metric", "none")),
+        "stats_quality_gate_enabled": bool(feature_summary.get("stats_quality_gate_enabled", False)),
+        "stats_quality_gate_on_fail": str(feature_summary.get("stats_quality_gate_on_fail", "ignore_with_warning")),
+        "topology_gateway_mode": str(feature_summary.get("topology_gateway_mode", "preserve")),
+        "global_process_stats_forward_enabled": False,
+        "stats_time_policy": stats_time_policy,
+        "on_missing_asof_snapshot": on_missing_asof_snapshot,
+        "cache_policy": cache_policy,
+        "cache_dir": cache_dir or ".cache/dynamic_graph_builder",
+        "graph_dataset_cache_policy": graph_dataset_cache_policy,
+        "graph_dataset_cache_dir": graph_dataset_cache_dir,
+        "graph_dataset_disk_spill_enabled": bool(graph_dataset_disk_spill_enabled),
+        "graph_dataset_shard_size": int(graph_dataset_shard_size),
+        "max_ram_gb": float(experiment_cfg.get("max_ram_gb", 0.0) or 0.0),
+        "knowledge_backend": str(knowledge_cfg.get("backend", "in_memory")),
+        "knowledge_strict_load": bool(knowledge_cfg.get("strict_load", False)),
+        "knowledge_versions_count": int(len(available_versions)),
+        "data_all_versions_count": int(len(all_version_counts)),
+        "data_prepared_versions_count": int(len(prepared_version_counts)),
+        "data_train_versions_count": int(len(train_version_counts)),
+        "data_val_versions_count": int(len(val_version_counts)),
+        "data_test_versions_count": int(len(test_version_counts)),
+        "data_all_versions": _format_trace_version_counts(all_version_counts),
+        "data_prepared_versions": _format_trace_version_counts(prepared_version_counts),
+        "data_train_versions": _format_trace_version_counts(train_version_counts),
+        "data_val_versions": _format_trace_version_counts(val_version_counts),
+        "data_test_versions": _format_trace_version_counts(test_version_counts),
+        "data_version_collapse_warning": bool(version_collapse_warning),
+        "fraction_strategy": fraction_strategy,
+        "version_scope_policy": version_scope_policy,
+        "xes_use_classifier": xes_use_classifier,
+        "xes_activity_key": xes_activity_key or None,
+        "xes_version_key": xes_version_key or None,
+        "dataloader_num_workers": max(0, int(training_cfg.get("dataloader_num_workers", 0))),
+        "dataloader_pin_memory": bool(training_cfg.get("dataloader_pin_memory", False)),
+    }
+    logger.info("========== RUN PROFILE ==========")
+    logger.info(
+        "RUN_PROFILE mode=%s model=%s model_family=%s adapter=%s dataset=%s stats_time_policy=%s on_missing_asof_snapshot=%s cache_policy=%s cache_dir=%s graph_cache_policy=%s graph_cache_dir=%s spill=%s shard_size=%d max_ram_gb=%.2f",
+        mode,
+        model_type,
+        model_family,
+        adapter_kind,
+        dataset_name,
+        stats_time_policy,
+        on_missing_asof_snapshot,
+        cache_policy,
+        run_profile["cache_dir"],
+        graph_dataset_cache_policy,
+        graph_dataset_cache_dir,
+        bool(graph_dataset_disk_spill_enabled),
+        int(graph_dataset_shard_size),
+        float(run_profile["max_ram_gb"]),
+    )
+    logger.info(
+        "RUN_PROFILE structure backend=%s strict_load=%s versions=%d graph_features=%s node_features=%d node_scopes=%s edge_weight=%s edge_metric=%s gateway_mode=%s global_process_forward=%s",
+        run_profile["knowledge_backend"],
+        run_profile["knowledge_strict_load"],
+        run_profile["knowledge_versions_count"],
+        "on" if run_profile["graph_features_enabled"] else "off",
+        run_profile["node_feature_count"],
+        ",".join(str(item) for item in run_profile["node_scopes"]) or "none",
+        "on" if run_profile["edge_weight_enabled"] else "off",
+        run_profile["edge_weight_metric"],
+        run_profile["topology_gateway_mode"],
+        "on" if run_profile["global_process_stats_forward_enabled"] else "off",
+    )
+    if adapter_kind == "xes":
+        logger.info(
+            "RUN_PROFILE xes use_classifier=%s activity_key=%s version_key=%s",
+            bool(xes_use_classifier),
+            xes_activity_key or "concept:name",
+            xes_version_key or "concept:version",
+        )
+    logger.info(
+        "RUN_PROFILE data_versions all=%s prepared=%s train=%s val=%s test=%s collapse_warning=%s",
+        run_profile["data_all_versions"],
+        run_profile["data_prepared_versions"],
+        run_profile["data_train_versions"],
+        run_profile["data_val_versions"],
+        run_profile["data_test_versions"],
+        bool(run_profile["data_version_collapse_warning"]),
+    )
+    logger.info(
+        "RUN_PROFILE checks alignment_guard=%s quality_guard=%s forward_stats_summary=%s cache_policy=%s",
+        "manual",
+        "on" if run_profile["stats_quality_gate_enabled"] else "off",
+        "on",
+        cache_policy,
+    )
+    logger.info(
+        "RUN_PROFILE runtime dataloader_workers=%d pin_memory=%s",
+        run_profile["dataloader_num_workers"],
+        run_profile["dataloader_pin_memory"],
+    )
+    logger.info("=================================")
+    graph_builder = DynamicGraphBuilder(
+        rs01_admissibility_policy=experiment_cfg.get("rs01_admissibility_policy"),
+        feature_encoder=feature_encoder,
+        knowledge_port=knowledge_repo,
+        process_name=dataset_name,
+        graph_feature_mapping=graph_feature_mapping,
+        stats_time_policy=stats_time_policy,
+        on_missing_asof_snapshot=on_missing_asof_snapshot,
+        cache_policy=cache_policy,
+        cache_dir=cache_dir,
+        candidate_identity_mode=training_cfg.get("candidate_identity_mode", "topology_native"),
+        process_state_mask_enabled=_as_bool(training_cfg.get("process_state_mask_enabled"), default=False),
+        process_state_mask_source=str(training_cfg.get("process_state_mask_source", "lifecycle_active_set")),
+        process_state_mask_include_direct_successors=_as_bool(
+            training_cfg.get("process_state_mask_include_direct_successors"),
+            default=True,
+        ),
+        process_state_mask_include_active_candidates=_as_bool(
+            training_cfg.get("process_state_mask_include_active_candidates"),
+            default=True,
+        ),
+        process_state_mask_relaxed_lookback_events=int(
+            training_cfg.get("process_state_mask_relaxed_lookback_events", 8)
+        ),
+        process_state_mask_relaxed_max_depth=int(training_cfg.get("process_state_mask_relaxed_max_depth", 1)),
+        process_state_mask_relaxed_max_cardinality_ratio=float(
+            training_cfg.get("process_state_mask_relaxed_max_cardinality_ratio", 0.35)
+        ),
+        process_state_mask_relaxed_suppress_completed=_as_bool(
+            training_cfg.get("process_state_mask_relaxed_suppress_completed"),
+            default=True,
+        ),
+        process_state_mask_relaxed_anchor_policy=str(
+            training_cfg.get("process_state_mask_relaxed_anchor_policy", "open_successors")
+        ),
+        process_state_mask_relaxed_loop_policy=str(
+            training_cfg.get("process_state_mask_relaxed_loop_policy", "keep_direct_successor_repeats")
+        ),
+    )
+    show_progress = bool(training_cfg.get("show_progress", True))
+    tqdm_disable = bool(training_cfg.get("tqdm_disable", False))
+
+    logger.info(
+        "Building graph datasets: train_traces=%d, val_traces=%d, test_traces=%d",
+        len(train_traces),
+        len(val_traces),
+        len(test_traces),
+    )
+    cache_fingerprint = _graph_dataset_cache_fingerprint(
+        config=config,
+        dataset_name=dataset_name,
+        adapter_kind=adapter_kind,
+        mode=mode,
+        split_strategy=split_strategy,
+        fraction_strategy=fraction_strategy,
+        version_scope_policy=version_scope_policy,
+        split_ratio=split_ratio,
+        train_ratio=train_ratio,
+        fraction=fraction,
+        stats_time_policy=stats_time_policy,
+        on_missing_asof_snapshot=on_missing_asof_snapshot,
+        log_path=log_path,
+        traces_all=all_traces,
+        train_traces=train_traces,
+        val_traces=val_traces,
+        test_traces=test_traces,
+        activity_vocab=activity_vocab,
+        resource_vocab=resource_vocab,
+        graph_feature_mapping=graph_feature_mapping,
+    )
+    cache_hit = False
+    version_to_idx: Dict[str, int] = {}
+    stats_snapshot_version_to_idx: Dict[str, int] = {}
+    train_dataset: Any
+    val_dataset: Any
+    test_dataset: Any
+    cache_bundle = None
+    if graph_dataset_cache_read:
+        cache_bundle = _load_graph_dataset_cache(
+            cache_dir=graph_dataset_cache_dir,
+            dataset_name=dataset_name,
+            fingerprint=cache_fingerprint,
+        )
+    if cache_bundle is not None:
+        cache_hit = True
+        train_dataset = cache_bundle["train_dataset"]
+        val_dataset = cache_bundle["val_dataset"]
+        test_dataset = cache_bundle["test_dataset"]
+        version_to_idx = dict(cache_bundle["version_to_idx"])
+        stats_snapshot_version_to_idx = dict(cache_bundle["stats_snapshot_version_to_idx"])
+        logger.info(
+            "Graph dataset cache hit: policy=%s dir=%s key=%s train=%d val=%d test=%d",
+            graph_dataset_cache_policy,
+            graph_dataset_cache_dir,
+            cache_fingerprint[:12],
+            _dataset_payload_graph_count(train_dataset),
+            _dataset_payload_graph_count(val_dataset),
+            _dataset_payload_graph_count(test_dataset),
+        )
+        emit_progress_event(
+            stage="build_graph.train",
+            status="done",
+            message="Train graphs loaded from disk cache",
+            current=int(len(train_traces)),
+            total=int(len(train_traces)),
+            payload={"graphs": int(_dataset_payload_graph_count(train_dataset)), "from_cache": True},
+        )
+        emit_progress_event(
+            stage="build_graph.validation",
+            status="done",
+            message="Validation graphs loaded from disk cache",
+            current=int(len(val_traces)),
+            total=int(len(val_traces)),
+            payload={"graphs": int(_dataset_payload_graph_count(val_dataset)), "from_cache": True},
+        )
+        emit_progress_event(
+            stage="build_graph.test",
+            status="done",
+            message="Test graphs loaded from disk cache",
+            current=int(len(test_traces)),
+            total=int(len(test_traces)),
+            payload={"graphs": int(_dataset_payload_graph_count(test_dataset)), "from_cache": True},
+        )
+    else:
+        version_to_idx = {}
+        stats_snapshot_version_to_idx = {}
+        if graph_dataset_disk_spill_enabled:
+            entry_dir = _graph_dataset_cache_entry_dir(
+                graph_dataset_cache_dir,
+                dataset_name,
+                cache_fingerprint,
+            )
+            train_dataset = _build_graph_dataset_sharded(
+                train_traces,
+                prefix_policy,
+                graph_builder,
+                version_to_idx,
+                stats_snapshot_version_to_idx,
+                show_progress=show_progress,
+                tqdm_disable=tqdm_disable,
+                desc="Build train graphs",
+                progress_stage="build_graph.train",
+                entry_dir=entry_dir,
+                split_key="train",
+                shard_size=graph_dataset_shard_size,
+                max_ram_bytes=max_ram_bytes,
+            )
+            val_dataset = _build_graph_dataset_sharded(
+                val_traces,
+                prefix_policy,
+                graph_builder,
+                version_to_idx,
+                stats_snapshot_version_to_idx,
+                show_progress=show_progress,
+                tqdm_disable=tqdm_disable,
+                desc="Build val graphs",
+                progress_stage="build_graph.validation",
+                entry_dir=entry_dir,
+                split_key="validation",
+                shard_size=graph_dataset_shard_size,
+                max_ram_bytes=max_ram_bytes,
+            )
+            test_dataset = _build_graph_dataset_sharded(
+                test_traces,
+                prefix_policy,
+                graph_builder,
+                version_to_idx,
+                stats_snapshot_version_to_idx,
+                show_progress=show_progress,
+                tqdm_disable=tqdm_disable,
+                desc="Build test graphs",
+                progress_stage="build_graph.test",
+                entry_dir=entry_dir,
+                split_key="test",
+                shard_size=graph_dataset_shard_size,
+                max_ram_bytes=max_ram_bytes,
+            )
+            if graph_dataset_cache_write:
+                try:
+                    saved_dir = _save_graph_dataset_cache_sharded(
+                        cache_dir=graph_dataset_cache_dir,
+                        dataset_name=dataset_name,
+                        fingerprint=cache_fingerprint,
+                        train_split=train_dataset,
+                        val_split=val_dataset,
+                        test_split=test_dataset,
+                        version_to_idx=version_to_idx,
+                        stats_snapshot_version_to_idx=stats_snapshot_version_to_idx,
+                        payload_meta={
+                            "mode": mode,
+                            "adapter": adapter_kind,
+                            "split_strategy": split_strategy,
+                            "fraction_strategy": fraction_strategy,
+                            "version_scope_policy": version_scope_policy,
+                            "fraction": float(fraction),
+                            "train_ratio": float(train_ratio),
+                            "split_ratio": [float(item) for item in split_ratio],
+                            "disk_spill_enabled": True,
+                            "shard_size": int(graph_dataset_shard_size),
+                            "max_ram_bytes": int(max_ram_bytes or 0),
+                        },
+                    )
+                    logger.info(
+                        "Graph dataset cache saved (sharded): dir=%s key=%s",
+                        saved_dir,
+                        cache_fingerprint[:12],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Graph dataset cache save failed (sharded, dir=%s key=%s): %s",
+                        graph_dataset_cache_dir,
+                        cache_fingerprint[:12],
+                        exc,
+                    )
+        else:
+            train_dataset = _build_graph_dataset(
+                train_traces,
+                prefix_policy,
+                graph_builder,
+                version_to_idx,
+                stats_snapshot_version_to_idx,
+                show_progress=show_progress,
+                tqdm_disable=tqdm_disable,
+                desc="Build train graphs",
+                progress_stage="build_graph.train",
+            )
+            val_dataset = _build_graph_dataset(
+                val_traces,
+                prefix_policy,
+                graph_builder,
+                version_to_idx,
+                stats_snapshot_version_to_idx,
+                show_progress=show_progress,
+                tqdm_disable=tqdm_disable,
+                desc="Build val graphs",
+                progress_stage="build_graph.validation",
+            )
+            test_dataset = _build_graph_dataset(
+                test_traces,
+                prefix_policy,
+                graph_builder,
+                version_to_idx,
+                stats_snapshot_version_to_idx,
+                show_progress=show_progress,
+                tqdm_disable=tqdm_disable,
+                desc="Build test graphs",
+                progress_stage="build_graph.test",
+            )
+            if graph_dataset_cache_write:
+                try:
+                    saved_dir = _save_graph_dataset_cache(
+                        cache_dir=graph_dataset_cache_dir,
+                        dataset_name=dataset_name,
+                        fingerprint=cache_fingerprint,
+                        train_dataset=train_dataset,
+                        val_dataset=val_dataset,
+                        test_dataset=test_dataset,
+                        version_to_idx=version_to_idx,
+                        stats_snapshot_version_to_idx=stats_snapshot_version_to_idx,
+                        payload_meta={
+                            "mode": mode,
+                            "adapter": adapter_kind,
+                            "split_strategy": split_strategy,
+                            "fraction_strategy": fraction_strategy,
+                            "version_scope_policy": version_scope_policy,
+                            "fraction": float(fraction),
+                            "train_ratio": float(train_ratio),
+                            "split_ratio": [float(item) for item in split_ratio],
+                        },
+                    )
+                    logger.info(
+                        "Graph dataset cache saved: dir=%s key=%s",
+                        saved_dir,
+                        cache_fingerprint[:12],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Graph dataset cache save failed (dir=%s key=%s): %s",
+                        graph_dataset_cache_dir,
+                        cache_fingerprint[:12],
+                        exc,
+                    )
+    idx_to_version = {idx: version for version, idx in version_to_idx.items()}
+    idx_to_stats_snapshot_version = {
+        idx: snapshot_version for snapshot_version, idx in stats_snapshot_version_to_idx.items()
+    }
+    run_profile["graph_dataset_cache_hit"] = bool(cache_hit)
+    run_profile["graph_dataset_cache_key"] = cache_fingerprint[:12]
+    train_struct_x_diag = _tensor_scale_diagnostics(train_dataset, tensor_name="struct_x")
+    val_struct_x_diag = _tensor_scale_diagnostics(val_dataset, tensor_name="struct_x")
+    test_struct_x_diag = _tensor_scale_diagnostics(test_dataset, tensor_name="struct_x")
+    train_edge_weight_diag = _tensor_scale_diagnostics(train_dataset, tensor_name="structural_edge_weight")
+    logger.info(
+        "STRUCT_TENSOR_SCALE train_struct_x max_abs=%.6g p99_abs=%.6g warning=%s val_struct_x max_abs=%.6g p99_abs=%.6g warning=%s test_struct_x max_abs=%.6g p99_abs=%.6g warning=%s train_edge_weight max_abs=%.6g p99_abs=%.6g warning=%s",
+        float(train_struct_x_diag["max_abs"]),
+        float(train_struct_x_diag["p99_abs"]),
+        bool(train_struct_x_diag["scale_warning"]),
+        float(val_struct_x_diag["max_abs"]),
+        float(val_struct_x_diag["p99_abs"]),
+        bool(val_struct_x_diag["scale_warning"]),
+        float(test_struct_x_diag["max_abs"]),
+        float(test_struct_x_diag["p99_abs"]),
+        bool(test_struct_x_diag["scale_warning"]),
+        float(train_edge_weight_diag["max_abs"]),
+        float(train_edge_weight_diag["p99_abs"]),
+        bool(train_edge_weight_diag["scale_warning"]),
+    )
+    if bool(train_struct_x_diag["scale_warning"]) or bool(val_struct_x_diag["scale_warning"]) or bool(test_struct_x_diag["scale_warning"]):
+        logger.warning(
+            "STRUCT_TENSOR_SCALE_WARNING: struct_x contains very large or non-finite values. "
+            "Use bounded encodings such as ['log1p', 'z-score'] for count/duration statistics instead of raw identity."
+        )
+    logger.info(
+        "Graph datasets ready: train_graphs=%d, val_graphs=%d, test_graphs=%d",
+        _dataset_payload_graph_count(train_dataset),
+        _dataset_payload_graph_count(val_dataset),
+        _dataset_payload_graph_count(test_dataset),
+    )
+    emit_progress_event(
+        stage="prepare_data",
+        status="done",
+        message="Data preparation completed",
+        payload={
+            "train_graphs": int(_dataset_payload_graph_count(train_dataset)),
+            "validation_graphs": int(_dataset_payload_graph_count(val_dataset)),
+            "test_graphs": int(_dataset_payload_graph_count(test_dataset)),
+        },
+    )
+
+    return {
+        "log_path": log_path,
+        "mapping_config": mapping_cfg,
+        "data_config": {
+            "dataset_name": dataset_name,
+            "dataset_label": str(data_cfg.get("dataset_label", "unknown_data")),
+        },
+        "experiment_split_config": {
+            "fraction": fraction,
+            "split_strategy": split_strategy,
+            "fraction_strategy": fraction_strategy,
+            "version_scope_policy": version_scope_policy,
+            "split_ratio": list(split_ratio),
+            "train_ratio": train_ratio,
+        },
+        "data_metrics": {
+            "data_all_num_traces": int(len(all_traces)),
+            "data_all_num_events": int(event_count),
+            "data_num_traces": int(data_num_traces),
+            "data_num_events": int(data_num_events),
+            "vocab_activity_size": int(len(activity_vocab)),
+            "vocab_resource_size": int(len(resource_vocab)),
+            "data_all_versions_count": int(len(all_version_counts)),
+            "data_prepared_versions_count": int(len(prepared_version_counts)),
+            "data_train_versions_count": int(len(train_version_counts)),
+            "data_val_versions_count": int(len(val_version_counts)),
+            "data_test_versions_count": int(len(test_version_counts)),
+            "data_all_versions": _format_trace_version_counts(all_version_counts),
+            "data_prepared_versions": _format_trace_version_counts(prepared_version_counts),
+            "data_train_versions": _format_trace_version_counts(train_version_counts),
+            "data_val_versions": _format_trace_version_counts(val_version_counts),
+            "data_test_versions": _format_trace_version_counts(test_version_counts),
+            "data_version_collapse_warning": bool(version_collapse_warning),
+            "train_struct_x_max_abs": float(train_struct_x_diag["max_abs"]),
+            "train_struct_x_p99_abs": float(train_struct_x_diag["p99_abs"]),
+            "train_struct_x_scale_warning": bool(train_struct_x_diag["scale_warning"]),
+            "val_struct_x_max_abs": float(val_struct_x_diag["max_abs"]),
+            "val_struct_x_p99_abs": float(val_struct_x_diag["p99_abs"]),
+            "val_struct_x_scale_warning": bool(val_struct_x_diag["scale_warning"]),
+            "test_struct_x_max_abs": float(test_struct_x_diag["max_abs"]),
+            "test_struct_x_p99_abs": float(test_struct_x_diag["p99_abs"]),
+            "test_struct_x_scale_warning": bool(test_struct_x_diag["scale_warning"]),
+            "train_edge_weight_max_abs": float(train_edge_weight_diag["max_abs"]),
+            "train_edge_weight_p99_abs": float(train_edge_weight_diag["p99_abs"]),
+            "train_edge_weight_scale_warning": bool(train_edge_weight_diag["scale_warning"]),
+        },
+        "activity_vocab": activity_vocab,
+        "resource_vocab": resource_vocab,
+        "reverse_activity_vocab": reverse_activity_vocab,
+        "reverse_resource_vocab": reverse_resource_vocab,
+        "feature_configs": feature_configs,
+        "feature_layout": feature_layout,
+        "feature_encoder": feature_encoder,
+        "activity_feature": activity_feature,
+        "extra_vocabs": feature_encoder.categorical_vocabs,
+        "ordered_extra_keys": [cfg.name for cfg in feature_configs],
+        "normalization_stats": normalization_stats,
+        "input_dim": feature_layout.num_dim,
+        "graph_builder": graph_builder,
+        "prefix_policy": prefix_policy,
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "prepared_traces": list(traces),
+        "train_traces": list(train_traces),
+        "val_traces": list(val_traces),
+        "test_traces": list(test_traces),
+        "idx_to_version": idx_to_version,
+        "version_to_idx": version_to_idx,
+        "idx_to_stats_snapshot_version": idx_to_stats_snapshot_version,
+        "stats_snapshot_version_to_idx": stats_snapshot_version_to_idx,
+        "run_profile": run_profile,
+        "graph_dataset_cache_hit": bool(cache_hit),
+        "graph_dataset_cache_fingerprint": cache_fingerprint,
+    }
+
+
+def _compute_class_weights(train_dataset: Any, num_classes: int, device: torch.device) -> torch.Tensor:
+    """Compute inverse-frequency class weights with 0.0 for absent classes."""
+    counts = np.zeros(num_classes, dtype=np.float64)
+    for sample in _iter_graphs_from_dataset_payload(train_dataset):
+        y_idx = int(sample.y.view(-1)[0].item())
+        if 0 <= y_idx < num_classes:
+            counts[y_idx] += 1.0
+
+    total_samples = float(np.sum(counts))
+    weights = np.zeros(num_classes, dtype=np.float32)
+    if total_samples > 0.0:
+        for idx in range(num_classes):
+            if counts[idx] > 0.0:
+                weights[idx] = float(total_samples / (num_classes * counts[idx]))
+            else:
+                weights[idx] = 0.0
+
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
+def _build_mou_progress_callback() -> Any:
+    reporters: Dict[str, ProgressReporter] = {}
+
+    def _report_progress(**event: Any) -> None:
+        stage = str(event.get("stage", "")).strip() or "mou.evaluate"
+        status = str(event.get("status", "update")).strip() or "update"
+        reporter = reporters.get(stage)
+        if reporter is None:
+            reporter = ProgressReporter(stage=stage, min_interval_sec=0.8)
+            reporters[stage] = reporter
+        kwargs = {
+            "message": str(event.get("message", "")),
+            "current": event.get("current"),
+            "total": event.get("total"),
+            "payload": event.get("payload") if isinstance(event.get("payload"), dict) else None,
+        }
+        if status == "start":
+            reporter.start(**kwargs)
+        elif status == "done":
+            reporter.done(**kwargs)
+        elif status == "error":
+            reporter.error(message=kwargs["message"], payload=kwargs["payload"])
+        else:
+            reporter.update(**kwargs)
+
+    return _report_progress
+
+
+def _log_mou_results_to_mlflow(tracker: Any, results: Mapping[str, Any]) -> None:
+    """Log scalar MOU metrics and per-window diagnostics to an active tracker."""
+    for key, value in (results.get("test_metrics", {}) or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            tracker.log_metric(str(key), float(value))
+
+    for key, value in (results.get("monte_carlo", {}) or {}).items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            tracker.log_metric(f"monte_carlo.{key}", float(value))
+
+    drift_metrics = results.get("drift_metrics", []) or []
+    if isinstance(drift_metrics, Sequence):
+        for window_index, row in enumerate(drift_metrics):
+            if not isinstance(row, Mapping):
+                continue
+            step = int(row.get("window_index", window_index))
+            has_canonical_strict = "window_strict_macro_f1" in row
+            has_canonical_hybrid = "window_macro_f1" in row
+            for key, value in row.items():
+                if key == "window_index":
+                    continue
+                if key == "window_strict_test_macro_f1_mc_mean" and has_canonical_strict:
+                    continue
+                if key == "window_test_macro_f1_mc_mean" and has_canonical_hybrid:
+                    continue
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    tracker.log_metric(_mou_drift_metric_key(str(key)), float(value), step=step)
+
+
+def _mou_drift_metric_key(key: str) -> str:
+    if key == "window_strict_test_macro_f1_mc_mean":
+        return "drift_window_strict_macro_f1"
+    if key == "window_test_macro_f1_mc_mean":
+        return "drift_window_macro_f1"
+    normalized = key.removeprefix("window_")
+    return f"drift_window_{normalized}"
+
+
+def _build_mou_mlflow_params(config: Mapping[str, Any]) -> Dict[str, Any]:
+    params = _build_mlflow_params(dict(config), max_value_len=480)
+    params["experiment.mode"] = "eval_drift"
+    params["experiment.evaluation_mode"] = TOPOLOGY_MASK_UNIFORM_MODE
+    params["model.type"] = "MOU"
+    params["model_type"] = "MOU"
+    experiment_cfg = config.get("experiment", {}) if isinstance(config.get("experiment"), Mapping) else {}
+    params["rs01.metric_contract_id"] = "mou_native_candidate_label_mask.v1"
+    params["rs01.prediction_space"] = "mou_native_candidate_label"
+    params["rs01.mask_space"] = "mou_native_candidate_label"
+    params["rs01.mc_draws"] = str(experiment_cfg.get("uniform_mask_mc_draws", ""))
+    policy = experiment_cfg.get("rs01_admissibility_policy")
+    if policy is not None:
+        params["rs01.metric_contract_id"] = "state_aware_activity_label_mask.v2"
+        params["rs01.prediction_space"] = "activity_label"
+        params["rs01.mask_space"] = "activity_label"
+        params["rs01.mask_policy_id"] = hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    return params
+
+
+def main() -> None:
+    """Parse CLI args, wire dependencies, and run model training."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    parser = argparse.ArgumentParser(description="Run MVP1 next-activity training pipeline.")
+    parser.add_argument("--config", default="configs/experiments/experiment.yaml", help="YAML experiment config path or filename.")
+    args = parser.parse_args()
+
+    config_path = _resolve_config_path(args.config)
+    config = load_yaml_config(args.config)
+    config = _apply_experiment_switch_overrides(config)
+
+    seed = int(config.get("seed", 42))
+    set_seed(seed)
+
+    model_cfg = config.get("model", {})
+    training_cfg = config.get("training", {})
+    _configure_cpu_threading(training_cfg, logger)
+    experiment_cfg = config.get("experiment", {})
+    tracking_cfg = config.get("tracking", {})
+    mode = str(experiment_cfg.get("mode", "train")).strip().lower()
+
+    exp_name = str(experiment_cfg.get("name", "Run")).strip() or "Run"
+    ds_label = str(config.get("data", {}).get("dataset_label", experiment_cfg.get("dataset", "unknown_data"))).strip() or "unknown_data"
+    model_label_for_name = str(model_cfg.get("model_label", model_cfg.get("type", "unknown_model"))).strip() or "unknown_model"
+    full_run_name = f"{exp_name}_{ds_label}_{model_label_for_name}"
+
+    checkpoint_run_name = str(training_cfg.get("checkpoint_run_name", full_run_name)).strip() or full_run_name
+    checkpoint_dir = str(training_cfg.get("checkpoint_dir", "checkpoints")).strip() or "checkpoints"
+    checkpoint_override = str(training_cfg.get("checkpoint_path", "")).strip()
+    resume_checkpoint_override = str(training_cfg.get("resume_checkpoint_path", "")).strip()
+    load_checkpoint_override = str(experiment_cfg.get("load_checkpoint", "")).strip()
+
+    retrain = bool(training_cfg.get("retrain", False))
+    resume_train_mode = (mode == "train") and (not retrain)
+    checkpoint_payload_for_resume: Dict[str, Any] | None = None
+    checkpoint_epoch_for_resume = 0
+
+    if mode == TOPOLOGY_MASK_UNIFORM_MODE:
+        config["encoder_state"] = _load_uniform_mask_encoder_state(experiment_cfg)
+        resolved_checkpoint_path = str(experiment_cfg.get("uniform_mask_encoder_checkpoint", "")).strip()
+        resolved_resume_checkpoint_path = resolved_checkpoint_path
+    elif mode.startswith("eval_"):
+        if not load_checkpoint_override:
+            raise ValueError("Р”Р»СЏ eval СЂРµР¶РёРјС–РІ РЅРµРѕР±С…С–РґРЅРѕ РІРєР°Р·Р°С‚Рё С€Р»СЏС… РґРѕ С‡РµРєРїРѕС–РЅС‚Сѓ РІ experiment.load_checkpoint")
+        resolved_checkpoint_path = load_checkpoint_override
+        resolved_resume_checkpoint_path = resolved_checkpoint_path
+
+    else:
+        resolved_checkpoint_path = (
+            checkpoint_override
+            or load_checkpoint_override
+            or str(Path(checkpoint_dir) / f"{checkpoint_run_name}_best.pth")
+        )
+        resolved_resume_checkpoint_path = (
+            resume_checkpoint_override
+            or (_derive_last_checkpoint_path(resolved_checkpoint_path) if resume_train_mode else resolved_checkpoint_path)
+        )
+
+    early_checkpoint_path = resolved_checkpoint_path if mode.startswith("eval_") else resolved_resume_checkpoint_path
+    should_early_load_checkpoint = (
+        (mode.startswith("eval_") and mode != TOPOLOGY_MASK_UNIFORM_MODE)
+        or (resume_train_mode and Path(early_checkpoint_path).exists())
+    )
+
+    if should_early_load_checkpoint:
+        if mode.startswith("eval_") and not Path(early_checkpoint_path).exists():
+            raise ValueError(f"Checkpoint required for mode '{mode}' was not found: {early_checkpoint_path}")
+
+        checkpoint_payload = load_trusted_torch_artifact(early_checkpoint_path, map_location="cpu")
+        if not isinstance(checkpoint_payload, dict):
+            raise ValueError("Checkpoint payload must be a dictionary.")
+        model_state_dict = checkpoint_payload.get("model_state_dict")
+        if model_state_dict is None:
+            raise ValueError("Checkpoint payload does not contain required key 'model_state_dict'.")
+        checkpoint_payload_for_resume = checkpoint_payload
+        checkpoint_epoch_for_resume = int(checkpoint_payload.get("epoch", 0) or 0)
+        encoder_state = checkpoint_payload.get("encoder_state")
+        if encoder_state is None:
+            raise ValueError(
+                "Checkpoint does not contain 'encoder_state'. "
+                "Cross-dataset/drift evaluation requires frozen encoder vocabularies."
+            )
+        config["encoder_state"] = encoder_state
+
+    if mode in {"eval_drift", "eval_drift_finetune", TOPOLOGY_MASK_UNIFORM_MODE}:
+        drift_window_size = int(experiment_cfg.get("drift_window_size", 500))
+        if drift_window_size <= 0:
+            raise ValueError("experiment.drift_window_size must be a positive integer.")
+        drift_window_sliding = int(experiment_cfg.get("drift_window_sliding", 0) or 0)
+        if drift_window_sliding < 0:
+            raise ValueError("experiment.drift_window_sliding must be a non-negative integer.")
+        experiment_cfg = {
+            **experiment_cfg,
+            "drift_window_size": drift_window_size,
+            "drift_window_sliding": drift_window_sliding,
+        }
+        config["experiment"] = experiment_cfg
+
+    trace_adapter = _build_trace_adapter(config.get("mapping", {}))
+    prepared = prepare_data(config, trace_adapter=trace_adapter)
+    activity_vocab = prepared["activity_vocab"]
+    resource_vocab = prepared["resource_vocab"]
+
+    if mode == TOPOLOGY_MASK_UNIFORM_MODE:
+        evaluator = TopologyMaskUniformEvaluator(
+            empty_mask_policy=str(experiment_cfg.get("uniform_mask_empty_mask_policy", "raise")).strip() or "raise",
+            evaluation_seed=int(experiment_cfg.get("uniform_mask_evaluation_seed", 20260831)),
+            mc_draws=int(experiment_cfg.get("uniform_mask_mc_draws", 200)),
+            drift_window_size=int(experiment_cfg.get("drift_window_size", 0) or 0),
+            drift_window_sliding=int(experiment_cfg.get("drift_window_sliding", 0) or 0),
+            progress_callback=_build_mou_progress_callback(),
+        )
+        mou_tracker = None
+        if bool(tracking_cfg.get("enabled", False)):
+            tracking_experiment_name = _resolve_tracking_experiment_name(
+                str(experiment_cfg.get("project", "DefaultExperiment")),
+                mode,
+            )
+            mou_tracker = MLflowTracker(
+                experiment_name=tracking_experiment_name,
+                run_name=full_run_name,
+                tracking_uri=tracking_cfg.get("uri"),
+            )
+            mou_tracker.log_tag("tracking_project_base", str(experiment_cfg.get("project", "DefaultExperiment")))
+            mou_tracker.log_tag("mode", "eval_drift")
+            mou_tracker.log_tag("evaluation_mode", mode)
+            mou_tracker.log_tag("model_type", "MOU")
+            mou_tracker.log_params(_build_mou_mlflow_params(config))
+        try:
+            results = evaluator.evaluate(_iter_graphs_from_dataset_payload(prepared["test_dataset"]))
+            if mou_tracker is not None:
+                _log_mou_results_to_mlflow(mou_tracker, results)
+            logger.info(
+                "Topology mask uniform evaluation finished: encoder=%s seed=%d draws=%d",
+                str(experiment_cfg.get("uniform_mask_encoder_checkpoint", "")).strip(),
+                int(results.get("monte_carlo", {}).get("evaluation_seed", 20260831)),
+                int(results.get("monte_carlo", {}).get("draws", 0)),
+            )
+            print("=== Topology Mask Uniform Metrics ===")
+            for key, value in results.get("test_metrics", {}).items():
+                print(f"{key}: {value}")
+        finally:
+            if mou_tracker is not None:
+                mou_tracker.close()
+        return
+
+    if not mode.startswith("eval_"):
+        logger.info("Built vocabularies: activity_vocab=%d, resource_vocab=%d", len(activity_vocab), len(resource_vocab))
+
+    # input_dim = Р±Р°Р·РѕРІС– one-hot + С‡Р°СЃРѕРІС– С„С–С‡С– + typed extra-С„С–С‡С– (СѓР·РіРѕРґР¶РµРЅРѕ Р· graph_builder).
+    output_dim = len(activity_vocab)
+    feature_layout = prepared["feature_layout"]
+
+    model_kwargs = _build_model_factory_kwargs(
+        model_cfg=model_cfg,
+        feature_layout=feature_layout,
+        output_dim=output_dim,
+    )
+    model_type = str(model_kwargs["model_type"])
+    model = create_model(**model_kwargs)
+    logger.info("Initialized model via factory: type=%s", model_type)
+
+    device = torch.device(str(training_cfg.get("device", "cpu")))
+    class_weights = _compute_class_weights(prepared["train_dataset"], output_dim, device)
+
+    md_label = model_label_for_name
+
+    tracker = None
+    if bool(tracking_cfg.get("enabled", False)):
+        tracking_experiment_name = _resolve_tracking_experiment_name(
+            str(experiment_cfg.get("project", "DefaultExperiment")),
+            mode,
+        )
+        target_epochs = int(training_cfg.get("epochs", 10))
+        resume_run_id = _resolve_resume_mlflow_run_id(
+            mode=mode,
+            retrain=retrain,
+            checkpoint_payload=checkpoint_payload_for_resume,
+            checkpoint_epoch=checkpoint_epoch_for_resume,
+            target_epochs=target_epochs,
+            experiment_name=tracking_experiment_name,
+            run_name=full_run_name,
+            tracking_uri=str(tracking_cfg.get("uri", "")).strip(),
+        )
+        tracker = MLflowTracker(
+            experiment_name=tracking_experiment_name,
+            run_name=full_run_name,
+            tracking_uri=tracking_cfg.get("uri"),
+            resume_run_id=resume_run_id,
+        )
+        tracker.log_tag("tracking_project_base", str(experiment_cfg.get("project", "DefaultExperiment")))
+        tracker.log_tag("mode", mode)
+        if isinstance(resume_run_id, str) and resume_run_id.strip():
+            logger.info(
+                "MLflow resume mode: continuing run_id=%s (checkpoint_epoch=%d target_epochs=%d)",
+                resume_run_id,
+                int(checkpoint_epoch_for_resume),
+                int(target_epochs),
+            )
+            tracker.log_tag("resume_from_checkpoint", str(early_checkpoint_path))
+            tracker.log_tag("resume_checkpoint_epoch", int(checkpoint_epoch_for_resume))
+        elif mode in {"eval_drift", "eval_drift_finetune", "eval_cross_dataset"}:
+            logger.info(
+                "MLflow eval mode (%s): using new experiment '%s' and starting a new run.",
+                mode,
+                tracking_experiment_name,
+            )
+        mlflow_params = _build_mlflow_params(config, max_value_len=480)
+        tracker.log_params(mlflow_params)
+        logger.info("Logged MLflow params from selected blocks: %d entries.", len(mlflow_params))
+
+    trace_recorder = _build_trace_recorder(
+        tracking_cfg=tracking_cfg,
+        run_id=tracker.get_run_id() if tracker is not None else None,
+        experiment_id=tracker.get_experiment_id() if tracker is not None else None,
+        output_dir=str(Path("outputs") / "mlflow_trace_fallback"),
+    )
+
+    trainer_experiment_cfg = dict(experiment_cfg)
+    trainer_experiment_cfg.update(prepared.get("experiment_split_config", {}))
+    trainer_experiment_cfg["name"] = full_run_name
+    finetune_start_ratio = trainer_experiment_cfg.get(
+        "finetune_start_ratio",
+        training_cfg.get("finetune_start_ratio", 0.0),
+    )
+
+    trainer_config: Dict[str, Any] = {
+        **training_cfg,
+        "mapping_config": prepared["mapping_config"],
+        "data_config": prepared["data_config"],
+        "run_profile": prepared.get("run_profile", {}),
+        "model_config": model_cfg,
+        "experiment_config": trainer_experiment_cfg,
+        "tracking_config": tracking_cfg,
+        "config_path": str(config_path),
+        "feature_configs": [
+            {
+                "name": item.name,
+                "source_key": item.source_key,
+                "encoding": list(item.encoding),
+                "source": item.source,
+                "dtype": item.dtype,
+                "role": item.role,
+            }
+            for item in prepared["feature_configs"]
+        ],
+        "policy_config": config.get("policies", {}),
+        "data_metrics": prepared["data_metrics"],
+        "dataset_label": ds_label,
+        "model_label": md_label,
+        "feature_layout": {
+            "num_cat_features": len(prepared["feature_layout"].cat_feature_names),
+            "num_num_channels": int(prepared["feature_layout"].num_dim),
+            "cat_feature_names": list(prepared["feature_layout"].cat_feature_names),
+        },
+        "seed": seed,
+        "class_weight_cap": float(training_cfg.get("class_weight_cap", 50.0)),
+        "retrain": retrain,
+        "checkpoint_dir": checkpoint_dir,
+        "checkpoint_path": resolved_checkpoint_path,
+        "resume_checkpoint_path": resolved_resume_checkpoint_path,
+        "tracking_model_type": _resolve_tracking_model_type(config),
+        "mode": mode,
+        "drift_window_size": int(experiment_cfg.get("drift_window_size", 500)),
+        "drift_window_sliding": int(experiment_cfg.get("drift_window_sliding", 0) or 0),
+        "finetune_start_ratio": float(finetune_start_ratio or 0.0),
+    }
+
+    trainer = ModelTrainer(
+        xes_adapter=trace_adapter,
+        prefix_policy=PrefixPolicy(),
+        graph_builder=prepared["graph_builder"],
+        model=model,
+        log_path=prepared["log_path"],
+        config=trainer_config,
+        tracker=tracker,
+        trace_recorder=trace_recorder,
+        class_weights=class_weights,
+        prepared_data=prepared,
+    )
+
+    try:
+        results = trainer.run()
+        test_metrics = results.get("test_metrics", {})
+
+        print("=== Final Test Metrics ===")
+        for key, value in test_metrics.items():
+            print(f"{key}: {value}")
+    finally:
+        if tracker is not None:
+            if trace_recorder is not None:
+                fallback_json_path = getattr(trace_recorder, "fallback_json_path", None)
+                if fallback_json_path is not None and Path(fallback_json_path).exists():
+                    tracker.log_artifact(str(fallback_json_path))
+            tracker.close()
+
+
+if __name__ == "__main__":
+    main()
+

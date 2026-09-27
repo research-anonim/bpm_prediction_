@@ -1,0 +1,205 @@
+# This file owns only the explicit execution queue.
+# Preset payloads remain in experiment_ui_presets.json.
+# Remove, comment out, or reorder entries before running the benchmark.
+
+runs:
+  # ========================================================
+  # 1. Loan Process Evolution Benchmark (v1 - v5)
+  # ========================================================
+  - preset: EOPKG
+  - preset: EOPKG-WI
+  - preset: EOPKG-WI-drift
+  - preset: EOPKG-drift
+  - preset: EOPKG-drift-finetune
+  - preset: GATv2
+  - preset: GATv2+Mask
+  - preset: GATv2+Mask-drift
+  - preset: GATv2+Mask-drift-finetune
+  - preset: GATv2-drift
+  - preset: LSTM
+  - preset: LSTM-drift
+  - preset: MOU-drift
+
+  # ========================================================
+  # 2. CDLG Process-Tree Structural Drift Benchmarks
+  # ========================================================
+  # --- Case: complex1 ---
+  - preset: _CDLG-complex1_EOPKG
+  - preset: _CDLG-complex1_EOPKG-WI
+  - preset: _CDLG-complex1_EOPKG-WI-drift
+  - preset: _CDLG-complex1_EOPKG-drift
+  - preset: _CDLG-complex1_EOPKG-drift-finetune
+  - preset: _CDLG-complex1_GATv2
+  - preset: _CDLG-complex1_GATv2+Mask
+  - preset: _CDLG-complex1_GATv2+Mask-drift
+  - preset: _CDLG-complex1_GATv2+Mask-drift-finetune
+  - preset: _CDLG-complex1_GATv2-drift
+  - preset: _CDLG-complex1_MOU-drift
+  # --- Case: complex2 ---
+  - preset: _CDLG-complex2_EOPKG
+  - preset: _CDLG-complex2_EOPKG-WI
+  - preset: _CDLG-complex2_EOPKG-WI-drift
+  - preset: _CDLG-complex2_EOPKG-drift
+  - preset: _CDLG-complex2_EOPKG-drift-finetune
+  - preset: _CDLG-complex2_GATv2
+  - preset: _CDLG-complex2_GATv2+Mask
+  - preset: _CDLG-complex2_GATv2+Mask-drift
+  - preset: _CDLG-complex2_GATv2+Mask-drift-finetune
+  - preset: _CDLG-complex2_GATv2-drift
+  - preset: _CDLG-complex2_MOU-drift
+  # --- Case: complex3 ---
+  - preset: _CDLG-complex3_EOPKG
+  - preset: _CDLG-complex3_EOPKG-WI
+  - preset: _CDLG-complex3_EOPKG-WI-drift
+  - preset: _CDLG-complex3_EOPKG-drift
+  - preset: _CDLG-complex3_EOPKG-drift-finetune
+  - preset: _CDLG-complex3_GATv2
+  - preset: _CDLG-complex3_GATv2+Mask
+  - preset: _CDLG-complex3_GATv2+Mask-drift
+  - preset: _CDLG-complex3_GATv2+Mask-drift-finetune
+  - preset: _CDLG-complex3_GATv2-drift
+  - preset: _CDLG-complex3_MOU-drift
+  # --- Case: complex4 ---
+  - preset: _CDLG-complex4_EOPKG
+  - preset: _CDLG-complex4_EOPKG-WI
+  - preset: _CDLG-complex4_EOPKG-WI-drift
+  - preset: _CDLG-complex4_EOPKG-drift
+  - preset: _CDLG-complex4_EOPKG-drift-finetune
+  - preset: _CDLG-complex4_GATv2
+  - preset: _CDLG-complex4_GATv2+Mask
+  - preset: _CDLG-complex4_GATv2+Mask-drift
+  - preset: _CDLG-complex4_GATv2+Mask-drift-finetune
+  - preset: _CDLG-complex4_GATv2-drift
+  - preset: _CDLG-complex4_MOU-drift
+  # --- Case: complex5 ---
+  - preset: _CDLG-complex5_EOPKG
+  - preset: _CDLG-complex5_EOPKG-WI
+  - preset: _CDLG-complex5_EOPKG-WI-drift
+  - preset: _CDLG-complex5_EOPKG-drift
+  - preset: _CDLG-complex5_EOPKG-drift-finetune
+  - preset: _CDLG-complex5_GATv2
+  - preset: _CDLG-complex5_GATv2+Mask
+  - preset: _CDLG-complex5_GATv2+Mask-drift
+  - preset: _CDLG-complex5_GATv2+Mask-drift-finetune
+  - preset: _CDLG-complex5_GATv2-drift
+  - preset: _CDLG-complex5_MOU-drift
+  # --- Case: medium1 ---
+  - preset: _CDLG-medium1_EOPKG
+  - preset: _CDLG-medium1_EOPKG-WI
+  - preset: _CDLG-medium1_EOPKG-WI-drift
+  - preset: _CDLG-medium1_EOPKG-drift
+  - preset: _CDLG-medium1_EOPKG-drift-finetune
+  - preset: _CDLG-medium1_GATv2
+  - preset: _CDLG-medium1_GATv2+Mask
+  - preset: _CDLG-medium1_GATv2+Mask-drift
+  - preset: _CDLG-medium1_GATv2+Mask-drift-finetune
+  - preset: _CDLG-medium1_GATv2-drift
+  - preset: _CDLG-medium1_MOU-drift
+  # --- Case: medium2 ---
+  - preset: _CDLG-medium2_EOPKG
+  - preset: _CDLG-medium2_EOPKG-WI
+  - preset: _CDLG-medium2_EOPKG-WI-drift
+  - preset: _CDLG-medium2_EOPKG-drift
+  - preset: _CDLG-medium2_EOPKG-drift-finetune
+  - preset: _CDLG-medium2_GATv2
+  - preset: _CDLG-medium2_GATv2+Mask
+  - preset: _CDLG-medium2_GATv2+Mask-drift
+  - preset: _CDLG-medium2_GATv2+Mask-drift-finetune
+  - preset: _CDLG-medium2_GATv2-drift
+  - preset: _CDLG-medium2_MOU-drift
+  # --- Case: medium3 ---
+  - preset: _CDLG-medium3_EOPKG
+  - preset: _CDLG-medium3_EOPKG-WI
+  - preset: _CDLG-medium3_EOPKG-WI-drift
+  - preset: _CDLG-medium3_EOPKG-drift
+  - preset: _CDLG-medium3_EOPKG-drift-finetune
+  - preset: _CDLG-medium3_GATv2
+  - preset: _CDLG-medium3_GATv2+Mask
+  - preset: _CDLG-medium3_GATv2+Mask-drift
+  - preset: _CDLG-medium3_GATv2+Mask-drift-finetune
+  - preset: _CDLG-medium3_GATv2-drift
+  - preset: _CDLG-medium3_MOU-drift
+  # --- Case: medium4 ---
+  - preset: _CDLG-medium4_EOPKG
+  - preset: _CDLG-medium4_EOPKG-WI
+  - preset: _CDLG-medium4_EOPKG-WI-drift
+  - preset: _CDLG-medium4_EOPKG-drift
+  - preset: _CDLG-medium4_EOPKG-drift-finetune
+  - preset: _CDLG-medium4_GATv2
+  - preset: _CDLG-medium4_GATv2+Mask
+  - preset: _CDLG-medium4_GATv2+Mask-drift
+  - preset: _CDLG-medium4_GATv2+Mask-drift-finetune
+  - preset: _CDLG-medium4_GATv2-drift
+  - preset: _CDLG-medium4_MOU-drift
+  # --- Case: medium5 ---
+  - preset: _CDLG-medium5_EOPKG
+  - preset: _CDLG-medium5_EOPKG-WI
+  - preset: _CDLG-medium5_EOPKG-WI-drift
+  - preset: _CDLG-medium5_EOPKG-drift
+  - preset: _CDLG-medium5_EOPKG-drift-finetune
+  - preset: _CDLG-medium5_GATv2
+  - preset: _CDLG-medium5_GATv2+Mask
+  - preset: _CDLG-medium5_GATv2+Mask-drift
+  - preset: _CDLG-medium5_GATv2+Mask-drift-finetune
+  - preset: _CDLG-medium5_GATv2-drift
+  - preset: _CDLG-medium5_MOU-drift
+  # --- Case: simple1 ---
+  - preset: _CDLG-simple1_EOPKG
+  - preset: _CDLG-simple1_EOPKG-WI
+  - preset: _CDLG-simple1_EOPKG-WI-drift
+  - preset: _CDLG-simple1_EOPKG-drift
+  - preset: _CDLG-simple1_EOPKG-drift-finetune
+  - preset: _CDLG-simple1_GATv2
+  - preset: _CDLG-simple1_GATv2+Mask
+  - preset: _CDLG-simple1_GATv2+Mask-drift
+  - preset: _CDLG-simple1_GATv2+Mask-drift-finetune
+  - preset: _CDLG-simple1_GATv2-drift
+  - preset: _CDLG-simple1_MOU-drift
+  # --- Case: simple2 ---
+  - preset: _CDLG-simple2_EOPKG
+  - preset: _CDLG-simple2_EOPKG-WI
+  - preset: _CDLG-simple2_EOPKG-WI-drift
+  - preset: _CDLG-simple2_EOPKG-drift
+  - preset: _CDLG-simple2_EOPKG-drift-finetune
+  - preset: _CDLG-simple2_GATv2
+  - preset: _CDLG-simple2_GATv2+Mask
+  - preset: _CDLG-simple2_GATv2+Mask-drift
+  - preset: _CDLG-simple2_GATv2+Mask-drift-finetune
+  - preset: _CDLG-simple2_GATv2-drift
+  - preset: _CDLG-simple2_MOU-drift
+  # --- Case: simple3 ---
+  - preset: _CDLG-simple3_EOPKG
+  - preset: _CDLG-simple3_EOPKG-WI
+  - preset: _CDLG-simple3_EOPKG-WI-drift
+  - preset: _CDLG-simple3_EOPKG-drift
+  - preset: _CDLG-simple3_EOPKG-drift-finetune
+  - preset: _CDLG-simple3_GATv2
+  - preset: _CDLG-simple3_GATv2+Mask
+  - preset: _CDLG-simple3_GATv2+Mask-drift
+  - preset: _CDLG-simple3_GATv2+Mask-drift-finetune
+  - preset: _CDLG-simple3_GATv2-drift
+  - preset: _CDLG-simple3_MOU-drift
+  # --- Case: simple4 ---
+  - preset: _CDLG-simple4_EOPKG
+  - preset: _CDLG-simple4_EOPKG-WI
+  - preset: _CDLG-simple4_EOPKG-WI-drift
+  - preset: _CDLG-simple4_EOPKG-drift
+  - preset: _CDLG-simple4_EOPKG-drift-finetune
+  - preset: _CDLG-simple4_GATv2
+  - preset: _CDLG-simple4_GATv2+Mask
+  - preset: _CDLG-simple4_GATv2+Mask-drift
+  - preset: _CDLG-simple4_GATv2+Mask-drift-finetune
+  - preset: _CDLG-simple4_GATv2-drift
+  - preset: _CDLG-simple4_MOU-drift
+  # --- Case: simple5 ---
+  - preset: _CDLG-simple5_EOPKG
+  - preset: _CDLG-simple5_EOPKG-WI
+  - preset: _CDLG-simple5_EOPKG-WI-drift
+  - preset: _CDLG-simple5_EOPKG-drift
+  - preset: _CDLG-simple5_EOPKG-drift-finetune
+  - preset: _CDLG-simple5_GATv2
+  - preset: _CDLG-simple5_GATv2+Mask
+  - preset: _CDLG-simple5_GATv2+Mask-drift
+  - preset: _CDLG-simple5_GATv2+Mask-drift-finetune
+  - preset: _CDLG-simple5_GATv2-drift
+  - preset: _CDLG-simple5_MOU-drift

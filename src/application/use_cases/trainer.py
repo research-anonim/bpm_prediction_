@@ -1,0 +1,7574 @@
+"""Application use-case for MVP1 model training and evaluation."""
+
+# Р’С–РґРїРѕРІС–РґРЅРѕ РґРѕ:
+# - ARCHITECTURE_RULES.MD -> СЂРѕР·РґС–Р» 2-4 (Application orchestration С‡РµСЂРµР· РїРѕСЂС‚Рё)
+# - EVF_MVP1.MD -> СЂРѕР·РґС–Р» 3 (Strict Temporal Split), СЂРѕР·РґС–Р» 4 (С†С–Р»СЊРѕРІС– РјРµС‚СЂРёРєРё), СЂРѕР·РґС–Р» 5 (tracking)
+# - AGENT_GUIDE.MD -> СЂРѕР·РґС–Р» 2 (MVP1 scope, Р±РµР· Critic/Reliability)
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from bisect import bisect_right
+from datetime import datetime, timezone
+import logging
+import math
+import random
+from pathlib import Path
+import tempfile
+from time import perf_counter, sleep
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from uuid import uuid4
+import warnings
+
+import numpy as np
+import psutil
+import torch
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, top_k_accuracy_score
+from torch import nn
+import torch.nn.functional as F
+from torch.nn.parameter import UninitializedParameter
+from torch.optim import Adam
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch.utils.data import Dataset, Sampler
+from tqdm import tqdm
+
+from src.application.ports.graph_builder_port import IGraphBuilder
+from src.application.ports.prefix_policy_port import IPrefixPolicy
+from src.application.ports.trace_recorder_port import ITraceRecorder
+from src.application.ports.tracker_port import ITracker
+from src.application.ports.xes_adapter_port import IXESAdapter
+from src.application.services.learning_strategy_config import LearningStrategyConfig
+from src.application.services.drift_release_policy import (
+    adaptive_window_start_trace,
+    eligible_released_trace_indices,
+    newly_observed_trace_indices,
+    released_trace_indices,
+)
+from src.application.services.candidate_target_mapping import (
+    candidate_target_mask_from_labels,
+    candidate_predictions_to_global,
+    candidate_set_cross_entropy,
+    candidate_target_summary,
+    candidate_set_predictions,
+)
+from src.application.services.outcome_partition_audit import (
+    COMMON_MASK_CONTRACT, COMMON_SAFETY_KEYS, common_mask_observation,
+    AuditObservation,
+    OutcomePartitionSummary,
+    aggregate_outcomes,
+)
+from src.application.services.structural_trace_payload_builder import build_structural_prediction_trace_event
+from src.application.services.topology_conditioned_learning import (
+    allowed_set_mass_leakage,
+    allowed_set_loss,
+    candidate_allowed_flow_summary,
+    candidate_allowed_mask_from_global,
+    candidate_topology_flow_penalty_loss,
+    margin_negative_loss,
+    version_weighted_cross_entropy,
+)
+from src.application.services.topology_payload_pool import (
+    TopologyPayloadPool,
+    drop_structural_edges,
+    replace_structural_payload,
+)
+from src.application.services.trace_sampling_policy import TraceSamplingPolicy, classify_trace_reason
+from src.domain.entities.candidate_prediction import CandidatePredictionOutput
+from src.domain.entities.raw_trace import RawTrace
+from src.domain.entities.tensor_contract import GraphTensorContract
+from src.domain.models.base_gnn import BaseGNN
+from src.domain.services.candidate_label_matching import candidate_label_metric_key
+from src.domain.services.torch_serialization import load_trusted_torch_artifact
+from src.infrastructure.runtime.progress_events import ProgressReporter, emit_progress_event, progress_events_enabled
+
+
+logger = logging.getLogger(__name__)
+
+
+def _as_bool(raw: Any, *, default: bool = False) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+@dataclass
+class SplitData:
+    """Container for chronologically split trace subsets."""
+
+    train: List[RawTrace]
+    val: List[RawTrace]
+    test: List[RawTrace]
+
+
+@dataclass
+class DriftInferenceRecords:
+    """Compact per-prefix inference records for drift-window aggregation."""
+
+    trace_idx: np.ndarray
+    y_true: np.ndarray
+    y_pred: np.ndarray
+    confidence: np.ndarray
+    correct: np.ndarray
+    top3_hit: np.ndarray
+    oos_flags: np.ndarray
+    target_in_mask_flags: np.ndarray
+    pred_in_mask_flags: np.ndarray
+    strict_error_but_allowed_flags: np.ndarray
+    mask_cardinality: np.ndarray
+    candidate_oos_flags: np.ndarray
+    candidate_invalid_probability_mass: np.ndarray
+    candidate_valid_probability_mass: np.ndarray
+    candidate_valid_invalid_logit_margin: np.ndarray
+    hybrid_correct_flags: np.ndarray
+    hybrid_set_nll: np.ndarray
+    ambiguous_flags: np.ndarray
+    prefix_lengths: np.ndarray
+    version_labels: List[str]
+    inference_ms_per_graph: float
+    fixed_y_true: np.ndarray
+    fixed_y_pred: np.ndarray
+    fixed_confidence: np.ndarray
+    fixed_correct: np.ndarray
+    fixed_set_nll: np.ndarray
+    audit_observations: tuple[AuditObservation, ...] = ()
+
+
+def _data_topology_key(graph: Data) -> str:
+    raw_version = getattr(graph, "process_version_idx", None)
+    if isinstance(raw_version, torch.Tensor) and raw_version.numel() > 0:
+        version = f"v:{int(raw_version.view(-1)[0].item())}"
+    else:
+        version = "v:__missing__"
+    raw_snapshot = getattr(graph, "stats_snapshot_version_idx", None)
+    if isinstance(raw_snapshot, torch.Tensor) and raw_snapshot.numel() > 0:
+        snapshot = f"s:{int(raw_snapshot.view(-1)[0].item())}"
+    else:
+        snapshot = "s:__none__"
+    return f"{version}|{snapshot}"
+
+
+class ShardedGraphDataset(Dataset[Data]):
+    """Lazy on-disk dataset backed by shard files produced by CLI graph cache."""
+
+    def __init__(self, *, entry_dir: str, shards: Sequence[Dict[str, Any]], max_cached_shards: int = 2) -> None:
+        self.entry_dir = Path(str(entry_dir))
+        self._shards: List[Dict[str, Any]] = []
+        self._offsets: List[int] = []
+        total = 0
+        for row in shards:
+            if not isinstance(row, dict):
+                continue
+            rel_path = str(row.get("path", "")).strip()
+            count = int(row.get("count", 0))
+            if not rel_path or count <= 0:
+                continue
+            shard_payload: Dict[str, Any] = {"path": rel_path, "count": int(count)}
+            segments = row.get("topology_segments")
+            if isinstance(segments, list):
+                shard_payload["topology_segments"] = segments
+            self._shards.append(shard_payload)
+            total += int(count)
+            self._offsets.append(total)
+        self._size = int(total)
+        self._max_cached_shards = max(1, int(max_cached_shards))
+        self._cached_shards: Dict[int, List[Data]] = {}
+        self._cache_lru_order: List[int] = []
+        self._topology_index: Tuple[str, ...] | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any], *, max_cached_shards: int = 2) -> "ShardedGraphDataset":
+        return cls(
+            entry_dir=str(payload.get("entry_dir", "")),
+            shards=payload.get("shards", []),
+            max_cached_shards=max_cached_shards,
+        )
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __getitem__(self, index: int) -> Data:
+        if index < 0 or index >= self._size:
+            raise IndexError(index)
+        shard_idx = int(bisect_right(self._offsets, index))
+        prev_total = self._offsets[shard_idx - 1] if shard_idx > 0 else 0
+        local_idx = index - prev_total
+        shard = self._load_shard(shard_idx)
+        return shard[local_idx]
+
+    def _load_shard(self, shard_idx: int) -> List[Data]:
+        cached = self._cached_shards.get(shard_idx)
+        if isinstance(cached, list):
+            try:
+                self._cache_lru_order.remove(shard_idx)
+            except ValueError:
+                pass
+            self._cache_lru_order.append(shard_idx)
+            return cached
+        row = self._shards[shard_idx]
+        shard_path = self.entry_dir / str(row["path"])
+        loaded = load_trusted_torch_artifact(shard_path, map_location="cpu")
+        if isinstance(loaded, dict) and loaded.get("format") == "dedup_structural_payloads":
+            graphs = loaded.get("graphs", [])
+            registry = loaded.get("structural_payloads", {})
+            if not isinstance(graphs, list) or not isinstance(registry, dict):
+                raise ValueError(f"Invalid deduplicated shard payload for {shard_path}.")
+            hydrated: List[Data] = []
+            for graph in graphs:
+                if not isinstance(graph, Data):
+                    raise ValueError(f"Invalid graph item in {shard_path}.")
+                key = getattr(graph, "structural_payload_key", None)
+                payload = registry.get(str(key)) if key is not None else None
+                if isinstance(payload, dict):
+                    for name, value in payload.items():
+                        setattr(graph, name, value)
+                    if hasattr(graph, "structural_payload_key"):
+                        delattr(graph, "structural_payload_key")
+                hydrated.append(graph)
+            loaded = hydrated
+        if not isinstance(loaded, list):
+            raise ValueError(f"Invalid shard payload type for {shard_path}.")
+        self._cached_shards[shard_idx] = loaded
+        self._cache_lru_order.append(shard_idx)
+        evicted = False
+        while len(self._cache_lru_order) > self._max_cached_shards:
+            evict_idx = self._cache_lru_order.pop(0)
+            self._cached_shards.pop(evict_idx, None)
+            evicted = True
+        if evicted:
+            import gc
+            gc.collect()
+        return loaded
+
+    def shard_index_ranges(self) -> List[Tuple[int, int]]:
+        ranges: List[Tuple[int, int]] = []
+        start = 0
+        for end in self._offsets:
+            ranges.append((start, int(end)))
+            start = int(end)
+        return ranges
+
+    def topology_index(self) -> Tuple[str, ...]:
+        """Return one topology identity per graph without hydrating structural tensors."""
+        if self._topology_index is not None:
+            return self._topology_index
+
+        indexed: List[str] = []
+        can_use_segments = True
+        for row in self._shards:
+            segments = row.get("topology_segments")
+            if not isinstance(segments, list):
+                can_use_segments = False
+                break
+            expanded: List[str] = []
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    can_use_segments = False
+                    break
+                key = str(segment.get("key", "")).strip()
+                count = int(segment.get("count", 0))
+                if not key or count <= 0:
+                    can_use_segments = False
+                    break
+                expanded.extend([key] * count)
+            if not can_use_segments or len(expanded) != int(row.get("count", 0)):
+                can_use_segments = False
+                break
+            indexed.extend(expanded)
+        if can_use_segments and len(indexed) == self._size:
+            self._topology_index = tuple(indexed)
+            return self._topology_index
+
+        import gc
+        indexed = []
+        for i, row in enumerate(self._shards):
+            shard_path = self.entry_dir / str(row["path"])
+            loaded = load_trusted_torch_artifact(shard_path, map_location="cpu")
+            graphs = loaded.get("graphs", []) if isinstance(loaded, dict) and loaded.get("format") == "dedup_structural_payloads" else loaded
+            if not isinstance(graphs, list):
+                raise ValueError(f"Invalid shard payload type for {shard_path}.")
+            for graph in graphs:
+                if not isinstance(graph, Data):
+                    raise ValueError(f"Invalid graph item in {shard_path}.")
+                indexed.append(_data_topology_key(graph))
+            loaded = None
+            graphs = None
+            if (i + 1) % 5 == 0:
+                gc.collect()
+        if len(indexed) != self._size:
+            raise ValueError(f"Invalid sharded topology index size: expected {self._size}, got {len(indexed)}.")
+        self._topology_index = tuple(indexed)
+        gc.collect()
+        return self._topology_index
+
+
+class _ShardAwareRandomSampler(Sampler[int]):
+    """Shuffle by shard then by index within shard to avoid random disk seeks."""
+
+    def __init__(self, dataset: ShardedGraphDataset, *, seed: int = 42) -> None:
+        self._dataset = dataset
+        self._base_seed = int(seed)
+        self._iteration = 0
+
+    def __iter__(self) -> Iterable[int]:
+        rng = random.Random(self._base_seed + self._iteration)
+        self._iteration += 1
+        shard_ranges = self._dataset.shard_index_ranges()
+        shard_ids = list(range(len(shard_ranges)))
+        rng.shuffle(shard_ids)
+        for shard_idx in shard_ids:
+            start, end = shard_ranges[shard_idx]
+            indices = list(range(int(start), int(end)))
+            rng.shuffle(indices)
+            for idx in indices:
+                yield idx
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class _TopologyHomogeneousBatchSampler(Sampler[List[int]]):
+    """Yield mini-batches grouped by process_version_idx and stats snapshot."""
+
+    def __init__(self, dataset: Any, *, batch_size: int, shuffle: bool, seed: int = 42) -> None:
+        self._dataset = dataset
+        self._batch_size = max(1, int(batch_size))
+        self._shuffle = bool(shuffle)
+        self._base_seed = int(seed)
+        self._iteration = 0
+        self._topology_keys = self._resolve_topology_keys(dataset)
+        self._groups = self._build_groups(self._topology_keys)
+
+    @staticmethod
+    def _graph_key(graph: Data) -> str:
+        return _data_topology_key(graph)
+
+    @classmethod
+    def _resolve_topology_keys(cls, dataset: Any) -> Tuple[str, ...]:
+        index_fn = getattr(dataset, "topology_index", None)
+        if callable(index_fn):
+            raw_keys = tuple(str(key) for key in index_fn())
+            if len(raw_keys) != len(dataset):
+                raise ValueError(f"Invalid topology_index length: expected {len(dataset)}, got {len(raw_keys)}.")
+            return raw_keys
+        keys: List[str] = []
+        for idx in range(len(dataset)):
+            graph = dataset[idx]
+            keys.append(cls._graph_key(graph))
+        return tuple(keys)
+
+    @classmethod
+    def _build_groups(cls, topology_keys: Sequence[str]) -> Dict[str, List[int]]:
+        groups: Dict[str, List[int]] = {}
+        for idx, key in enumerate(topology_keys):
+            groups.setdefault(str(key), []).append(int(idx))
+        return groups
+
+    def __iter__(self) -> Iterable[List[int]]:
+        if not self._shuffle:
+            current_key: str | None = None
+            current_batch: List[int] = []
+            for idx, key in enumerate(self._topology_keys):
+                if current_batch and (key != current_key or len(current_batch) >= self._batch_size):
+                    yield current_batch
+                    current_batch = []
+                current_key = key
+                current_batch.append(int(idx))
+            if current_batch:
+                yield current_batch
+            return
+
+        rng = random.Random(self._base_seed + self._iteration)
+        self._iteration += 1
+        keys = list(self._groups)
+        if self._shuffle:
+            rng.shuffle(keys)
+        for key in keys:
+            indices = list(self._groups[key])
+            if self._shuffle:
+                rng.shuffle(indices)
+            for start in range(0, len(indices), self._batch_size):
+                yield indices[start : start + self._batch_size]
+
+    def __len__(self) -> int:
+        if self._shuffle:
+            total = 0
+            for indices in self._groups.values():
+                total += int(math.ceil(len(indices) / float(self._batch_size)))
+            return total
+
+        total = 0
+        last_key: str | None = None
+        current_size = 0
+        for key in self._topology_keys:
+            if current_size and (key != last_key or current_size >= self._batch_size):
+                total += 1
+                current_size = 0
+            last_key = key
+            current_size += 1
+        return total + (1 if current_size else 0)
+
+
+class ModelTrainer:
+    """End-to-end trainer for MVP1 next-activity prediction baseline."""
+
+    def __init__(
+        self,
+        xes_adapter: IXESAdapter,
+        prefix_policy: IPrefixPolicy,
+        graph_builder: IGraphBuilder,
+        model: BaseGNN,
+        log_path: str,
+        config: Dict[str, Any],
+        tracker: Optional[ITracker] = None,
+        class_weights: Optional[torch.Tensor] = None,
+        prepared_data: Optional[Dict[str, Any]] = None,
+        trace_recorder: Optional[ITraceRecorder] = None,
+    ) -> None:
+        self.xes_adapter = xes_adapter
+        self.prefix_policy = prefix_policy
+        self.graph_builder = graph_builder
+        self.model = model
+        self.log_path = log_path
+        self.config = config
+        self.tracker = tracker
+        self.trace_recorder = trace_recorder
+        self.class_weights = class_weights
+        self.prepared_data = dict(prepared_data) if isinstance(prepared_data, dict) else None
+
+        self.batch_size = int(config.get("batch_size", 32))
+        self.epochs = int(config.get("epochs", 10))
+        self.learning_rate = float(config.get("learning_rate", 1e-3))
+        experiment_cfg = config.get("experiment_config", {})
+        experiment_finetune_start_ratio = (
+            experiment_cfg.get("finetune_start_ratio")
+            if isinstance(experiment_cfg, Mapping)
+            else None
+        )
+        self.finetune_epochs = max(1, int(config.get("finetune_epochs", 1) or 1))
+        self.finetune_learning_rate = max(1e-12, float(config.get("finetune_learning_rate", 1e-4) or 1e-4))
+        self.finetune_start_ratio = float(
+            experiment_finetune_start_ratio
+            if experiment_finetune_start_ratio is not None
+            else (config.get("finetune_start_ratio", 0.0) or 0.0)
+        )
+        if self.finetune_start_ratio < 0.0 or self.finetune_start_ratio > 1.0:
+            raise ValueError("finetune_start_ratio must be between 0.0 and 1.0.")
+        self.device = torch.device(config.get("device", "cpu"))
+        self.num_ece_bins = int(config.get("ece_bins", 10))
+        self.class_weight_cap = float(config.get("class_weight_cap", 50.0))
+        self.show_progress = bool(config.get("show_progress", True))
+        self.tqdm_disable = bool(config.get("tqdm_disable", False))
+        self.tqdm_leave = bool(config.get("tqdm_leave", False))
+        self._structured_progress_enabled = bool(progress_events_enabled())
+        self.dataloader_num_workers = max(0, int(config.get("dataloader_num_workers", 0)))
+        self.dataloader_pin_memory = bool(config.get("dataloader_pin_memory", False))
+        self.dataloader_persistent_workers = bool(
+            config.get("dataloader_persistent_workers", self.dataloader_num_workers > 0)
+        )
+        self.dataloader_prefetch_factor = max(2, int(config.get("dataloader_prefetch_factor", 2)))
+        self.sharded_dataset_cached_shards = max(1, int(config.get("sharded_dataset_cached_shards", 2)))
+        self.loss_function = str(config.get("loss_function", "cross_entropy")).strip().lower()
+        self.patience = int(config.get("patience", 6))
+        self.delta = float(config.get("delta", 1e-4))
+        self.config_path = str(config.get("config_path", "")).strip()
+        self.seed = int(config.get("seed", 42))
+        self.retrain = bool(config.get("retrain", False))
+        self.mode = str(config.get("mode", self.config.get("experiment_config", {}).get("mode", "train"))).strip().lower()
+        self.drift_window_size = int(config.get("drift_window_size", self.config.get("experiment_config", {}).get("drift_window_size", 500)))
+        self.drift_window_sliding = int(config.get("drift_window_sliding", self.config.get("experiment_config", {}).get("drift_window_sliding", 0) or 0))
+        self.mask_guided_enabled = bool(config.get("mask_guided_enabled", False))
+        self.mask_guided_apply_in_eval = bool(config.get("mask_guided_apply_in_eval", True))
+        self.mask_guided_policy = str(config.get("mask_guided_policy", "auto") or "auto").strip().lower()
+        if self.mask_guided_policy not in {"auto", "off", "soft", "hard"}:
+            raise ValueError("training.mask_guided_policy must be auto, off, soft, or hard.")
+        self.mask_guided_hard_threshold = float(config.get("mask_guided_hard_threshold", 1.0))
+        self.mask_guided_soft_penalty = float(config.get("mask_guided_soft_penalty", 2.0))
+        self.mask_guided_min_samples_for_hard = max(1, int(config.get("mask_guided_min_samples_for_hard", 1)))
+        self.structural_aux_loss_enabled = _as_bool(config.get("structural_aux_loss_enabled"), default=False)
+        self.structural_aux_loss_weight = float(config.get("structural_aux_loss_weight", 0.05))
+        self.structural_aux_exact_loss_weight = float(config.get("structural_aux_exact_loss_weight", 0.01))
+        self.dynamic_candidate_contract_enabled = _as_bool(
+            config.get("dynamic_candidate_contract_enabled"),
+            default=False,
+        )
+        self.candidate_contract_mode = str(config.get("candidate_contract_mode", "") or "").strip().lower()
+        if not self.candidate_contract_mode:
+            self.candidate_contract_mode = (
+                "fixed_projection" if self.dynamic_candidate_contract_enabled else "fixed_label"
+            )
+        if self.candidate_contract_mode not in {"fixed_label", "fixed_projection", "candidate_id"}:
+            raise ValueError(
+                "training.candidate_contract_mode must be fixed_label, fixed_projection, or candidate_id."
+            )
+        self.candidate_identity_mode = str(config.get("candidate_identity_mode", "topology_native") or "topology_native").strip().lower()
+        self.candidate_batch_topology_policy = str(
+            config.get("candidate_batch_topology_policy", "single_topology_required")
+            or "single_topology_required"
+        ).strip().lower()
+        self.candidate_missing_target_fail_threshold = float(
+            config.get("candidate_missing_target_fail_threshold", 0.10)
+        )
+        self.topology_flow_penalty_enabled = _as_bool(config.get("topology_flow_penalty_enabled"), default=False)
+        self.topology_flow_penalty_weight = float(config.get("topology_flow_penalty_weight", 0.0) or 0.0)
+        self.topology_flow_penalty_type = str(
+            config.get("topology_flow_penalty_type", "invalid_probability_mass")
+            or "invalid_probability_mass"
+        ).strip().lower()
+        self.topology_flow_penalty_margin = float(config.get("topology_flow_penalty_margin", 0.1) or 0.1)
+        self.topology_flow_penalty_fail_on_missing_mask = _as_bool(
+            config.get("topology_flow_penalty_fail_on_missing_mask"),
+            default=True,
+        )
+        if self.candidate_batch_topology_policy not in {"single_topology_required", "group_by_topology"}:
+            raise ValueError(
+                "training.candidate_batch_topology_policy must be single_topology_required or group_by_topology."
+            )
+        if self.candidate_contract_mode == "candidate_id" and self.candidate_batch_topology_policy == "group_by_topology":
+            raise ValueError(
+                "training.candidate_batch_topology_policy=group_by_topology is planned but not implemented."
+            )
+        self.struct_xattn_contrastive_enabled = _as_bool(
+            config.get("struct_xattn_contrastive_enabled"),
+            default=False,
+        )
+        self.struct_xattn_contrastive_weight = float(config.get("struct_xattn_contrastive_weight", 0.03))
+        self.struct_xattn_contrastive_margin = float(config.get("struct_xattn_contrastive_margin", 0.05))
+        self.struct_xattn_contrastive_temperature = max(
+            1e-6,
+            float(config.get("struct_xattn_contrastive_temperature", 0.10)),
+        )
+        self.struct_xattn_contrastive_max_loss = max(
+            0.0,
+            float(config.get("struct_xattn_contrastive_max_loss", 0.50)),
+        )
+        self.struct_xattn_contrastive_warmup_epochs = max(
+            0,
+            int(config.get("struct_xattn_contrastive_warmup_epochs", 3)),
+        )
+        self.struct_xattn_corruption_policy = str(
+            config.get("struct_xattn_corruption_policy", "edge_drop")
+        ).strip().lower()
+        self.struct_xattn_corruption_edge_drop_prob = min(
+            1.0,
+            max(0.0, float(config.get("struct_xattn_corruption_edge_drop_prob", 0.15))),
+        )
+        self.struct_xattn_corruption_feature_noise_std = max(
+            0.0,
+            float(config.get("struct_xattn_corruption_feature_noise_std", 0.0)),
+        )
+        self.learning_strategy_config = LearningStrategyConfig.from_training_config(
+            config,
+            fusion_mode=getattr(model, "fusion_mode", ""),
+            structural_mode=_as_bool(getattr(model, "structural_mode", True), default=True),
+        )
+        self._topology_payload_pool: TopologyPayloadPool | None = None
+
+        self.checkpoint_dir = str(config.get("checkpoint_dir", "checkpoints")).strip() or "checkpoints"
+        checkpoint_override = str(config.get("checkpoint_path", "")).strip()
+        experiment_name = str(experiment_cfg.get("name", "default_experiment")).strip() or "default_experiment"
+        safe_experiment_name = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in experiment_name)
+        self.experiment_name = safe_experiment_name
+        self.checkpoint_path = Path(checkpoint_override) if checkpoint_override else (Path(self.checkpoint_dir) / f"{self.experiment_name}_best.pth")
+        resume_checkpoint_override = str(config.get("resume_checkpoint_path", "")).strip()
+        self.resume_checkpoint_path = (
+            Path(resume_checkpoint_override)
+            if resume_checkpoint_override
+            else self._derive_last_checkpoint_path(self.checkpoint_path)
+        )
+        self.last_checkpoint_path = self._derive_last_checkpoint_path(self.checkpoint_path)
+        self.finetune_checkpoint_path = self._derive_finetune_checkpoint_path(self.checkpoint_path)
+
+        self._topology_nodes: List[int] = []
+        self._topology_edges: List[int] = []
+        self._prefix_lengths: List[int] = []
+        self._version_to_idx: Dict[str, int] = {}
+        self._idx_to_version: Dict[int, str] = {}
+        self._stats_snapshot_version_to_idx: Dict[str, int] = {}
+        self._idx_to_stats_snapshot_version: Dict[int, str] = {}
+        self._warned_mixed_snapshot_batches: set[tuple[int, ...]] = set()
+        self._logged_mask_debug = False
+        self._logged_oos_math = False
+        self._logged_peak_vram = False
+        self._mask_guided_reliability_rate: float | None = None
+        self._mask_guided_reliability_samples = 0
+        tracing_cfg = self.config.get("tracking_config", {}).get("tracing", {})
+        self.trace_policy = TraceSamplingPolicy.from_config(
+            tracing_cfg if isinstance(tracing_cfg, dict) else {},
+            seed=self.seed,
+        )
+        self._reverse_activity_vocab: Dict[int, str] = {}
+        self._trace_events_recorded = 0
+        self._trace_record_time_ms_total = 0.0
+
+        if self.prepared_data is not None:
+            raw_idx_to_version = self.prepared_data.get("idx_to_version", {})
+            if isinstance(raw_idx_to_version, dict):
+                normalized_idx_to_version: Dict[int, str] = {}
+                for raw_idx, raw_label in raw_idx_to_version.items():
+                    try:
+                        normalized_idx_to_version[int(raw_idx)] = str(raw_label)
+                    except (TypeError, ValueError):
+                        continue
+                self._idx_to_version.update(normalized_idx_to_version)
+                self._version_to_idx.update({label: idx for idx, label in self._idx_to_version.items()})
+            raw_snapshot_idx_to_version = self.prepared_data.get("idx_to_stats_snapshot_version", {})
+            if isinstance(raw_snapshot_idx_to_version, dict):
+                normalized_snapshot_idx_to_version: Dict[int, str] = {}
+                for raw_idx, raw_label in raw_snapshot_idx_to_version.items():
+                    try:
+                        normalized_snapshot_idx_to_version[int(raw_idx)] = str(raw_label)
+                    except (TypeError, ValueError):
+                        continue
+                self._idx_to_stats_snapshot_version.update(normalized_snapshot_idx_to_version)
+                self._stats_snapshot_version_to_idx.update(
+                    {label: idx for idx, label in self._idx_to_stats_snapshot_version.items()}
+                )
+            reverse_activity_vocab_raw = self.prepared_data.get("reverse_activity_vocab", {})
+            if isinstance(reverse_activity_vocab_raw, dict):
+                for raw_idx, raw_label in reverse_activity_vocab_raw.items():
+                    try:
+                        self._reverse_activity_vocab[int(raw_idx)] = str(raw_label)
+                    except (TypeError, ValueError):
+                        continue
+            activity_vocab_raw = self.prepared_data.get("activity_vocab", {})
+            if not self._reverse_activity_vocab and isinstance(activity_vocab_raw, dict):
+                for raw_label, raw_idx in activity_vocab_raw.items():
+                    try:
+                        self._reverse_activity_vocab[int(raw_idx)] = str(raw_label)
+                    except (TypeError, ValueError):
+                        continue
+
+    def _is_tqdm_disabled(self) -> bool:
+        return (not self.show_progress) or self.tqdm_disable or self._structured_progress_enabled
+
+    def _forward_model_logits(self, contract: GraphTensorContract) -> torch.Tensor:
+        """Run model forward and return global fixed-label logits for trainer metrics."""
+
+        if self.candidate_contract_mode == "candidate_id":
+            raise ValueError("candidate_contract_mode=candidate_id requires _forward_candidate_output().")
+        if (
+            self.candidate_contract_mode == "fixed_projection"
+            and hasattr(self.model, "forward_candidate")
+        ):
+            output = self.model.forward_candidate(contract)  # type: ignore[attr-defined]
+            if isinstance(output, CandidatePredictionOutput):
+                return self._candidate_output_to_fixed_logits(output)
+            if isinstance(output, torch.Tensor):
+                return output
+            raise TypeError("model.forward_candidate() must return CandidatePredictionOutput or Tensor.")
+        return self.model(contract)
+
+    def _forward_candidate_output(self, contract: GraphTensorContract) -> CandidatePredictionOutput:
+        self._guard_impulse_candidate_contract(contract)
+        if not hasattr(self.model, "forward_candidate"):
+            raise ValueError("candidate_contract_mode=candidate_id requires a model with forward_candidate().")
+        output = self.model.forward_candidate(contract)  # type: ignore[attr-defined]
+        if not isinstance(output, CandidatePredictionOutput):
+            raise TypeError("candidate_contract_mode=candidate_id requires forward_candidate() to return CandidatePredictionOutput.")
+        return output
+
+    def _guard_impulse_candidate_contract(self, contract: GraphTensorContract) -> None:
+        if self.candidate_contract_mode != "candidate_id":
+            return
+        if self.candidate_identity_mode != "topology_native":
+            return
+        mode = str(getattr(self.model, "topology_conditioning_mode", "") or "").strip().lower()
+        if mode != "impulse_activation_routing":
+            return
+        if not isinstance(contract.get("struct_prefix_state_x"), torch.Tensor):
+            raise ValueError(
+                "candidate_id topology_native impulse_activation_routing requires struct_prefix_state_x."
+            )
+        if not self._candidate_metadata_present(contract, "candidate_ids"):
+            raise ValueError("candidate_id topology_native impulse_activation_routing requires candidate_ids.")
+        if not self._candidate_metadata_present(contract, "candidate_labels"):
+            raise ValueError("candidate_id topology_native impulse_activation_routing requires candidate_labels.")
+        target_labels = self._target_labels_from_contract(contract, contract.get("y", torch.empty(0)))
+        if not target_labels:
+            raise ValueError("candidate_id topology_native impulse_activation_routing requires target_label.")
+
+    @staticmethod
+    def _candidate_metadata_present(contract: GraphTensorContract, key: str) -> bool:
+        raw = contract.get(key)  # type: ignore[typeddict-item]
+        if raw is None:
+            return False
+        if isinstance(raw, str):
+            return bool(raw.strip())
+        if isinstance(raw, (list, tuple)):
+            return len(raw) > 0
+        return True
+
+    def _candidate_output_to_fixed_logits(self, output: CandidatePredictionOutput) -> torch.Tensor:
+        candidate_logits = output.candidate_logits
+        candidate_class_index = output.candidate_class_index.to(device=candidate_logits.device, dtype=torch.long)
+        if isinstance(output.fixed_label_logits, torch.Tensor) and output.fixed_label_logits.dim() == 2:
+            output_dim = int(output.fixed_label_logits.size(1))
+        else:
+            output_dim = int(getattr(self.model, "output_dim", 0) or 0)
+            if output_dim <= 0 and candidate_class_index.numel() > 0:
+                output_dim = int(candidate_class_index.max().item()) + 1
+        if output_dim <= 0:
+            raise ValueError("Dynamic candidate output cannot infer fixed-label output dimension.")
+        fixed_logits = candidate_logits.new_full((candidate_logits.size(0), output_dim), -1e6)
+        valid = (candidate_class_index >= 0) & (candidate_class_index < output_dim)
+        if bool(valid.any()):
+            fixed_logits[:, candidate_class_index[valid]] = candidate_logits[:, valid]
+        return fixed_logits
+
+    def _candidate_probs_to_fixed_probs(self, output: CandidatePredictionOutput, candidate_probs: torch.Tensor) -> torch.Tensor:
+        candidate_class_index = output.candidate_class_index.to(device=candidate_probs.device, dtype=torch.long)
+        output_dim = int(getattr(self.model, "output_dim", 0) or 0)
+        if output_dim <= 0 and candidate_class_index.numel() > 0:
+            output_dim = int(candidate_class_index.max().item()) + 1
+        if output_dim <= 0:
+            raise ValueError("Candidate output cannot infer fixed-label probability dimension.")
+        fixed_probs = candidate_probs.new_zeros((candidate_probs.size(0), output_dim))
+        valid = (candidate_class_index >= 0) & (candidate_class_index < output_dim)
+        if bool(valid.any()):
+            fixed_probs.index_add_(1, candidate_class_index[valid], candidate_probs[:, valid])
+        row_sum = fixed_probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return fixed_probs / row_sum
+
+    @staticmethod
+    def _candidate_metric_true_pred(
+        candidate_logits: torch.Tensor,
+        target_candidate_mask: torch.Tensor,
+    ) -> tuple[torch.LongTensor, torch.LongTensor, torch.BoolTensor]:
+        mask = target_candidate_mask.to(device=candidate_logits.device, dtype=torch.bool)
+        if candidate_logits.dim() != 2 or mask.shape != candidate_logits.shape:
+            raise ValueError("candidate metric tensors must have matching [B, C_v] shapes.")
+        has_target = mask.any(dim=1)
+        pred = candidate_set_predictions(candidate_logits)
+        true = torch.full((candidate_logits.size(0),), -1, dtype=torch.long, device=candidate_logits.device)
+        if bool(has_target.any()):
+            true[has_target] = torch.argmax(mask[has_target].long(), dim=1)
+        return true, pred, has_target
+
+    def _candidate_metric_label_keys(
+        self,
+        *,
+        candidate_logits: torch.Tensor,
+        target_candidate_mask: torch.Tensor,
+        candidate_output: CandidatePredictionOutput,
+        contract: GraphTensorContract,
+        targets: torch.Tensor,
+    ) -> tuple[List[str], List[str], torch.BoolTensor]:
+        mask = target_candidate_mask.to(device=candidate_logits.device, dtype=torch.bool)
+        if candidate_logits.dim() != 2 or mask.shape != candidate_logits.shape:
+            raise ValueError("candidate metric tensors must have matching [B, C_v] shapes.")
+        pred = candidate_set_predictions(candidate_logits).detach().cpu().tolist()
+        has_target = mask.any(dim=1)
+        mask_cpu = mask.detach().cpu()
+        target_labels = self._target_labels_from_contract(contract, targets)
+        candidate_labels = [str(label).strip() for label in candidate_output.candidate_labels]
+        candidate_ids = [str(candidate_id).strip() for candidate_id in candidate_output.candidate_ids]
+        candidate_class_index = (
+            candidate_output.candidate_class_index.detach().cpu().long().view(-1).tolist()
+            if isinstance(candidate_output.candidate_class_index, torch.Tensor)
+            else []
+        )
+        target_values = targets.detach().cpu().long().view(-1).tolist()
+
+        true_keys: List[str] = []
+        pred_keys: List[str] = []
+        for row_idx, pred_idx in enumerate(pred):
+            if row_idx < len(target_labels) and str(target_labels[row_idx]).strip():
+                true_key = candidate_label_metric_key(target_labels[row_idx])
+            elif row_idx < len(target_values) and int(target_values[row_idx]) >= 0:
+                true_key = f"class:{int(target_values[row_idx])}"
+            elif bool(has_target[row_idx].item()):
+                target_idx = int(torch.argmax(mask_cpu[row_idx].long()).item())
+                if target_idx < len(candidate_labels) and candidate_labels[target_idx]:
+                    true_key = candidate_label_metric_key(candidate_labels[target_idx])
+                elif target_idx < len(candidate_class_index) and int(candidate_class_index[target_idx]) >= 0:
+                    true_key = f"class:{int(candidate_class_index[target_idx])}"
+                else:
+                    true_key = f"candidate:{target_idx}"
+            else:
+                true_key = "__missing_candidate_target__"
+
+            if 0 <= int(pred_idx) < max(len(candidate_labels), len(candidate_class_index)):
+                pred_label = candidate_labels[int(pred_idx)] if int(pred_idx) < len(candidate_labels) else ""
+                pred_id = candidate_ids[int(pred_idx)] if int(pred_idx) < len(candidate_ids) else ""
+                if pred_id and pred_id == true_key:
+                    pred_key = candidate_label_metric_key(pred_id)
+                elif pred_label:
+                    pred_key = candidate_label_metric_key(pred_label)
+                elif int(pred_idx) < len(candidate_class_index) and int(candidate_class_index[int(pred_idx)]) >= 0:
+                    pred_key = f"class:{int(candidate_class_index[int(pred_idx)])}"
+                else:
+                    pred_key = f"candidate:{int(pred_idx)}"
+            else:
+                pred_key = "__invalid_candidate_prediction__"
+            true_keys.append(true_key)
+            pred_keys.append(pred_key)
+        return true_keys, pred_keys, has_target
+
+    def _fixed_head_metric_label_keys(
+        self,
+        *,
+        predictions: torch.Tensor,
+        contract: GraphTensorContract,
+        targets: torch.Tensor,
+    ) -> tuple[List[str], List[str]]:
+        target_labels = self._target_labels_from_contract(contract, targets)
+        target_values = targets.detach().cpu().long().view(-1).tolist()
+        pred_values = predictions.detach().cpu().long().view(-1).tolist()
+
+        true_keys: List[str] = []
+        pred_keys: List[str] = []
+        for row_idx, pred_idx in enumerate(pred_values):
+            if row_idx < len(target_labels) and str(target_labels[row_idx]).strip():
+                true_key = candidate_label_metric_key(target_labels[row_idx])
+            elif row_idx < len(target_values):
+                raw_true_key = self._reverse_activity_vocab.get(
+                    int(target_values[row_idx]),
+                    f"class:{int(target_values[row_idx])}",
+                )
+                true_key = candidate_label_metric_key(raw_true_key) if not raw_true_key.startswith("class:") else raw_true_key
+            else:
+                true_key = "__missing_target__"
+
+            raw_pred_key = self._reverse_activity_vocab.get(int(pred_idx), f"class:{int(pred_idx)}")
+            pred_keys.append(candidate_label_metric_key(raw_pred_key) if not raw_pred_key.startswith("class:") else raw_pred_key)
+            true_keys.append(true_key)
+        return true_keys, pred_keys
+
+    def _fixed_head_allowed_identity_sets(
+        self,
+        allowed_mask: torch.Tensor | None,
+    ) -> list[frozenset[str] | None]:
+        if not isinstance(allowed_mask, torch.Tensor):
+            return []
+        mask = allowed_mask.detach().cpu().bool()
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 2:
+            return []
+        rows: list[frozenset[str] | None] = []
+        for row in mask:
+            identities: set[str] = set()
+            for idx, allowed in enumerate(row.tolist()):
+                if not bool(allowed):
+                    continue
+                raw_key = self._reverse_activity_vocab.get(int(idx), f"class:{int(idx)}")
+                identities.add(
+                    candidate_label_metric_key(raw_key)
+                    if not str(raw_key).startswith("class:")
+                    else str(raw_key)
+                )
+            rows.append(frozenset(identities))
+        return rows
+
+    @staticmethod
+    def _candidate_allowed_identity_sets(
+        candidate_output: CandidatePredictionOutput,
+        allowed_mask: torch.Tensor | None,
+    ) -> list[frozenset[str] | None]:
+        if not isinstance(allowed_mask, torch.Tensor):
+            return []
+        mask = allowed_mask.detach().cpu().bool()
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 2:
+            return []
+        candidate_labels = [str(label).strip() for label in candidate_output.candidate_labels]
+        rows: list[frozenset[str] | None] = []
+        for row in mask:
+            identities: set[str] = set()
+            for idx, allowed in enumerate(row.tolist()):
+                if bool(allowed) and idx < len(candidate_labels) and candidate_labels[idx]:
+                    identities.add(candidate_label_metric_key(candidate_labels[idx]))
+            rows.append(frozenset(identities))
+        return rows
+
+    @staticmethod
+    def _audit_metrics_from_summary(summary: OutcomePartitionSummary) -> Dict[str, float]:
+        raw = summary.as_metrics()
+        return {
+            key: float(value)
+            for key, value in raw.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+
+    @staticmethod
+    def _window_audit_metrics(metrics: Mapping[str, Any]) -> Dict[str, float]:
+        keys = COMMON_SAFETY_KEYS + (
+            "audited_prefix_count",
+            "valid_prediction_count",
+            "strict_correct_count",
+            "strict_correct_rate",
+            "parallelism_admissible_error_count",
+            "parallelism_admissible_error_rate",
+            "oos_error_count",
+            "oos_error_rate",
+            "exact_outside_mask_count",
+            "exact_outside_mask_rate",
+            "empty_mask_count",
+            "empty_mask_rate",
+            "unknown_target_count",
+            "unknown_target_rate",
+            "unknown_prediction_count",
+            "unknown_prediction_rate",
+            "unresolved_mapping_count",
+            "unresolved_mapping_rate",
+            "excluded_count",
+            "excluded_rate",
+            "partition_sum",
+            "audit_contract_discrepancy_count",
+            "audit_contract_discrepancy_rate",
+            "topology_tolerant_macro_f1",
+            "topology_tolerant_macro_f1_gain",
+        )
+        out: Dict[str, float] = {}
+        for key in keys:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                out[f"window_{key}"] = float(value)
+        return out
+
+    @staticmethod
+    def _endpoint_audit_metrics(metrics: Mapping[str, Any]) -> Dict[str, float]:
+        keys = COMMON_SAFETY_KEYS + (
+            "test_accuracy",
+            "test_macro_f1",
+            "test_weighted_f1",
+            "test_set_nll",
+            "test_ece",
+            "test_oos",
+            "test_target_in_mask_rate",
+            "test_pred_in_mask_rate",
+            "test_strict_error_but_allowed_rate",
+            "test_ambiguous_prefix_rate",
+            "strict_test_accuracy",
+            "strict_test_macro_f1",
+            "strict_test_weighted_f1",
+            "fixed_label_strict_test_accuracy",
+            "fixed_label_strict_test_macro_f1",
+            "audited_prefix_count",
+            "valid_prediction_count",
+            "strict_correct_count",
+            "strict_correct_rate",
+            "parallelism_admissible_error_count",
+            "parallelism_admissible_error_rate",
+            "oos_error_count",
+            "oos_error_rate",
+            "exact_outside_mask_count",
+            "exact_outside_mask_rate",
+            "empty_mask_count",
+            "empty_mask_rate",
+            "unknown_target_count",
+            "unknown_target_rate",
+            "unknown_prediction_count",
+            "unknown_prediction_rate",
+            "unresolved_mapping_count",
+            "unresolved_mapping_rate",
+            "excluded_count",
+            "excluded_rate",
+            "partition_sum",
+            "audit_contract_discrepancy_count",
+            "audit_contract_discrepancy_rate",
+            "topology_tolerant_macro_f1",
+            "topology_tolerant_macro_f1_gain",
+        )
+        out: Dict[str, float] = {}
+        for key in keys:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                out[key] = float(value)
+        return out
+
+    def _log_eval_drift_endpoint_audit_metrics(self, records: DriftInferenceRecords) -> None:
+        if self.tracker is None or int(records.y_true.shape[0]) == 0:
+            return
+        idxs = np.arange(int(records.y_true.shape[0]), dtype=np.int64)
+        metrics = self._compute_test_metrics_from_records(records, idxs)
+        if records.audit_observations:
+            summary = aggregate_outcomes(records.audit_observations)
+            self.tracker.log_param("rs01.metric_contract_id", summary.metric_contract_id)
+            self.tracker.log_param("rs01.mask_space", summary.mask_space)
+            self.tracker.log_param("rs01.prediction_space", summary.prediction_space)
+            if summary.mask_policy_id:
+                self.tracker.log_param("rs01.mask_policy_id", summary.mask_policy_id)
+        for key, value in self._endpoint_audit_metrics(metrics).items():
+            self.tracker.log_metric(key, float(value), step=0)
+        if records.audit_observations and summary.metric_contract_id == COMMON_MASK_CONTRACT:
+            for scope, versions in (
+                ("v3", {"v3"}),
+                ("v4", {"v4"}),
+                ("v5", {"v5"}),
+                ("v3_v4_v5", {"v3", "v4", "v5"}),
+            ):
+                selected = np.asarray(
+                    [idx for idx, version in enumerate(records.version_labels) if version in versions],
+                    dtype=np.int64,
+                )
+                if selected.size == 0:
+                    continue
+                scoped_metrics = self._compute_test_metrics_from_records(records, selected)
+                for key, value in self._endpoint_audit_metrics(scoped_metrics).items():
+                    self.tracker.log_metric(f"endpoint_{scope}_{key}", float(value), step=0)
+
+    def _fixed_head_label_target_probabilities(
+        self,
+        *,
+        probs: torch.Tensor,
+        contract: GraphTensorContract,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return probability mass assigned to the stable target label.
+
+        If a target label is not present in the fixed training vocabulary, the
+        fixed-head model assigns zero mass to it.  We clamp to epsilon for NLL
+        stability while preserving the semantic penalty.
+        """
+        if probs.dim() != 2:
+            return torch.empty((0,), dtype=torch.float32, device=probs.device)
+        target_labels = self._target_labels_from_contract(contract, targets)
+        label_to_idx = {str(label): int(idx) for idx, label in self._reverse_activity_vocab.items()}
+        target_values = targets.detach().cpu().long().view(-1).tolist()
+        values: List[torch.Tensor] = []
+        eps = probs.new_tensor(1e-12)
+        for row_idx, raw_target in enumerate(target_values):
+            class_idx: int | None = None
+            if row_idx < len(target_labels) and str(target_labels[row_idx]).strip():
+                class_idx = label_to_idx.get(str(target_labels[row_idx]).strip())
+            else:
+                class_idx = int(raw_target)
+
+            if class_idx is None or class_idx < 0 or class_idx >= int(probs.shape[1]):
+                values.append(eps)
+            else:
+                values.append(probs[row_idx, class_idx].clamp_min(1e-12))
+        if not values:
+            return torch.empty((0,), dtype=probs.dtype, device=probs.device)
+        return torch.stack(values).to(dtype=probs.dtype, device=probs.device)
+
+    @staticmethod
+    def _fixed_numeric_target_probabilities(
+        *,
+        probs: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return probability mass for the legacy fixed numeric target index."""
+        if probs.dim() != 2:
+            return torch.empty((0,), dtype=torch.float32, device=probs.device)
+        target_idx = targets.view(-1).long().to(probs.device)
+        valid = (target_idx >= 0) & (target_idx < int(probs.shape[1]))
+        safe_idx = target_idx.clamp(min=0, max=max(int(probs.shape[1]) - 1, 0))
+        row_ids = torch.arange(int(target_idx.shape[0]), device=probs.device)
+        gathered = probs[row_ids, safe_idx].clamp_min(1e-12)
+        return torch.where(valid, gathered, torch.full_like(gathered, 1e-12))
+
+    @staticmethod
+    def _candidate_target_probabilities(
+        *,
+        candidate_probs: torch.Tensor,
+        target_candidate_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return candidate-space probability mass for the stable target set."""
+        if candidate_probs.dim() != 2:
+            return torch.empty((0,), dtype=torch.float32, device=candidate_probs.device)
+        if target_candidate_mask is None:
+            return torch.full((int(candidate_probs.shape[0]),), 1e-12, dtype=candidate_probs.dtype, device=candidate_probs.device)
+        mask = target_candidate_mask.to(device=candidate_probs.device, dtype=candidate_probs.dtype)
+        if mask.shape != candidate_probs.shape:
+            return torch.full((int(candidate_probs.shape[0]),), 1e-12, dtype=candidate_probs.dtype, device=candidate_probs.device)
+        return (candidate_probs * mask).sum(dim=1).clamp_min(1e-12)
+
+    def run(self) -> Dict[str, Any]:
+        """Execute full training flow: data prep, train/val loop, and final test."""
+        pipeline_reporter = ProgressReporter(stage="run.pipeline", total=1, min_interval_sec=0.5)
+        pipeline_reporter.start(message=f"Pipeline mode={self.mode}", current=0, total=1)
+        self.model.to(self.device)
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.to(self.device)
+            self.class_weights = torch.clamp(self.class_weights, max=self.class_weight_cap)
+        if self.loss_function != "cross_entropy":
+            raise ValueError(f"Unsupported training.loss_function '{self.loss_function}' for MVP1.")
+
+        self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+        self._log_params()
+        self._log_run_context()
+        self._log_data_metrics()
+        if self.tracker is not None and self.config_path:
+            self.tracker.log_artifact(self.config_path)
+
+        is_eval_cross = self.mode == "eval_cross_dataset"
+        is_eval_drift = self.mode == "eval_drift"
+        is_eval_drift_finetune = self.mode == "eval_drift_finetune"
+        is_eval_mode = is_eval_cross or is_eval_drift or is_eval_drift_finetune
+        prebuilt_datasets = None
+        if self.prepared_data is not None:
+            logger.info("Using preloaded prepared data from CLI (single-read mode).")
+            prepared_traces_raw = self.prepared_data.get("prepared_traces", [])
+            prepared_traces = list(prepared_traces_raw) if prepared_traces_raw is not None else []
+            train_traces_raw = self.prepared_data.get("train_traces", [])
+            val_traces_raw = self.prepared_data.get("val_traces", [])
+            test_traces_raw = self.prepared_data.get("test_traces", [])
+            if all(item is not None for item in (train_traces_raw, val_traces_raw, test_traces_raw)):
+                split_data = SplitData(
+                    train=list(train_traces_raw),
+                    val=list(val_traces_raw),
+                    test=list(test_traces_raw),
+                )
+            else:
+                split_data = self._prepare_split_data(prepared_traces)
+
+            train_dataset = self.prepared_data.get("train_dataset")
+            val_dataset = self.prepared_data.get("val_dataset")
+            test_dataset = self.prepared_data.get("test_dataset")
+            if all(item is not None for item in (train_dataset, val_dataset, test_dataset)):
+                train_payload = train_dataset if isinstance(train_dataset, dict) else list(train_dataset)
+                val_payload = val_dataset if isinstance(val_dataset, dict) else list(val_dataset)
+                test_payload = test_dataset if isinstance(test_dataset, dict) else list(test_dataset)
+                prebuilt_datasets = {
+                    "train": train_payload,
+                    "val": val_payload,
+                    "test": test_payload,
+                }
+        else:
+            raw_traces = self._read_raw_traces_with_progress()
+            prepared_traces = self._prepare_data(raw_traces, mode=self.mode)
+            split_data = self._prepare_split_data(prepared_traces)
+
+        checkpoint, start_epoch, best_val_loss, best_epoch = self._prepare_checkpoint_state(is_eval_mode=is_eval_mode)
+
+        if is_eval_cross:
+            result = self._run_eval_cross_dataset(
+                split_data=split_data,
+                best_epoch=best_epoch,
+                best_val_loss=best_val_loss,
+                prebuilt_test_dataset=(prebuilt_datasets or {}).get("test") if prebuilt_datasets else None,
+            )
+            pipeline_reporter.done(message=f"Pipeline completed mode={self.mode}", current=1, total=1)
+            return result
+
+        if is_eval_drift:
+            result = self._run_eval_drift(
+                split_data=split_data,
+                drift_traces=prepared_traces,
+                best_epoch=best_epoch,
+                best_val_loss=best_val_loss,
+                prebuilt_test_dataset=(prebuilt_datasets or {}).get("test") if prebuilt_datasets else None,
+            )
+            pipeline_reporter.done(message=f"Pipeline completed mode={self.mode}", current=1, total=1)
+            return result
+
+        if is_eval_drift_finetune:
+            result = self._run_eval_drift_finetune(
+                split_data=split_data,
+                drift_traces=prepared_traces,
+                checkpoint=checkpoint,
+                best_epoch=best_epoch,
+                best_val_loss=best_val_loss,
+                prebuilt_test_dataset=(prebuilt_datasets or {}).get("test") if prebuilt_datasets else None,
+            )
+            pipeline_reporter.done(message=f"Pipeline completed mode={self.mode}", current=1, total=1)
+            return result
+
+        result = self._run_train_pipeline(
+            split_data=split_data,
+            checkpoint=checkpoint,
+            start_epoch=start_epoch,
+            best_val_loss=best_val_loss,
+            best_epoch=best_epoch,
+            prebuilt_datasets=prebuilt_datasets,
+        )
+        pipeline_reporter.done(message=f"Pipeline completed mode={self.mode}", current=1, total=1)
+        return result
+
+    def _read_raw_traces_with_progress(self) -> List[RawTrace]:
+        """Read raw traces from adapter with heartbeat logging for long operations."""
+        logger.info("Reading XES file...")
+        started = perf_counter()
+        traces: List[RawTrace] = []
+        event_count = 0
+        read_reporter = ProgressReporter(stage="prepare.read_events", min_interval_sec=0.8)
+        read_reporter.start(message=f"Reading events via {self.xes_adapter.__class__.__name__}")
+
+        iterator = self.xes_adapter.read(self.log_path, self.config.get("mapping_config", {}))
+        progress = tqdm(
+            desc="Read traces",
+            unit="trace",
+            leave=self.tqdm_leave,
+            disable=self._is_tqdm_disabled(),
+        )
+        try:
+            for idx, trace in enumerate(iterator, start=1):
+                traces.append(trace)
+                event_count += len(trace.events)
+                progress.update(1)
+                read_reporter.update(
+                    message=f"Reading events via {self.xes_adapter.__class__.__name__}",
+                    current=int(idx),
+                    total=None,
+                    payload={"events": int(event_count)},
+                    force=(idx == 1),
+                )
+                if idx % 1000 == 0:
+                    progress.set_postfix({"events": event_count})
+                    logger.info("Read %d traces (%d events) so far...", idx, event_count)
+        finally:
+            progress.close()
+
+        duration = perf_counter() - started
+        logger.info("Finished reading XES: traces=%d, events=%d, duration=%.2fs", len(traces), event_count, duration)
+        read_reporter.done(
+            message="Event read finished",
+            current=int(len(traces)),
+            total=int(len(traces)),
+            payload={"events": int(event_count), "duration_sec": float(duration)},
+        )
+        return traces
+
+    def _prepare_checkpoint_state(self, is_eval_mode: bool) -> Tuple[Optional[Dict[str, Any]], int, float, int]:
+        """Load checkpoint according to active scenario and return state tuple."""
+        checkpoint: Optional[Dict[str, Any]] = None
+        start_epoch = 0
+        best_val_loss = float("inf")
+        best_epoch = 0
+
+        if is_eval_mode:
+            if not self.checkpoint_path.exists():
+                raise ValueError(f"Checkpoint required for mode '{self.mode}' was not found: {self.checkpoint_path}")
+            checkpoint = self._load_checkpoint(self.checkpoint_path, require_encoder_state=True)
+            self._restore_from_checkpoint(checkpoint, require_encoder_state=True)
+            best_val_loss = float(checkpoint["val_loss"])
+            best_epoch = int(checkpoint["epoch"])
+        elif not self.retrain:
+            resume_path = self._resolve_resume_checkpoint_path()
+            if resume_path is None:
+                return checkpoint, start_epoch, best_val_loss, best_epoch
+            checkpoint = self._load_checkpoint(resume_path, require_encoder_state=False)
+            self._restore_from_checkpoint(checkpoint, require_encoder_state=False)
+            start_epoch = int(checkpoint["epoch"])
+            best_val_loss = float(checkpoint.get("best_val_loss", checkpoint["val_loss"]))
+            best_epoch = int(checkpoint.get("best_epoch", start_epoch))
+            logger.info(
+                "Loaded resume checkpoint from %s at epoch %d (best_epoch=%d, best_val_loss=%.6f).",
+                resume_path,
+                start_epoch,
+                best_epoch,
+                best_val_loss,
+            )
+
+        return checkpoint, start_epoch, best_val_loss, best_epoch
+
+    def _run_eval_cross_dataset(
+        self,
+        split_data: SplitData,
+        best_epoch: int,
+        best_val_loss: float,
+        prebuilt_test_dataset: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run eval_cross_dataset scenario with preloaded checkpoint state."""
+        test_loader = (
+            self._build_loader_from_dataset(prebuilt_test_dataset, shuffle=False)
+            if prebuilt_test_dataset is not None
+            else self._build_loader(split_data.test, shuffle=False)
+        )
+        self._log_topology_metrics_and_artifacts()
+        logger.info("DataLoaders ready for eval_cross_dataset: test_batches=%d", len(test_loader))
+        test_metrics = self._evaluate_test(test_loader, stage_label="inference")
+        logger.info("Eval cross-dataset test metrics: %s", test_metrics)
+        self._log_test_metrics(test_metrics)
+        return {
+            "history": [],
+            "test_metrics": test_metrics,
+            "split_sizes": {"train": len(split_data.train), "val": len(split_data.val), "test": len(split_data.test)},
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+            "mode": self.mode,
+        }
+
+    def _run_eval_drift(
+        self,
+        split_data: SplitData,
+        drift_traces: Sequence[RawTrace],
+        best_epoch: int,
+        best_val_loss: float,
+        prebuilt_test_dataset: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run eval_drift scenario over chronologically sorted windows."""
+        drift_metrics = self._evaluate_drift_windows_from_prebuilt_dataset(
+            traces=drift_traces,
+            prebuilt_test_dataset=prebuilt_test_dataset,
+        )
+        if drift_metrics is None:
+            logger.info("Drift evaluation path: legacy_raw_trace_windows")
+            drift_metrics = self._evaluate_drift_windows(drift_traces)
+        self._log_topology_metrics_and_artifacts()
+        logger.info("Eval drift windows completed: windows=%d", len(drift_metrics))
+        return {
+            "history": [],
+            "test_metrics": {},
+            "drift_metrics": drift_metrics,
+            "split_sizes": {"train": len(split_data.train), "val": len(split_data.val), "test": len(split_data.test)},
+            "drift_trace_count": len(drift_traces),
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+            "mode": self.mode,
+        }
+
+    def _run_eval_drift_finetune(
+        self,
+        split_data: SplitData,
+        drift_traces: Sequence[RawTrace],
+        checkpoint: Optional[Dict[str, Any]],
+        best_epoch: int,
+        best_val_loss: float,
+        prebuilt_test_dataset: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Run prequential drift evaluation with released-window fine-tuning."""
+        self.finetune_checkpoint_path = self._derive_finetune_checkpoint_path(
+            self.checkpoint_path,
+            run_token=uuid4().hex[:12],
+        )
+        self._finetune_source_checkpoint = checkpoint
+        drift_metrics = self._evaluate_drift_finetune_windows_from_prebuilt_dataset(
+            traces=drift_traces,
+            prebuilt_test_dataset=prebuilt_test_dataset,
+        )
+        if drift_metrics is None:
+            raise ValueError("eval_drift_finetune requires a prebuilt graph dataset with trace_idx metadata.")
+        self._log_topology_metrics_and_artifacts()
+        logger.info("Eval drift finetune windows completed: windows=%d", len(drift_metrics))
+        return {
+            "history": [],
+            "test_metrics": {},
+            "drift_metrics": drift_metrics,
+            "split_sizes": {"train": len(split_data.train), "val": len(split_data.val), "test": len(split_data.test)},
+            "drift_trace_count": len(drift_traces),
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+            "mode": self.mode,
+            "adaptation_protocol": "prequential_released_unique_v1",
+            "finetune_checkpoint_path": str(self.finetune_checkpoint_path),
+        }
+
+    def _run_train_pipeline(
+        self,
+        *,
+        split_data: SplitData,
+        checkpoint: Optional[Dict[str, Any]],
+        start_epoch: int,
+        best_val_loss: float,
+        best_epoch: int,
+        prebuilt_datasets: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run train/validation/test scenario with optional resume checkpoint."""
+        has_prebuilt = bool(
+            prebuilt_datasets
+            and all(prebuilt_datasets.get(key) is not None for key in ("train", "val", "test"))
+        )
+        if has_prebuilt:
+            train_loader = self._build_loader_from_dataset(prebuilt_datasets.get("train"), shuffle=True)
+            val_loader = self._build_loader_from_dataset(prebuilt_datasets.get("val"), shuffle=False)
+            test_loader = self._build_loader_from_dataset(prebuilt_datasets.get("test"), shuffle=False)
+        else:
+            train_loader = self._build_loader(split_data.train, shuffle=True)
+            val_loader = self._build_loader(split_data.val, shuffle=False)
+            test_loader = self._build_loader(split_data.test, shuffle=False)
+        self._log_topology_metrics_and_artifacts()
+
+        logger.info(
+            "DataLoaders ready: train_batches=%d, val_batches=%d, test_batches=%d",
+            len(train_loader),
+            len(val_loader),
+            len(test_loader),
+        )
+        emit_progress_event(
+            stage="trainer.dataloaders",
+            status="done",
+            message="DataLoaders ready",
+            payload={
+                "train_batches": int(len(train_loader)),
+                "validation_batches": int(len(val_loader)),
+                "test_batches": int(len(test_loader)),
+            },
+        )
+
+        self._perform_dry_run(train_loader, context_label="train")
+        self._log_model_and_system_context()
+        optimizer = Adam(self.model.parameters(), lr=self.learning_rate)
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if checkpoint is not None and start_epoch < self.epochs:
+            optimizer_state_dict = checkpoint.get("optimizer_state_dict")
+            if optimizer_state_dict is None:
+                raise ValueError("Checkpoint is missing required key 'optimizer_state_dict' for resume training.")
+            optimizer.load_state_dict(optimizer_state_dict)
+        else:
+            logger.info("Starting training from scratch, start_epoch = 0.")
+
+        history: List[Dict[str, float]] = []
+        epochs_without_improvement = 0
+        epochs_reporter = ProgressReporter(stage="train.epochs", total=int(self.epochs), min_interval_sec=0.5)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+        if start_epoch >= self.epochs:
+            logger.info("Model already trained for %d epochs. Skipping training loop.", self.epochs)
+            epochs_reporter.start(message="Training epochs started", current=int(self.epochs), total=int(self.epochs))
+            epochs_reporter.done(
+                message="Training skipped: checkpoint already at target epoch",
+                current=int(self.epochs),
+                total=int(self.epochs),
+            )
+        else:
+            epochs_reporter.start(message="Training epochs started", current=start_epoch, total=int(self.epochs))
+            for epoch in range(start_epoch + 1, self.epochs + 1):
+                def _update_epoch_progress(batch_idx: int, total_batches: int, phase_name: str) -> None:
+                    if total_batches <= 0:
+                        return
+                    phase_ratio = float(batch_idx) / float(total_batches)
+                    phase_offset = 0.0 if phase_name == "train" else 0.5
+                    phase_span = 0.5
+                    epoch_current = float(epoch - 1) + phase_offset + (phase_span * phase_ratio)
+                    epochs_reporter.update(
+                        message=f"Epoch {epoch}/{self.epochs} | {phase_name} {batch_idx}/{total_batches}",
+                        current=epoch_current,
+                        total=int(self.epochs),
+                        force=(batch_idx == 1 or batch_idx == total_batches),
+                    )
+
+                train_loss, train_macro_f1, _, epoch_duration = self._run_epoch(
+                    train_loader,
+                    optimizer=optimizer,
+                    training=True,
+                    epoch_index=epoch,
+                    total_epochs=self.epochs,
+                    epoch_progress_callback=_update_epoch_progress,
+                )
+                val_loss, val_macro_f1, val_weighted_f1, _ = self._run_epoch(
+                    val_loader,
+                    optimizer=None,
+                    training=False,
+                    epoch_index=epoch,
+                    total_epochs=self.epochs,
+                    epoch_progress_callback=_update_epoch_progress,
+                )
+
+                epoch_metrics = {
+                    "train_loss": train_loss,
+                    "strict_train_macro_f1": train_macro_f1,
+                    "val_loss": val_loss,
+                    "strict_val_macro_f1": val_macro_f1,
+                    "strict_val_weighted_f1": val_weighted_f1,
+                    "epoch_duration_sec": epoch_duration,
+                    # Legacy aliases for backward compatibility with existing dashboards.
+                    "train_macro_f1": train_macro_f1,
+                    "val_macro_f1": val_macro_f1,
+                    "val_weighted_f1": val_weighted_f1,
+                }
+                history.append(epoch_metrics)
+                self._log_epoch_metrics(epoch=epoch, metrics=epoch_metrics)
+                logger.info(
+                    "Epoch %d/%d | Train Loss: %.6f | Val Loss: %.6f | Train F1: %.4f | Val F1: %.4f",
+                    epoch,
+                    self.epochs,
+                    train_loss,
+                    val_loss,
+                    train_macro_f1,
+                    val_macro_f1,
+                )
+                epochs_reporter.update(
+                    message=f"Epoch {epoch}/{self.epochs}",
+                    current=int(epoch),
+                    total=int(self.epochs),
+                    payload={
+                        "train_loss": float(train_loss),
+                        "val_loss": float(val_loss),
+                        "train_f1": float(train_macro_f1),
+                        "val_f1": float(val_macro_f1),
+                    },
+                )
+
+                if self.device.type == "cuda" and torch.cuda.is_available() and not self._logged_peak_vram:
+                    peak_vram_mb = float(torch.cuda.max_memory_allocated() / 1048576.0)
+                    if self.tracker is not None:
+                        self.tracker.log_param("peak_vram_mb", peak_vram_mb)
+                    self._logged_peak_vram = True
+
+                improvement = best_val_loss - val_loss
+                if improvement > self.delta:
+                    best_val_loss = val_loss
+                    best_epoch = epoch
+                    epochs_without_improvement = 0
+                    self._save_checkpoint(
+                        self.checkpoint_path,
+                        epoch=epoch,
+                        val_loss=best_val_loss,
+                        optimizer=optimizer,
+                        best_epoch=best_epoch,
+                        best_val_loss=best_val_loss,
+                    )
+                else:
+                    epochs_without_improvement += 1
+                self._save_checkpoint(
+                    self.last_checkpoint_path,
+                    epoch=epoch,
+                    val_loss=val_loss,
+                    optimizer=optimizer,
+                    best_epoch=best_epoch,
+                    best_val_loss=best_val_loss,
+                )
+
+                if epochs_without_improvement >= self.patience:
+                    logger.info("Early stopping triggered at epoch %d (best_epoch=%d, best_val_loss=%.6f).", epoch, best_epoch, best_val_loss)
+                    epochs_reporter.done(
+                        level="warning",
+                        message=f"Early stopping at epoch {epoch}",
+                        current=int(epoch),
+                        total=int(self.epochs),
+                        payload={"best_epoch": int(best_epoch), "best_val_loss": float(best_val_loss)},
+                    )
+                    if self.tracker is not None:
+                        self.tracker.log_metric("early_stopping_epoch", float(epoch), step=epoch)
+                        self.tracker.log_metric("best_epoch", float(best_epoch), step=epoch)
+                        self.tracker.log_metric("best_val_loss", float(best_val_loss), step=epoch)
+                    break
+            else:
+                epochs_reporter.done(
+                    message="Training epochs completed",
+                    current=int(self.epochs),
+                    total=int(self.epochs),
+                )
+
+        if not self.checkpoint_path.exists():
+            raise FileNotFoundError(f"Best checkpoint not found: {self.checkpoint_path}")
+
+        best_checkpoint = self._load_checkpoint(self.checkpoint_path, require_encoder_state=False)
+        self.model.load_state_dict(best_checkpoint["model_state_dict"])
+        self._restore_encoder_state(best_checkpoint, require_encoder_state=False)
+        best_epoch = int(best_checkpoint["epoch"])
+        best_val_loss = float(best_checkpoint["val_loss"])
+
+        test_eval_reporter = ProgressReporter(stage="test.eval", total=1, min_interval_sec=0.2)
+        test_eval_reporter.start(message="Test evaluation started", current=0, total=1)
+        test_metrics = self._evaluate_test(test_loader, stage_label="inference")
+        logger.info("Final test metrics: %s", test_metrics)
+        test_eval_reporter.done(
+            message="Test evaluation completed",
+            current=1,
+            total=1,
+            payload={
+                "test_macro_f1": float(test_metrics.get("test_macro_f1", 0.0)),
+                "test_accuracy": float(test_metrics.get("test_accuracy", 0.0)),
+                "strict_test_macro_f1": float(test_metrics.get("strict_test_macro_f1", 0.0)),
+                "strict_test_accuracy": float(test_metrics.get("strict_test_accuracy", 0.0)),
+            },
+        )
+        self._log_test_metrics(test_metrics)
+
+        if self.tracker is not None:
+            self.tracker.log_model(self.model, "best_model")
+            self.tracker.log_metric("best_epoch", float(best_epoch), step=self.epochs)
+            self.tracker.log_metric("best_val_loss", float(best_val_loss), step=self.epochs)
+
+        return {
+            "history": history,
+            "test_metrics": test_metrics,
+            "split_sizes": {"train": len(split_data.train), "val": len(split_data.val), "test": len(split_data.test)},
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+            "mode": self.mode,
+        }
+
+    def _perform_dry_run(self, loader: Iterable[Data], context_label: str) -> None:
+        """Initialize lazy modules by one forward pass before optimizer/model-size logging."""
+        logger.info("Performing dry run to initialize Lazy modules (%s)...", context_label)
+        emit_progress_event(stage="trainer.dry_run", status="start", message=f"Dry run started ({context_label})")
+        was_training = self.model.training
+        self.model.train()
+        try:
+            iterator = iter(loader)
+            dummy_batch = next(iterator, None)
+            if dummy_batch is None:
+                logger.warning("Dry run skipped (%s): loader is empty.", context_label)
+                emit_progress_event(stage="trainer.dry_run", status="done", level="warning", message=f"Dry run skipped ({context_label})")
+                return
+            dummy_batch = dummy_batch.to(self.device)
+            contract = self._data_to_contract(dummy_batch)
+            with torch.no_grad():
+                if self.candidate_contract_mode == "candidate_id":
+                    _ = self._forward_candidate_output(contract)
+                else:
+                    _ = self._forward_model_logits(contract)
+            logger.info("Dry run successful (%s). Model initialized.", context_label)
+            emit_progress_event(stage="trainer.dry_run", status="done", message=f"Dry run completed ({context_label})", current=1, total=1)
+        except Exception as exc:
+            logger.error("Dry run failed (%s): %s", context_label, exc)
+            emit_progress_event(stage="trainer.dry_run", status="error", level="error", message=f"Dry run failed: {exc}")
+            raise
+        finally:
+            self.model.train(was_training)
+
+    def _save_checkpoint(
+        self,
+        checkpoint_path: Path,
+        epoch: int,
+        val_loss: float,
+        optimizer: Adam,
+        *,
+        best_epoch: Optional[int] = None,
+        best_val_loss: Optional[float] = None,
+    ) -> None:
+        """Persist best model checkpoint for future resume/evaluation flows."""
+        checkpoint_payload = {
+            "epoch": int(epoch),
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": float(val_loss),
+        }
+        if best_epoch is not None:
+            checkpoint_payload["best_epoch"] = int(best_epoch)
+        if best_val_loss is not None and math.isfinite(float(best_val_loss)):
+            checkpoint_payload["best_val_loss"] = float(best_val_loss)
+        feature_encoder = getattr(self.graph_builder, "feature_encoder", None)
+        if feature_encoder is not None and hasattr(feature_encoder, "get_state"):
+            checkpoint_payload["encoder_state"] = feature_encoder.get_state()
+        if self.tracker is not None and hasattr(self.tracker, "get_run_id"):
+            try:
+                run_id = getattr(self.tracker, "get_run_id")()
+            except Exception:  # noqa: BLE001
+                run_id = None
+            if isinstance(run_id, str) and run_id.strip():
+                checkpoint_payload["mlflow_run_id"] = run_id.strip()
+        torch.save(checkpoint_payload, checkpoint_path)
+
+    @staticmethod
+    def _derive_last_checkpoint_path(checkpoint_path: Path) -> Path:
+        """Derive stable last-training checkpoint path from best/effective checkpoint path."""
+        name = checkpoint_path.name
+        if name.endswith("_best.pth"):
+            return checkpoint_path.with_name(f"{name[:-9]}_last.pth")
+        stem = checkpoint_path.stem
+        suffix = checkpoint_path.suffix or ".pth"
+        if stem.endswith("_best"):
+            return checkpoint_path.with_name(f"{stem[:-5]}_last{suffix}")
+        return checkpoint_path.with_name(f"{stem}_last{suffix}")
+
+    @staticmethod
+    def _derive_finetune_checkpoint_path(checkpoint_path: Path, *, run_token: str | None = None) -> Path:
+        """Derive sidecar checkpoint path for adaptive fine-tuned weights."""
+        name = checkpoint_path.name
+        if name.endswith("_best.pth"):
+            stem = name[:-9]
+            return checkpoint_path.with_name(f"{stem}_{run_token}_finetune.pth" if run_token else f"{stem}_finetune.pth")
+        stem = checkpoint_path.stem
+        suffix = checkpoint_path.suffix or ".pth"
+        if stem.endswith("_best"):
+            stem = stem[:-5]
+        return checkpoint_path.with_name(
+            f"{stem}_{run_token}_finetune{suffix}" if run_token else f"{stem}_finetune{suffix}"
+        )
+
+    def _save_finetune_checkpoint(
+        self,
+        *,
+        epoch: int,
+        val_loss: float,
+        checkpoint: Optional[Dict[str, Any]],
+        update_index: int,
+        optimizer: Optional[Adam] = None,
+    ) -> None:
+        """Persist adaptive fine-tune weights without modifying the source checkpoint."""
+        self.finetune_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = dict(checkpoint or {})
+        payload["epoch"] = int(epoch)
+        payload["model_state_dict"] = self.model.state_dict()
+        payload["val_loss"] = float(val_loss)
+        payload["source_checkpoint_path"] = str(self.checkpoint_path)
+        payload["finetune_update_index"] = int(update_index)
+        payload["adaptation_protocol"] = "prequential_released_unique_v1"
+        if optimizer is not None:
+            payload["optimizer_state_dict"] = optimizer.state_dict()
+        feature_encoder = getattr(self.graph_builder, "feature_encoder", None)
+        if feature_encoder is not None and hasattr(feature_encoder, "get_state"):
+            payload["encoder_state"] = feature_encoder.get_state()
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".pth.tmp",
+            dir=self.finetune_checkpoint_path.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        try:
+            torch.save(payload, temporary_path)
+            for attempt in range(5):
+                try:
+                    temporary_path.replace(self.finetune_checkpoint_path)
+                    break
+                except PermissionError:
+                    if attempt >= 4:
+                        raise
+                    delay_seconds = 0.2 * float(attempt + 1)
+                    logger.warning(
+                        "Fine-tune sidecar publish was temporarily locked; retrying in %.1fs "
+                        "(%d/5): %s",
+                        delay_seconds,
+                        attempt + 1,
+                        self.finetune_checkpoint_path,
+                    )
+                    sleep(delay_seconds)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    def _resolve_resume_checkpoint_path(self) -> Optional[Path]:
+        """Resolve training-resume checkpoint path, preferring explicit resume/last checkpoint."""
+        candidate_paths: List[Path] = []
+        if isinstance(self.resume_checkpoint_path, Path):
+            candidate_paths.append(self.resume_checkpoint_path)
+        if isinstance(self.last_checkpoint_path, Path):
+            candidate_paths.append(self.last_checkpoint_path)
+        candidate_paths.append(self.checkpoint_path)
+
+        seen: set[str] = set()
+        for candidate in candidate_paths:
+            normalized = str(candidate)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_checkpoint(self, checkpoint_path: Path, require_encoder_state: bool) -> Dict[str, Any]:
+        """Load checkpoint with required keys validation."""
+        checkpoint = load_trusted_torch_artifact(checkpoint_path, map_location=self.device)
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Checkpoint payload must be a dictionary.")
+
+        required_keys = {"epoch", "model_state_dict", "val_loss"}
+        missing_keys = required_keys.difference(checkpoint.keys())
+        if missing_keys:
+            raise ValueError(f"Checkpoint is missing required keys: {sorted(missing_keys)}")
+
+        if require_encoder_state and "encoder_state" not in checkpoint:
+            raise ValueError("Checkpoint is missing required key 'encoder_state'.")
+
+        return checkpoint
+
+    def _restore_from_checkpoint(self, checkpoint: Dict[str, Any], require_encoder_state: bool) -> None:
+        """Restore model and feature encoder states from checkpoint."""
+        self._materialize_lazy_model_modules(checkpoint)
+        try:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as exc:
+            logger.error(
+                "Checkpoint architecture mismatch while loading model state. "
+                "checkpoint_path=%s model_class=%s error=%s",
+                self.checkpoint_path,
+                self.model.__class__.__name__,
+                exc,
+            )
+            raise ValueError(
+                "Checkpoint architecture mismatch! You are trying to load a checkpoint that belongs to a "
+                f"different model architecture.\n"
+                f"Current model: {self.model.__class__.__name__}\n"
+                f"Checkpoint: {self.checkpoint_path}\n"
+                f"Details: {exc}\n"
+                "FIX: Either change 'experiment.name' in config, set 'training.retrain: true', "
+                "or manually delete the old checkpoint."
+            ) from exc
+        self._restore_encoder_state(checkpoint, require_encoder_state=require_encoder_state)
+
+    def _materialize_lazy_model_modules(self, checkpoint: Dict[str, Any]) -> None:
+        """Materialize lazily-created model modules that may already exist in checkpoint state."""
+        model_state = checkpoint.get("model_state_dict")
+        if not isinstance(model_state, dict):
+            return
+
+        # EOPKGGATv2 creates struct_input_proj lazily on first forward when struct_x dim != struct_hidden_dim.
+        # For resume flows we need the module in place before strict state_dict loading.
+        has_lazy_proj = hasattr(self.model, "struct_input_proj")
+        current_proj = getattr(self.model, "struct_input_proj", None) if has_lazy_proj else None
+        if not has_lazy_proj or current_proj is not None:
+            return
+
+        weight = model_state.get("struct_input_proj.weight")
+        bias = model_state.get("struct_input_proj.bias")
+        if not isinstance(weight, torch.Tensor):
+            return
+        if weight.ndim != 2:
+            raise ValueError("Invalid checkpoint tensor shape for struct_input_proj.weight; expected 2D tensor.")
+
+        out_features = int(weight.shape[0])
+        in_features = int(weight.shape[1])
+        use_bias = isinstance(bias, torch.Tensor)
+
+        layer = nn.Linear(in_features, out_features, bias=use_bias).to(device=self.device, dtype=weight.dtype)
+        setattr(self.model, "struct_input_proj", layer)
+        logger.info(
+            "Materialized lazy module struct_input_proj from checkpoint shape=(out=%d,in=%d).",
+            out_features,
+            in_features,
+        )
+
+    def _restore_encoder_state(self, checkpoint: Dict[str, Any], require_encoder_state: bool) -> None:
+        """Restore encoder state into graph_builder.feature_encoder when available."""
+        encoder_state = checkpoint.get("encoder_state")
+        if encoder_state is None:
+            if require_encoder_state:
+                raise ValueError("Checkpoint does not contain required encoder_state payload.")
+            return
+
+        feature_encoder = getattr(self.graph_builder, "feature_encoder", None)
+        if feature_encoder is None or not hasattr(feature_encoder, "load_state"):
+            raise ValueError("Graph builder does not expose feature_encoder.load_state required for checkpoint restore.")
+        feature_encoder.load_state(encoder_state)
+
+    def _prepare_split_data(self, traces: Sequence[RawTrace]) -> SplitData:
+        """Apply micro split into train/val/test on already prepared trace stream."""
+        if self.mode in {"eval_drift", "eval_cross_dataset"}:
+            logger.info("Eval mode [%s]: bypassing micro split; routing all %d traces to test scope.", self.mode, len(traces))
+            return SplitData(train=[], val=[], test=list(traces))
+        experiment_cfg = self.config.get("experiment_config", {})
+        split_strategy = str(experiment_cfg.get("split_strategy", "temporal")).strip().lower()
+        split_ratio = self._parse_split_ratio(experiment_cfg.get("split_ratio", [0.7, 0.2, 0.1]))
+        if split_strategy == "time":
+            split_strategy = "temporal"
+        logger.info("Micro split train/val/test with ratio %s.", list(split_ratio))
+        return self._strict_temporal_split(ordered=traces, split_ratio=split_ratio, split_strategy=split_strategy)
+
+    def _prepare_data(self, traces: Sequence[RawTrace], mode: str) -> List[RawTrace]:
+        """Apply safe cascade filter: temporal sort -> macro split -> fraction."""
+        experiment_cfg = self.config.get("experiment_config", {})
+        split_strategy = str(experiment_cfg.get("split_strategy", "temporal")).strip().lower()
+        if split_strategy == "time":
+            split_strategy = "temporal"
+        if split_strategy not in {"temporal", "none", "versioned"}:
+            raise ValueError("experiment.split_strategy must be 'temporal', 'none', or 'versioned'.")
+
+        fraction_strategy = str(experiment_cfg.get("fraction_strategy", "temporal")).strip().lower()
+        if fraction_strategy not in {"temporal", "versioned"}:
+            raise ValueError("experiment.fraction_strategy must be 'temporal' or 'versioned'.")
+
+        version_scope_policy = str(experiment_cfg.get("version_scope_policy", "all")).strip().lower()
+        if version_scope_policy not in {"all", "train_cut"}:
+            raise ValueError("experiment.version_scope_policy must be 'all' or 'train_cut'.")
+
+        train_ratio = float(experiment_cfg.get("train_ratio", 0.7))
+        if train_ratio < 0.0 or train_ratio > 1.0:
+            raise ValueError("experiment.train_ratio must be within [0.0, 1.0].")
+
+        fraction = float(experiment_cfg.get("fraction", 1.0))
+        if fraction <= 0.0 or fraction > 1.0:
+            raise ValueError("experiment.fraction must be within (0.0, 1.0].")
+
+        traces_with_events = [trace for trace in traces if trace.events]
+        if split_strategy == "temporal":
+            logger.info("Found %d traces. Applying chronological sort.", len(traces_with_events))
+            ordered = sorted(traces_with_events, key=lambda tr: tr.events[0].timestamp)
+        else:
+            logger.info("Found %d traces. split_strategy=none, keeping original order.", len(traces_with_events))
+            ordered = list(traces_with_events)
+
+        macro = self._apply_version_scope(
+            ordered,
+            mode=mode,
+            train_ratio=train_ratio,
+            version_scope_policy=version_scope_policy,
+        )
+        mode_label = mode.strip().lower()
+        if mode_label == "train":
+            logger.info(
+                "Macro split mode [train]: using %.2f%% of data (%d traces, version_scope_policy=%s).",
+                train_ratio * 100.0,
+                len(macro),
+                version_scope_policy,
+            )
+        elif mode_label in {"eval_drift", "eval_cross_dataset"}:
+            logger.info(
+                "Macro split mode [%s]: using %.2f%% tail data (%d traces, version_scope_policy=%s).",
+                mode_label,
+                (1.0 - train_ratio) * 100.0,
+                len(macro),
+                version_scope_policy,
+            )
+        else:
+            logger.info("Macro split mode [%s]: no cut applied, kept %d traces.", mode_label, len(macro))
+
+        if fraction >= 1.0:
+            filtered = macro
+        elif fraction_strategy == "versioned":
+            filtered = self._apply_versioned_fraction(macro, fraction)
+        else:
+            keep_count = int(len(macro) * fraction)
+            filtered = macro[:keep_count]
+        if split_strategy in {"temporal", "versioned"}:
+            filtered = sorted(filtered, key=self._first_event_ts)
+        logger.info(
+            "Applied fraction=%.4f with fraction_strategy=%s. Kept %d traces.",
+            fraction,
+            fraction_strategy,
+            len(filtered),
+        )
+        return filtered
+
+    def _parse_split_ratio(self, raw_ratio: Any) -> Tuple[float, float, float]:
+        """Validate configured train/val/test split ratio."""
+        if not isinstance(raw_ratio, Sequence) or isinstance(raw_ratio, (str, bytes)) or len(raw_ratio) != 3:
+            raise ValueError("experiment.split_ratio must be a 3-item list [train, val, test].")
+        ratios = [float(item) for item in raw_ratio]
+        if any(item < 0.0 for item in ratios):
+            raise ValueError("experiment.split_ratio must contain non-negative values.")
+        ratio_sum = sum(ratios)
+        if not math.isclose(ratio_sum, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            raise ValueError(f"experiment.split_ratio must sum to 1.0, got {ratio_sum:.6f}")
+        return ratios[0], ratios[1], ratios[2]
+
+    def _strict_temporal_split(self, ordered: Sequence[RawTrace], split_ratio: Tuple[float, float, float], split_strategy: str) -> SplitData:
+        """Apply deterministic micro split by configured strategy and ratio."""
+        if split_strategy not in {"temporal", "none", "versioned"}:
+            raise ValueError(f"Unsupported experiment.split_strategy '{split_strategy}'.")
+        if split_strategy == "versioned":
+            return self._versioned_split(ordered, split_ratio)
+        total = len(ordered)
+        train_ratio, val_ratio, _ = split_ratio
+        train_end = int(total * train_ratio)
+        val_end = train_end + int(total * val_ratio)
+        return SplitData(train=list(ordered[:train_end]), val=list(ordered[train_end:val_end]), test=list(ordered[val_end:]))
+
+    @staticmethod
+    def _trace_version_label(trace: RawTrace) -> str:
+        return str(getattr(trace, "process_version", "")).strip() or "__missing__"
+
+    @staticmethod
+    def _first_event_ts(trace: RawTrace) -> Any:
+        return trace.events[0].timestamp if trace.events else 0
+
+    @classmethod
+    def _group_traces_by_version(cls, traces: Sequence[RawTrace]) -> Dict[str, List[RawTrace]]:
+        grouped: Dict[str, List[RawTrace]] = {}
+        for trace in traces:
+            grouped.setdefault(cls._trace_version_label(trace), []).append(trace)
+        return dict(sorted(grouped.items(), key=lambda item: item[0]))
+
+    def _apply_versioned_fraction(self, traces: Sequence[RawTrace], fraction: float) -> List[RawTrace]:
+        grouped = self._group_traces_by_version([trace for trace in traces if trace.events])
+        selected: List[RawTrace] = []
+        for _, version_traces in grouped.items():
+            ordered = sorted(version_traces, key=self._first_event_ts)
+            keep_count = len(ordered) if fraction >= 1.0 else max(1, int(len(ordered) * fraction))
+            selected.extend(ordered[:keep_count])
+        return selected
+
+    def _apply_version_scope(
+        self,
+        ordered: Sequence[RawTrace],
+        *,
+        mode: str,
+        train_ratio: float,
+        version_scope_policy: str,
+    ) -> List[RawTrace]:
+        split_idx = int(len(ordered) * train_ratio)
+        mode_key = str(mode).strip().lower()
+        if version_scope_policy == "all":
+            if mode_key == "train":
+                return list(ordered[:split_idx])
+            if mode_key in {"eval_drift", "eval_cross_dataset"}:
+                return list(ordered[split_idx:])
+            return list(ordered)
+
+        known_versions = {self._trace_version_label(trace) for trace in ordered[:split_idx]}
+        if mode_key == "train":
+            return [trace for trace in ordered if self._trace_version_label(trace) in known_versions]
+        if mode_key in {"eval_drift", "eval_cross_dataset"}:
+            return [trace for trace in ordered[split_idx:] if self._trace_version_label(trace) not in known_versions]
+        return list(ordered)
+
+    def _versioned_split(
+        self,
+        traces: Sequence[RawTrace],
+        split_ratio: Tuple[float, float, float],
+    ) -> SplitData:
+        grouped = self._group_traces_by_version([trace for trace in traces if trace.events])
+        train: List[RawTrace] = []
+        val: List[RawTrace] = []
+        test: List[RawTrace] = []
+        train_ratio, val_ratio, _ = split_ratio
+        for _, version_traces in grouped.items():
+            ordered = sorted(version_traces, key=self._first_event_ts)
+            train_end = int(len(ordered) * train_ratio)
+            val_end = train_end + int(len(ordered) * val_ratio)
+            train.extend(ordered[:train_end])
+            val.extend(ordered[train_end:val_end])
+            test.extend(ordered[val_end:])
+        return SplitData(train=train, val=val, test=test)
+
+    def _build_loader(self, traces: Sequence[RawTrace], shuffle: bool) -> DataLoader:
+        """Convert traces into graph tensors and wrap them into PyG DataLoader."""
+        graphs: List[Data] = []
+        for trace in traces:
+            slices = self.prefix_policy.generate_slices(trace)
+            for prefix_slice in slices:
+                contract = self.graph_builder.build_graph(prefix_slice)
+                num_nodes = int(contract["num_nodes"])
+                num_edges = int(contract["edge_index"].shape[1])
+                prefix_length = int(len(prefix_slice.prefix_events))
+                version_label = str(prefix_slice.process_version)
+                version_idx = self._version_to_idx.setdefault(version_label, len(self._version_to_idx))
+                self._idx_to_version[version_idx] = version_label
+                self._topology_nodes.append(num_nodes)
+                self._topology_edges.append(num_edges)
+                self._prefix_lengths.append(prefix_length)
+                payload = {
+                    "x_cat": contract["x_cat"],
+                    "x_num": contract["x_num"],
+                    "edge_index": contract["edge_index"],
+                    "edge_type": contract["edge_type"],
+                    "y": contract["y"],
+                    "num_nodes": num_nodes,
+                    "prefix_len": torch.tensor([prefix_length], dtype=torch.long),
+                    "process_version_idx": torch.tensor([version_idx], dtype=torch.long),
+                }
+                allowed_mask = contract.get("allowed_target_mask")
+                if isinstance(allowed_mask, torch.Tensor):
+                    payload["allowed_target_mask"] = allowed_mask.unsqueeze(0) if allowed_mask.dim() == 1 else allowed_mask
+                struct_x = contract.get("struct_x")
+                if isinstance(struct_x, torch.Tensor):
+                    payload["struct_x"] = struct_x
+                struct_prefix_state_x = contract.get("struct_prefix_state_x")
+                if isinstance(struct_prefix_state_x, torch.Tensor):
+                    payload["struct_prefix_state_x"] = struct_prefix_state_x
+                structural_edge_index = contract.get("structural_edge_index")
+                if isinstance(structural_edge_index, torch.Tensor):
+                    payload["structural_edge_index"] = structural_edge_index
+                structural_edge_weight = contract.get("structural_edge_weight")
+                if isinstance(structural_edge_weight, torch.Tensor):
+                    payload["structural_edge_weight"] = structural_edge_weight
+                for key in (
+                    "topology_projection_aligned",
+                    "topology_projection_projected_edge_count",
+                    "topology_projection_source_path_count",
+                    "topology_projection_skipped_edge_count",
+                    "topology_projection_missing_vocab_count",
+                    "topology_projection_duplicate_label_count",
+                    "topology_projection_missing_node_metadata",
+                ):
+                    value = contract.get(key)
+                    if isinstance(value, bool):
+                        payload[key] = torch.tensor([1 if value else 0], dtype=torch.long)
+                    elif isinstance(value, int):
+                        payload[key] = torch.tensor([int(value)], dtype=torch.long)
+                snapshot_seq_raw = contract.get("stats_snapshot_version_seq")
+                if isinstance(snapshot_seq_raw, (int, float)) and not isinstance(snapshot_seq_raw, bool):
+                    snapshot_idx = int(snapshot_seq_raw)
+                    snapshot_version = f"k{snapshot_idx:06d}"
+                    self._stats_snapshot_version_to_idx.setdefault(snapshot_version, snapshot_idx)
+                    self._idx_to_stats_snapshot_version[snapshot_idx] = snapshot_version
+                    payload["stats_snapshot_version_idx"] = torch.tensor([snapshot_idx], dtype=torch.long)
+                else:
+                    # Backward compatibility for contracts that still expose text metadata.
+                    stats_snapshot_version = contract.get("stats_snapshot_version")
+                    if stats_snapshot_version is not None:
+                        snapshot_version = str(stats_snapshot_version).strip()
+                        if snapshot_version:
+                            snapshot_idx = self._stats_snapshot_version_to_idx.setdefault(
+                                snapshot_version,
+                                len(self._stats_snapshot_version_to_idx),
+                            )
+                            self._idx_to_stats_snapshot_version[snapshot_idx] = snapshot_version
+                            payload["stats_snapshot_version_idx"] = torch.tensor([snapshot_idx], dtype=torch.long)
+
+                snapshot_as_of_epoch = None
+                snapshot_as_of_epoch_raw = contract.get("stats_snapshot_as_of_epoch")
+                if isinstance(snapshot_as_of_epoch_raw, (int, float)) and not isinstance(snapshot_as_of_epoch_raw, bool):
+                    snapshot_as_of_epoch = float(snapshot_as_of_epoch_raw)
+                if snapshot_as_of_epoch is None:
+                    snapshot_as_of_epoch = self._safe_iso_to_epoch(contract.get("stats_snapshot_as_of_ts"))
+                if snapshot_as_of_epoch is not None:
+                    payload["stats_snapshot_as_of_epoch"] = torch.tensor([snapshot_as_of_epoch], dtype=torch.float64)
+                graphs.append(Data(**payload))
+        return self._create_data_loader(graphs, shuffle=shuffle)
+
+    def _create_lazy_dataset_from_payload(self, payload: Dict[str, Any]) -> ShardedGraphDataset:
+        """Create a ShardedGraphDataset from payload with smart default for max_cached_shards."""
+        shards_list = payload.get("shards", [])
+        shards_count = len(shards_list) if isinstance(shards_list, list) else 0
+        max_cached = max(self.sharded_dataset_cached_shards, shards_count)
+        if max_cached > self.sharded_dataset_cached_shards:
+            logger.info(
+                "Auto-scaling ShardedGraphDataset cache size from %d to %d to match shard count.",
+                int(self.sharded_dataset_cached_shards),
+                int(max_cached),
+            )
+        return ShardedGraphDataset.from_payload(payload, max_cached_shards=max_cached)
+
+    def _build_loader_from_dataset(self, dataset: Optional[Any], shuffle: bool) -> DataLoader:
+        """Wrap prebuilt graph dataset into DataLoader and collect topology diagnostics."""
+        if isinstance(dataset, dict) and dataset.get("kind") == "sharded_cache_split":
+            lazy_dataset = self._create_lazy_dataset_from_payload(dataset)
+            logger.info(
+                "Using sharded on-disk dataset: split=%s graphs=%d shards=%d cached_shards=%d",
+                str(dataset.get("split", "unknown")),
+                int(dataset.get("graphs", len(lazy_dataset))),
+                int(len(dataset.get("shards", []))) if isinstance(dataset.get("shards", []), list) else 0,
+                int(lazy_dataset._max_cached_shards),
+            )
+            return self._create_data_loader_from_source(lazy_dataset, shuffle=shuffle)
+
+        graphs_source = dataset or []
+        if self.learning_strategy_config.is_topology_conditioned and self._topology_payload_pool is None:
+            self._topology_payload_pool = TopologyPayloadPool.from_dataset(
+                graphs_source,
+                idx_to_version=self._idx_to_version,
+            )
+            logger.info(
+                "Topology-conditioned payload pool ready: versions=%s",
+                ",".join(self._topology_payload_pool.version_labels) or "none",
+            )
+        for graph in graphs_source:
+            num_nodes_attr = getattr(graph, "num_nodes", None)
+            if num_nodes_attr is None:
+                num_nodes = int(graph.x_cat.size(0))
+            else:
+                num_nodes = int(num_nodes_attr)
+            num_edges = int(graph.edge_index.shape[1]) if hasattr(graph, "edge_index") else 0
+            self._topology_nodes.append(num_nodes)
+            self._topology_edges.append(num_edges)
+
+            if hasattr(graph, "prefix_len"):
+                prefix_tensor = graph.prefix_len
+                if isinstance(prefix_tensor, torch.Tensor) and prefix_tensor.numel() > 0:
+                    self._prefix_lengths.append(int(prefix_tensor.view(-1)[0].item()))
+
+            if hasattr(graph, "process_version_idx"):
+                version_tensor = graph.process_version_idx
+                if isinstance(version_tensor, torch.Tensor) and version_tensor.numel() > 0:
+                    idx = int(version_tensor.view(-1)[0].item())
+                    if idx not in self._idx_to_version:
+                        self._idx_to_version[idx] = f"v{idx}"
+                    self._version_to_idx.setdefault(self._idx_to_version[idx], idx)
+            if hasattr(graph, "stats_snapshot_version_idx"):
+                snapshot_version_tensor = graph.stats_snapshot_version_idx
+                if isinstance(snapshot_version_tensor, torch.Tensor) and snapshot_version_tensor.numel() > 0:
+                    idx = int(snapshot_version_tensor.view(-1)[0].item())
+                    if idx not in self._idx_to_stats_snapshot_version:
+                        self._idx_to_stats_snapshot_version[idx] = f"k{idx:06d}"
+                    self._stats_snapshot_version_to_idx.setdefault(self._idx_to_stats_snapshot_version[idx], idx)
+
+        return self._create_data_loader_from_source(graphs_source, shuffle=shuffle)
+
+    def _create_data_loader(self, graphs: Sequence[Data], *, shuffle: bool) -> DataLoader:
+        """Create DataLoader with optional worker parallelism for batch collation."""
+        return self._create_data_loader_from_source(graphs, shuffle=shuffle)
+
+    def _create_data_loader_from_source(self, source: Any, *, shuffle: bool) -> DataLoader:
+        """Create DataLoader from in-memory sequence or lazy on-disk dataset source."""
+        sampler: Sampler[int] | None = None
+        batch_sampler: Sampler[List[int]] | None = None
+        effective_shuffle = bool(shuffle)
+        effective_num_workers = int(self.dataloader_num_workers)
+        is_indexable_graph_source = hasattr(source, "__len__") and hasattr(source, "__getitem__")
+        if self.candidate_contract_mode == "candidate_id" and is_indexable_graph_source:
+            batch_sampler = _TopologyHomogeneousBatchSampler(
+                source,
+                batch_size=self.batch_size,
+                shuffle=bool(shuffle),
+                seed=self.seed,
+            )
+            effective_shuffle = False
+        elif isinstance(source, ShardedGraphDataset) and shuffle:
+            sampler = _ShardAwareRandomSampler(source, seed=self.seed)
+            effective_shuffle = False
+        elif (
+            isinstance(source, Sequence)
+            and not isinstance(source, (str, bytes))
+            and (
+                self.learning_strategy_config.is_topology_conditioned and shuffle
+            )
+        ):
+            batch_sampler = _TopologyHomogeneousBatchSampler(
+                source,
+                batch_size=self.batch_size,
+                shuffle=bool(shuffle),
+                seed=self.seed,
+            )
+            effective_shuffle = False
+        if isinstance(source, ShardedGraphDataset) and effective_num_workers > 0:
+            logger.info(
+                "Sharded dataset detected: forcing dataloader_num_workers=0 "
+                "to avoid multiprocess shard cache duplication/IPC overhead."
+            )
+            effective_num_workers = 0
+
+        kwargs: Dict[str, Any] = {
+            "shuffle": effective_shuffle,
+            "num_workers": effective_num_workers,
+            "pin_memory": self.dataloader_pin_memory,
+        }
+        if batch_sampler is not None:
+            kwargs["batch_sampler"] = batch_sampler
+            kwargs.pop("shuffle", None)
+        else:
+            kwargs["batch_size"] = self.batch_size
+        if sampler is not None and batch_sampler is None:
+            kwargs["sampler"] = sampler
+        if effective_num_workers > 0:
+            kwargs["persistent_workers"] = self.dataloader_persistent_workers
+            kwargs["prefetch_factor"] = self.dataloader_prefetch_factor
+        return DataLoader(source, **kwargs)
+
+    def _learning_strategy_active(self, *, training: bool) -> bool:
+        return bool(training and self.learning_strategy_config.is_topology_conditioned)
+
+    @staticmethod
+    def _batch_version_labels(contract: GraphTensorContract) -> List[str]:
+        raw = contract.get("process_version_labels")
+        if isinstance(raw, list):
+            return [str(item) for item in raw]
+        return []
+
+    def _batch_has_mixed_versions(self, contract: GraphTensorContract) -> bool:
+        labels = self._batch_version_labels(contract)
+        return len(set(labels)) > 1
+
+    def _current_batch_version(self, contract: GraphTensorContract) -> str | None:
+        labels = self._batch_version_labels(contract)
+        if not labels:
+            return None
+        first = labels[0]
+        if any(label != first for label in labels):
+            return None
+        return first
+
+    @staticmethod
+    def _version_ordinal(version_label: str) -> int | None:
+        digits = "".join(ch for ch in str(version_label) if ch.isdigit())
+        if not digits:
+            return None
+        try:
+            return int(digits)
+        except ValueError:
+            return None
+
+    def _retention_sample_weights(self, contract: GraphTensorContract, targets: torch.Tensor) -> torch.Tensor:
+        labels = self._batch_version_labels(contract)
+        if len(labels) != int(targets.numel()):
+            return torch.ones(int(targets.numel()), dtype=torch.float32, device=targets.device)
+        ordinals = [self._version_ordinal(label) for label in labels]
+        known_ordinals = [item for item in ordinals if item is not None]
+        if not known_ordinals:
+            return torch.ones(int(targets.numel()), dtype=torch.float32, device=targets.device)
+        latest = max(known_ordinals)
+        weights: List[float] = []
+        for ordinal in ordinals:
+            if ordinal is None:
+                weights.append(1.0)
+                continue
+            distance = max(0, latest - int(ordinal))
+            if distance == 0:
+                weights.append(1.0)
+            elif distance <= int(self.learning_strategy_config.retention_recent_versions):
+                weights.append(float(self.learning_strategy_config.retention_recent_weight))
+            elif float(self.learning_strategy_config.retention_old_weight) > 0.0:
+                weights.append(float(self.learning_strategy_config.retention_old_weight))
+            else:
+                weights.append(float(self.learning_strategy_config.retention_obsolete_weight))
+        return torch.tensor(weights, dtype=torch.float32, device=targets.device)
+
+    def _accumulate_topology_conditioned_stats(
+        self,
+        bucket: Dict[str, Any],
+        *,
+        key_prefix: str,
+        correct_ce: torch.Tensor,
+        negative_ce: torch.Tensor | None = None,
+        objective_loss: torch.Tensor | None = None,
+        margin: float = 0.0,
+    ) -> None:
+        if negative_ce is None:
+            if objective_loss is None:
+                return
+            bucket[f"topology_conditioned_{key_prefix}_loss_sum"] = float(
+                bucket.get(f"topology_conditioned_{key_prefix}_loss_sum", 0.0)
+            ) + float(objective_loss.detach().cpu().item())
+            bucket[f"topology_conditioned_{key_prefix}_batches"] = int(
+                bucket.get(f"topology_conditioned_{key_prefix}_batches", 0)
+            ) + 1
+            return
+        correct_value = float(correct_ce.detach().cpu().item())
+        negative_value = float(negative_ce.detach().cpu().item())
+        loss_value = float(objective_loss.detach().cpu().item()) if isinstance(objective_loss, torch.Tensor) else 0.0
+        bucket[f"topology_conditioned_{key_prefix}_ce_sum"] = float(
+            bucket.get(f"topology_conditioned_{key_prefix}_ce_sum", 0.0)
+        ) + negative_value
+        bucket[f"topology_conditioned_{key_prefix}_delta_sum"] = float(
+            bucket.get(f"topology_conditioned_{key_prefix}_delta_sum", 0.0)
+        ) + (negative_value - correct_value)
+        bucket[f"topology_conditioned_{key_prefix}_loss_sum"] = float(
+            bucket.get(f"topology_conditioned_{key_prefix}_loss_sum", 0.0)
+        ) + loss_value
+        bucket[f"topology_conditioned_{key_prefix}_batches"] = int(
+            bucket.get(f"topology_conditioned_{key_prefix}_batches", 0)
+        ) + 1
+        if negative_value < correct_value + float(margin):
+            bucket[f"topology_conditioned_{key_prefix}_margin_violations"] = int(
+                bucket.get(f"topology_conditioned_{key_prefix}_margin_violations", 0)
+            ) + 1
+
+    def _candidate_allowed_mask(
+        self,
+        *,
+        candidate_output: CandidatePredictionOutput,
+        allowed_mask: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if not isinstance(allowed_mask, torch.Tensor):
+            return None
+        return candidate_allowed_mask_from_global(allowed_mask, candidate_output.candidate_class_index)
+
+    def _accumulate_candidate_flow_stats(self, bucket: Dict[str, Any], summary: Dict[str, float]) -> None:
+        bucket["candidate_flow_batches"] = int(bucket.get("candidate_flow_batches", 0)) + 1
+        for key in (
+            "candidate_oos_rate",
+            "candidate_invalid_probability_mass",
+            "candidate_valid_probability_mass",
+            "candidate_valid_invalid_logit_margin",
+        ):
+            bucket[f"{key}_sum"] = float(bucket.get(f"{key}_sum", 0.0)) + float(summary.get(key, 0.0))
+
+    @staticmethod
+    def _candidate_flow_arrays(
+        candidate_logits: torch.Tensor,
+        candidate_allowed_mask: torch.Tensor,
+    ) -> Dict[str, np.ndarray]:
+        mask = candidate_allowed_mask.to(device=candidate_logits.device, dtype=torch.bool)
+        probs = torch.softmax(candidate_logits, dim=1)
+        invalid = ~mask
+        pred = torch.argmax(candidate_logits, dim=1)
+        pred_allowed = mask.gather(1, pred.view(-1, 1)).view(-1)
+        invalid_mass = probs.masked_fill(~invalid, 0.0).sum(dim=1)
+        valid_mass = probs.masked_fill(~mask, 0.0).sum(dim=1)
+        valid_logits = candidate_logits.masked_fill(~mask, float("-inf"))
+        invalid_logits = candidate_logits.masked_fill(~invalid, float("-inf"))
+        zeros = candidate_logits.new_zeros(candidate_logits.size(0))
+        valid_max = torch.where(mask.any(dim=1), valid_logits.max(dim=1).values, zeros)
+        invalid_max = torch.where(invalid.any(dim=1), invalid_logits.max(dim=1).values, zeros)
+        margin = valid_max - invalid_max
+        return {
+            "candidate_oos_flags": (~pred_allowed).float().detach().cpu().numpy().astype(np.float32, copy=False),
+            "candidate_invalid_probability_mass": invalid_mass.detach().cpu().numpy().astype(np.float32, copy=False),
+            "candidate_valid_probability_mass": valid_mass.detach().cpu().numpy().astype(np.float32, copy=False),
+            "candidate_valid_invalid_logit_margin": margin.detach().cpu().numpy().astype(np.float32, copy=False),
+        }
+
+    def _compute_structural_set_loss(
+        self,
+        *,
+        structural_logits: torch.Tensor,
+        targets: torch.Tensor,
+        allowed_target_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not isinstance(allowed_target_mask, torch.Tensor):
+            return F.cross_entropy(structural_logits, targets)
+
+        valid_mask = allowed_target_mask.to(device=structural_logits.device, dtype=torch.bool).clone()
+        target_index = targets.view(-1, 1).to(device=structural_logits.device)
+        valid_mask.scatter_(1, target_index, True)
+        log_probs = F.log_softmax(structural_logits, dim=1)
+        masked_log_probs = log_probs.masked_fill(~valid_mask, torch.finfo(log_probs.dtype).min)
+        set_log_prob = torch.logsumexp(masked_log_probs, dim=1)
+        return -set_log_prob.mean()
+
+    def _struct_xattn_contrastive_active(self, *, training: bool, epoch_index: int) -> bool:
+        if not training:
+            return False
+        if not self.struct_xattn_contrastive_enabled:
+            return False
+        if int(epoch_index) <= int(self.struct_xattn_contrastive_warmup_epochs):
+            return False
+        if float(self.struct_xattn_contrastive_weight) <= 0.0:
+            return False
+        fusion_mode = str(getattr(self.model, "fusion_mode", "")).strip().lower()
+        if fusion_mode != "struct_xattn":
+            return False
+        if not _as_bool(getattr(self.model, "structural_mode", True), default=True):
+            return False
+        return True
+
+    def _build_corrupted_structural_contract(
+        self,
+        contract: GraphTensorContract,
+        *,
+        epoch_index: int,
+        batch_idx: int,
+    ) -> GraphTensorContract:
+        corrupted: GraphTensorContract = dict(contract)  # type: ignore[assignment]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(self.seed) + (int(epoch_index) * 100_003) + int(batch_idx))
+
+        policy = str(self.struct_xattn_corruption_policy).strip().lower()
+        if policy in {"edge_drop", "edge_drop_plus_feature_noise"}:
+            edge_index = corrupted.get("structural_edge_index")
+            if isinstance(edge_index, torch.Tensor) and edge_index.dim() == 2 and int(edge_index.size(1)) > 1:
+                edge_count = int(edge_index.size(1))
+                keep_prob = 1.0 - float(self.struct_xattn_corruption_edge_drop_prob)
+                random_values = torch.rand(edge_count, generator=generator, device="cpu")
+                keep_mask = random_values < keep_prob
+                if not torch.any(keep_mask):
+                    keep_mask[0] = True
+                keep_mask = keep_mask.to(device=edge_index.device, dtype=torch.bool)
+                corrupted["structural_edge_index"] = edge_index[:, keep_mask].clone()
+                edge_weight = corrupted.get("structural_edge_weight")
+                if isinstance(edge_weight, torch.Tensor) and int(edge_weight.numel()) == edge_count:
+                    corrupted["structural_edge_weight"] = edge_weight[keep_mask].clone()
+
+        if policy in {"feature_noise", "edge_drop_plus_feature_noise"}:
+            struct_x = corrupted.get("struct_x")
+            if isinstance(struct_x, torch.Tensor) and struct_x.numel() > 0:
+                std = float(self.struct_xattn_corruption_feature_noise_std)
+                if std > 0.0:
+                    noise = torch.randn(
+                        tuple(struct_x.shape),
+                        generator=generator,
+                        device="cpu",
+                        dtype=torch.float32,
+                    ).to(device=struct_x.device, dtype=struct_x.dtype)
+                    corrupted["struct_x"] = struct_x.clone() + (std * noise)
+
+        return corrupted
+
+    def _accumulate_struct_xattn_contrastive_stats(
+        self,
+        bucket: Dict[str, Any],
+        *,
+        correct_ce: torch.Tensor,
+        corrupt_ce: torch.Tensor,
+        contrastive_loss: torch.Tensor,
+        correct_logits: torch.Tensor,
+        corrupt_logits: torch.Tensor,
+        margin: float,
+    ) -> None:
+        correct_value = float(correct_ce.detach().cpu().item())
+        corrupt_value = float(corrupt_ce.detach().cpu().item())
+        contrastive_value = float(contrastive_loss.detach().cpu().item())
+        bucket["struct_xattn_correct_ce_sum"] = float(bucket.get("struct_xattn_correct_ce_sum", 0.0)) + correct_value
+        bucket["struct_xattn_corrupt_ce_sum"] = float(bucket.get("struct_xattn_corrupt_ce_sum", 0.0)) + corrupt_value
+        bucket["struct_xattn_contrastive_loss_sum"] = float(
+            bucket.get("struct_xattn_contrastive_loss_sum", 0.0)
+        ) + contrastive_value
+        bucket["struct_xattn_correct_vs_corrupt_ce_delta_sum"] = float(
+            bucket.get("struct_xattn_correct_vs_corrupt_ce_delta_sum", 0.0)
+        ) + (corrupt_value - correct_value)
+        bucket["struct_xattn_contrastive_batches"] = int(bucket.get("struct_xattn_contrastive_batches", 0)) + 1
+        if corrupt_value < correct_value + float(margin):
+            bucket["struct_xattn_contrastive_margin_violations"] = int(
+                bucket.get("struct_xattn_contrastive_margin_violations", 0)
+            ) + 1
+        correct_pred = torch.argmax(correct_logits.detach(), dim=1)
+        corrupt_pred = torch.argmax(corrupt_logits.detach(), dim=1)
+        flip_rate = (correct_pred != corrupt_pred).float().mean()
+        bucket["struct_xattn_prediction_flip_rate_sum"] = float(
+            bucket.get("struct_xattn_prediction_flip_rate_sum", 0.0)
+        ) + float(flip_rate.cpu().item())
+
+    def _run_epoch(
+        self,
+        loader: Iterable[Data],
+        optimizer: Optional[Adam],
+        training: bool,
+        epoch_index: int = 1,
+        total_epochs: int = 1,
+        epoch_progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> Tuple[float, float, float, float]:
+        """Run one epoch (train or eval) and return loss/macro_f1/weighted_f1/duration."""
+        if training:
+            self.model.train()
+        else:
+            self.model.eval()
+
+        started = perf_counter()
+        total_loss = 0.0
+        all_true: List[int] = []
+        all_pred: List[int] = []
+        batches = 0
+        forward_stats = self._new_forward_stats_accumulator()
+        contract_sanitized_batches = 0
+        logits_sanitized_batches = 0
+        non_finite_loss_batches = 0
+        non_finite_gradient_batches = 0
+        non_finite_parameter_batches = 0
+        optimizer_steps = 0
+        phase_name = "train" if training else "validation"
+        stage_name = "train.batches" if training else "validation.batches"
+        batch_reporter = ProgressReporter(stage=stage_name, min_interval_sec=0.8)
+        try:
+            total_batches = int(len(loader))  # type: ignore[arg-type]
+        except Exception:
+            total_batches = 0
+        batch_reporter.start(
+            message=f"{phase_name.title()} epoch {epoch_index}/{total_epochs}",
+            current=0,
+            total=total_batches if total_batches > 0 else None,
+            payload={"epoch": int(epoch_index), "total_epochs": int(total_epochs)},
+        )
+
+        iterator = tqdm(loader, desc=("Train epoch" if training else "Validation epoch"), leave=self.tqdm_leave, disable=self._is_tqdm_disabled())
+        for batch_idx, data in enumerate(iterator, start=1):
+            data = data.to(self.device)
+            contract = self._data_to_contract(data)
+            if self._sanitize_contract_numeric_tensors(contract):
+                contract_sanitized_batches += 1
+            self._accumulate_forward_stats(forward_stats, contract)
+            if training and optimizer is not None:
+                optimizer.zero_grad()
+
+            with torch.set_grad_enabled(training):
+                candidate_output: CandidatePredictionOutput | None = None
+                target_candidate_mask: torch.Tensor | None = None
+                candidate_allowed_mask: torch.Tensor | None = None
+                if self.candidate_contract_mode == "candidate_id":
+                    candidate_output = self._forward_candidate_output(contract)
+                    logits = candidate_output.candidate_logits
+                else:
+                    logits = self._forward_model_logits(contract)
+                self._accumulate_logit_contribution_stats(forward_stats)
+                self._accumulate_topology_state_stats(forward_stats)
+                self._accumulate_topology_graph_stats(forward_stats)
+                self._accumulate_structural_prior_stats(forward_stats)
+                self._accumulate_struct_xattn_stats(forward_stats)
+                self._accumulate_topology_conditioned_candidate_stats(forward_stats)
+                if not self._is_finite_tensor(logits):
+                    logits_sanitized_batches += 1
+                    logger.warning(
+                        "Numeric guard [epoch:%s]: non-finite logits detected. Applying nan_to_num.",
+                        "train" if training else "validation",
+                    )
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+                targets = data.y.view(-1).long()
+                allowed_mask = self._normalize_allowed_mask(contract.get("allowed_target_mask"), expected_rows=int(targets.shape[0]))
+                batch_target_in_mask_rate, valid_rows = self._batch_target_in_mask_rate(
+                    allowed_mask=allowed_mask,
+                    targets=targets,
+                )
+                if batch_target_in_mask_rate is not None:
+                    self._update_mask_guided_reliability(rate=batch_target_in_mask_rate, samples=valid_rows)
+                mask_policy = self._resolve_mask_guided_policy(
+                    training=training,
+                    batch_target_in_mask_rate=batch_target_in_mask_rate,
+                    batch_samples=valid_rows,
+                )
+                if candidate_output is not None:
+                    target_labels = self._target_labels_from_contract(contract, targets)
+                    if (
+                        self.candidate_identity_mode == "topology_native"
+                        and target_labels
+                        and len(candidate_output.candidate_labels) > 0
+                    ):
+                        target_candidate_mask = candidate_target_mask_from_labels(
+                            target_labels=target_labels,
+                            candidate_labels=candidate_output.candidate_labels,
+                            candidate_ids=candidate_output.candidate_ids,
+                            device=logits.device,
+                        )
+                    else:
+                        target_candidate_mask = candidate_output.map_targets_to_candidate_mask(targets)
+                    candidate_allowed_mask = self._candidate_allowed_mask(
+                        candidate_output=candidate_output,
+                        allowed_mask=allowed_mask,
+                    )
+                    if candidate_allowed_mask is not None:
+                        self._accumulate_candidate_flow_stats(
+                            forward_stats,
+                            candidate_allowed_flow_summary(logits.detach(), candidate_allowed_mask),
+                        )
+                    summary = candidate_target_summary(logits, target_candidate_mask)
+                    missing_rate = float(summary["missing_target_rate"])
+                    if training and missing_rate > float(self.candidate_missing_target_fail_threshold):
+                        raise ValueError(
+                            "candidate_contract_mode=candidate_id target mapping failed: "
+                            f"missing_target_rate={missing_rate:.6f} exceeds "
+                            f"candidate_missing_target_fail_threshold={self.candidate_missing_target_fail_threshold:.6f}."
+                        )
+                    for key, value in summary.items():
+                        metric_key = f"candidate_{key}"
+                        if isinstance(value, (int, float)):
+                            forward_stats[f"{metric_key}_sum"] = float(forward_stats.get(f"{metric_key}_sum", 0.0)) + float(value)
+                    forward_stats["candidate_target_mapping_batches"] = int(
+                        forward_stats.get("candidate_target_mapping_batches", 0)
+                    ) + 1
+                    effective_logits = logits
+                    loss = candidate_set_cross_entropy(
+                        logits,
+                        target_candidate_mask,
+                        missing_target_penalty=1.0,
+                    )
+                    base_ce_loss = loss
+                else:
+                    effective_logits = self._apply_mask_guided_logits(
+                        logits=logits,
+                        allowed_mask=allowed_mask,
+                        policy=mask_policy,
+                    )
+                    loss = self.criterion(effective_logits, targets)
+                    base_ce_loss = loss
+                if isinstance(allowed_mask, torch.Tensor) and candidate_output is None:
+                    leakage = allowed_set_mass_leakage(logits, targets, allowed_mask)
+                    forward_stats["allowed_set_mass_leakage_sum"] = float(
+                        forward_stats.get("allowed_set_mass_leakage_sum", 0.0)
+                    ) + float(leakage.detach().cpu().item())
+                    forward_stats["allowed_set_mass_leakage_batches"] = int(
+                        forward_stats.get("allowed_set_mass_leakage_batches", 0)
+                    ) + 1
+                structural_aux_set_loss: torch.Tensor | None = None
+                structural_aux_exact_loss: torch.Tensor | None = None
+                structural_logits = getattr(self.model, "last_structural_class_logits", None)
+                if (
+                    self.structural_aux_loss_enabled
+                    and isinstance(structural_logits, torch.Tensor)
+                    and structural_logits.shape == effective_logits.shape
+                ):
+                    structural_aux_set_loss = self._compute_structural_set_loss(
+                        structural_logits=structural_logits,
+                        targets=targets,
+                        allowed_target_mask=allowed_mask,
+                    )
+                    structural_aux_exact_loss = F.cross_entropy(structural_logits, targets)
+                    loss = (
+                        loss
+                        + (self.structural_aux_loss_weight * structural_aux_set_loss)
+                        + (self.structural_aux_exact_loss_weight * structural_aux_exact_loss)
+                    )
+                    forward_stats["structural_aux_set_loss_sum"] = float(
+                        forward_stats.get("structural_aux_set_loss_sum", 0.0)
+                    ) + float(structural_aux_set_loss.detach().cpu().item())
+                    forward_stats["structural_aux_exact_loss_sum"] = float(
+                        forward_stats.get("structural_aux_exact_loss_sum", 0.0)
+                    ) + float(structural_aux_exact_loss.detach().cpu().item())
+                    forward_stats["structural_aux_total_loss_sum"] = float(
+                        forward_stats.get("structural_aux_total_loss_sum", 0.0)
+                    ) + float(
+                        (
+                            (self.structural_aux_loss_weight * structural_aux_set_loss)
+                            + (self.structural_aux_exact_loss_weight * structural_aux_exact_loss)
+                        )
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
+                    forward_stats["structural_aux_loss_batches"] = int(
+                        forward_stats.get("structural_aux_loss_batches", 0)
+                    ) + 1
+                if self._learning_strategy_active(training=training):
+                    if self._batch_has_mixed_versions(contract):
+                        forward_stats["topology_conditioned_mixed_version_batches"] = int(
+                            forward_stats.get("topology_conditioned_mixed_version_batches", 0)
+                        ) + 1
+                    if (
+                        self.learning_strategy_config.allowed_set_loss_enabled
+                        and float(self.learning_strategy_config.allowed_set_loss_weight) > 0.0
+                    ):
+                        if not isinstance(allowed_mask, torch.Tensor):
+                            raise ValueError(
+                                "training.topology_conditioning_allowed_set_loss_enabled requires allowed_target_mask."
+                            )
+                        if candidate_output is not None:
+                            if candidate_allowed_mask is None:
+                                raise ValueError(
+                                    "candidate_contract_mode=candidate_id allowed-set loss requires allowed_target_mask."
+                                )
+                            allowed_loss = candidate_topology_flow_penalty_loss(
+                                logits,
+                                candidate_allowed_mask,
+                                penalty_type="invalid_probability_mass",
+                                margin=float(self.topology_flow_penalty_margin),
+                            )
+                        else:
+                            allowed_loss = allowed_set_loss(logits, targets, allowed_mask)
+                        loss = loss + (float(self.learning_strategy_config.allowed_set_loss_weight) * allowed_loss)
+                        self._accumulate_topology_conditioned_stats(
+                            forward_stats,
+                            key_prefix="allowed_set",
+                            correct_ce=base_ce_loss.detach(),
+                            objective_loss=allowed_loss.detach(),
+                        )
+                    if (
+                        candidate_output is not None
+                        and bool(self.topology_flow_penalty_enabled)
+                        and float(self.topology_flow_penalty_weight) > 0.0
+                    ):
+                        if candidate_allowed_mask is None:
+                            if bool(self.topology_flow_penalty_fail_on_missing_mask):
+                                raise ValueError("training.topology_flow_penalty_enabled requires allowed_target_mask.")
+                        else:
+                            flow_loss = candidate_topology_flow_penalty_loss(
+                                logits,
+                                candidate_allowed_mask,
+                                penalty_type=self.topology_flow_penalty_type,
+                                margin=float(self.topology_flow_penalty_margin),
+                            )
+                            loss = loss + (float(self.topology_flow_penalty_weight) * flow_loss)
+                            self._accumulate_topology_conditioned_stats(
+                                forward_stats,
+                                key_prefix="topology_flow_penalty",
+                                correct_ce=base_ce_loss.detach(),
+                                objective_loss=flow_loss.detach(),
+                            )
+                    if (
+                        self.learning_strategy_config.retention_enabled
+                        and str(self.learning_strategy_config.retention_policy) == "version_decay"
+                    ):
+                        sample_weights = self._retention_sample_weights(contract, targets)
+                        retention_class_weights = None if candidate_output is not None else self.class_weights
+                        retention_loss = version_weighted_cross_entropy(
+                            effective_logits,
+                            targets,
+                            sample_weights=sample_weights,
+                            class_weights=retention_class_weights,
+                        )
+                        loss = loss + retention_loss
+                        self._accumulate_topology_conditioned_stats(
+                            forward_stats,
+                            key_prefix="retention",
+                            correct_ce=base_ce_loss.detach(),
+                            objective_loss=retention_loss.detach(),
+                        )
+                    if (
+                        self.learning_strategy_config.drop_edges_negative_enabled
+                        and float(self.learning_strategy_config.drop_edges_negative_weight) > 0.0
+                    ):
+                        if candidate_output is not None:
+                            forward_stats["topology_conditioned_drop_edges_skipped_candidate_id_batches"] = int(
+                                forward_stats.get(
+                                    "topology_conditioned_drop_edges_skipped_candidate_id_batches",
+                                    0,
+                                )
+                            ) + 1
+                        else:
+                            dropped_contract = drop_structural_edges(
+                                contract,
+                                drop_ratio=float(self.learning_strategy_config.drop_edges_ratio),
+                                seed=int(self.seed) + (int(epoch_index) * 100_003) + int(batch_idx),
+                            )
+                            dropped_logits = self._forward_model_logits(dropped_contract)
+                            if not self._is_finite_tensor(dropped_logits):
+                                logits_sanitized_batches += 1
+                                dropped_logits = torch.nan_to_num(
+                                    dropped_logits,
+                                    nan=0.0,
+                                    posinf=1e6,
+                                    neginf=-1e6,
+                                )
+                            dropped_effective_logits = self._apply_mask_guided_logits(
+                                logits=dropped_logits,
+                                allowed_mask=allowed_mask,
+                                policy=mask_policy,
+                            )
+                            dropped_ce = self.criterion(dropped_effective_logits, targets)
+                            drop_loss = margin_negative_loss(
+                                correct_ce=base_ce_loss,
+                                negative_ce=dropped_ce,
+                                margin=float(self.learning_strategy_config.drop_edges_margin),
+                            )
+                            loss = loss + (float(self.learning_strategy_config.drop_edges_negative_weight) * drop_loss)
+                            self._accumulate_topology_conditioned_stats(
+                                forward_stats,
+                                key_prefix="drop_edges",
+                                correct_ce=base_ce_loss.detach(),
+                                negative_ce=dropped_ce.detach(),
+                                objective_loss=drop_loss.detach(),
+                                margin=float(self.learning_strategy_config.drop_edges_margin),
+                            )
+                    if (
+                        self.learning_strategy_config.wrong_version_negative_enabled
+                        and float(self.learning_strategy_config.wrong_version_negative_weight) > 0.0
+                    ):
+                        current_version = self._current_batch_version(contract)
+                        wrong_payload = (
+                            self._topology_payload_pool.wrong_version_payload(current_version)
+                            if self._topology_payload_pool is not None and current_version is not None
+                            else None
+                        )
+                        if current_version is None:
+                            forward_stats["topology_conditioned_wrong_version_skipped_mixed_batches"] = int(
+                                forward_stats.get("topology_conditioned_wrong_version_skipped_mixed_batches", 0)
+                            ) + 1
+                        elif candidate_output is not None:
+                            forward_stats["topology_conditioned_wrong_version_skipped_candidate_id_batches"] = int(
+                                forward_stats.get(
+                                    "topology_conditioned_wrong_version_skipped_candidate_id_batches",
+                                    0,
+                                )
+                            ) + 1
+                        elif wrong_payload is not None:
+                            wrong_contract = replace_structural_payload(contract, wrong_payload)
+                            wrong_logits = self._forward_model_logits(wrong_contract)
+                            if not self._is_finite_tensor(wrong_logits):
+                                logits_sanitized_batches += 1
+                                wrong_logits = torch.nan_to_num(wrong_logits, nan=0.0, posinf=1e6, neginf=-1e6)
+                            wrong_effective_logits = self._apply_mask_guided_logits(
+                                logits=wrong_logits,
+                                allowed_mask=allowed_mask,
+                                policy=mask_policy,
+                            )
+                            wrong_ce = self.criterion(wrong_effective_logits, targets)
+                            wrong_loss = margin_negative_loss(
+                                correct_ce=base_ce_loss,
+                                negative_ce=wrong_ce,
+                                margin=float(self.learning_strategy_config.wrong_version_margin),
+                            )
+                            loss = loss + (
+                                float(self.learning_strategy_config.wrong_version_negative_weight) * wrong_loss
+                            )
+                            self._accumulate_topology_conditioned_stats(
+                                forward_stats,
+                                key_prefix="wrong_version",
+                                correct_ce=base_ce_loss.detach(),
+                                negative_ce=wrong_ce.detach(),
+                                objective_loss=wrong_loss.detach(),
+                                margin=float(self.learning_strategy_config.wrong_version_margin),
+                            )
+                if self._struct_xattn_contrastive_active(training=training, epoch_index=epoch_index):
+                    corrupted_contract = self._build_corrupted_structural_contract(
+                        contract,
+                        epoch_index=epoch_index,
+                        batch_idx=batch_idx,
+                    )
+                    corrupt_logits = self._forward_model_logits(corrupted_contract)
+                    if not self._is_finite_tensor(corrupt_logits):
+                        logits_sanitized_batches += 1
+                        logger.warning(
+                            "Numeric guard [epoch:%s]: non-finite corrupted StructXAttn logits detected. "
+                            "Applying nan_to_num.",
+                            "train" if training else "validation",
+                        )
+                        corrupt_logits = torch.nan_to_num(corrupt_logits, nan=0.0, posinf=1e6, neginf=-1e6)
+                    corrupt_effective_logits = self._apply_mask_guided_logits(
+                        logits=corrupt_logits,
+                        allowed_mask=allowed_mask,
+                        policy=mask_policy,
+                    )
+                    corrupt_ce = self.criterion(corrupt_effective_logits, targets)
+                    raw_gap = float(self.struct_xattn_contrastive_margin) + base_ce_loss - corrupt_ce
+                    tau = float(self.struct_xattn_contrastive_temperature)
+                    contrastive_loss = tau * F.softplus(raw_gap / tau)
+                    if float(self.struct_xattn_contrastive_max_loss) > 0.0:
+                        contrastive_loss = torch.clamp(
+                            contrastive_loss,
+                            max=float(self.struct_xattn_contrastive_max_loss),
+                        )
+                    loss = loss + (float(self.struct_xattn_contrastive_weight) * contrastive_loss)
+                    self._accumulate_struct_xattn_contrastive_stats(
+                        forward_stats,
+                        correct_ce=base_ce_loss.detach(),
+                        corrupt_ce=corrupt_ce.detach(),
+                        contrastive_loss=contrastive_loss.detach(),
+                        correct_logits=effective_logits,
+                        corrupt_logits=corrupt_effective_logits,
+                        margin=float(self.struct_xattn_contrastive_margin),
+                    )
+                skip_optimizer_step = False
+                if not self._is_finite_tensor(loss):
+                    non_finite_loss_batches += 1
+                    skip_optimizer_step = True
+                    logger.warning(
+                        "Numeric guard [epoch:%s]: non-finite loss detected. Skipping optimizer step for this batch.",
+                        "train" if training else "validation",
+                    )
+                    if training and optimizer is not None:
+                        optimizer.zero_grad(set_to_none=True)
+                    loss = torch.zeros_like(loss)
+                if training and optimizer is not None:
+                    if not skip_optimizer_step:
+                        loss.backward()
+                        gradients_finite = all(
+                            param.grad is None or self._is_finite_tensor(param.grad)
+                            for param in self.model.parameters()
+                        )
+                        if not gradients_finite:
+                            non_finite_gradient_batches += 1
+                            logger.warning(
+                                "Numeric guard [epoch:train]: non-finite gradients detected. "
+                                "Skipping optimizer step for this batch."
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            skip_optimizer_step = True
+                    if not skip_optimizer_step:
+                        grad_norms = self._parameter_grad_norm_groups(self.model)
+                        for group_name, group_norm in grad_norms.items():
+                            forward_stats[f"grad_norm_{group_name}_sum"] = float(
+                                forward_stats.get(f"grad_norm_{group_name}_sum", 0.0)
+                            ) + float(group_norm)
+                        forward_stats["grad_norm_batches"] = int(forward_stats.get("grad_norm_batches", 0)) + 1
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer_steps += 1
+                        parameters_finite = all(
+                            self._is_finite_tensor(param.detach())
+                            for param in self.model.parameters()
+                            if not isinstance(param, UninitializedParameter)
+                        )
+                        if not parameters_finite:
+                            non_finite_parameter_batches += 1
+                            raise RuntimeError("Numeric guard [epoch:train]: optimizer step produced non-finite parameters.")
+
+            total_loss += float(loss.detach().cpu().item())
+            batches += 1
+            if candidate_output is not None:
+                if self.candidate_identity_mode == "topology_native" and len(candidate_output.candidate_labels) > 0:
+                    true_keys, pred_keys, has_target = self._candidate_metric_label_keys(
+                        candidate_logits=candidate_output.candidate_logits,
+                        target_candidate_mask=target_candidate_mask,
+                        candidate_output=candidate_output,
+                        contract=contract,
+                        targets=targets,
+                    )
+                    all_true.extend(true_keys)
+                    all_pred.extend(pred_keys)
+                else:
+                    fallback_true = []
+                    fallback_pred = []
+                    pred_for_metrics = candidate_predictions_to_global(
+                        candidate_output.candidate_logits.detach(),
+                        candidate_output.candidate_class_index,
+                    )
+                    for val in targets.detach().cpu().numpy().tolist():
+                        lbl = self._reverse_activity_vocab.get(int(val)) if hasattr(self, "_reverse_activity_vocab") and self._reverse_activity_vocab else None
+                        fallback_true.append(lbl if lbl else f"class:{int(val)}")
+                    for val in pred_for_metrics.cpu().numpy().tolist():
+                        lbl = self._reverse_activity_vocab.get(int(val)) if hasattr(self, "_reverse_activity_vocab") and self._reverse_activity_vocab else None
+                        fallback_pred.append(lbl if lbl else f"class:{int(val)}")
+                    all_true.extend(fallback_true)
+                    all_pred.extend(fallback_pred)
+            else:
+                pred_for_metrics = torch.argmax(effective_logits.detach(), dim=1)
+                true_keys, pred_keys = self._fixed_head_metric_label_keys(
+                    predictions=pred_for_metrics,
+                    contract=contract,
+                    targets=targets,
+                )
+                all_true.extend(true_keys)
+                all_pred.extend(pred_keys)
+            batch_reporter.update(
+                message=f"{phase_name.title()} epoch {epoch_index}/{total_epochs}",
+                current=int(batch_idx),
+                total=total_batches if total_batches > 0 else None,
+                payload={"epoch": int(epoch_index), "total_epochs": int(total_epochs)},
+                force=(batch_idx == 1 or (total_batches > 0 and batch_idx == total_batches)),
+            )
+            if epoch_progress_callback is not None and total_batches > 0:
+                epoch_progress_callback(int(batch_idx), int(total_batches), phase_name)
+
+        duration = perf_counter() - started
+        self._last_epoch_update_summary = {
+            "optimizer_steps": int(optimizer_steps),
+            "non_finite_loss_batches": int(non_finite_loss_batches),
+            "non_finite_gradient_batches": int(non_finite_gradient_batches),
+            "non_finite_parameter_batches": int(non_finite_parameter_batches),
+        }
+        if batches == 0:
+            batch_reporter.done(
+                message=f"{phase_name.title()} epoch {epoch_index}/{total_epochs} completed (empty)",
+                current=0,
+                total=total_batches if total_batches > 0 else None,
+                payload={"epoch": int(epoch_index), "total_epochs": int(total_epochs)},
+            )
+            return 0.0, 0.0, 0.0, duration
+
+        macro_f1 = float(f1_score(all_true, all_pred, average="macro", zero_division=0))
+        weighted_f1 = float(f1_score(all_true, all_pred, average="weighted", zero_division=0))
+        avg_loss = total_loss / batches
+        if contract_sanitized_batches > 0 or logits_sanitized_batches > 0 or non_finite_loss_batches > 0:
+            logger.info(
+                "Numeric guard [epoch:%s]: contract_sanitized_batches=%d logits_sanitized_batches=%d non_finite_loss_batches=%d",
+                "train" if training else "validation",
+                contract_sanitized_batches,
+                logits_sanitized_batches,
+                non_finite_loss_batches,
+            )
+        self._log_forward_stats_summary("train" if training else "validation", forward_stats)
+        batch_reporter.done(
+            message=f"{phase_name.title()} epoch {epoch_index}/{total_epochs} completed",
+            current=batches,
+            total=total_batches if total_batches > 0 else None,
+            payload={
+                "epoch": int(epoch_index),
+                "total_epochs": int(total_epochs),
+                "loss": float(avg_loss),
+                "macro_f1": float(macro_f1),
+            },
+        )
+        return avg_loss, macro_f1, weighted_f1, duration
+
+    def _evaluate_test(self, loader: Iterable[Data], stage_label: str = "inference") -> Dict[str, Any]:
+        """Compute final test metrics after training is complete."""
+        self.model.eval()
+        self._logged_mask_debug = False
+        self._logged_oos_math = False
+        all_true: List[Any] = []
+        all_pred: List[Any] = []
+        all_fixed_true: List[int] = []
+        all_fixed_pred: List[int] = []
+        all_confidence: List[float] = []
+        all_correct: List[float] = []
+        all_stable_set_nll: List[float] = []
+        all_fixed_confidence: List[float] = []
+        all_fixed_correct: List[float] = []
+        all_fixed_set_nll: List[float] = []
+        all_audit_observations: List[AuditObservation] = []
+        all_probs: List[np.ndarray] = []
+        all_oos_flags_aligned: List[float] = []
+        all_target_in_mask_flags: List[float] = []
+        all_pred_in_mask_flags: List[float] = []
+        all_strict_error_but_allowed_flags: List[float] = []
+        all_mask_cardinality: List[float] = []
+        all_candidate_oos_flags: List[float] = []
+        all_candidate_invalid_probability_mass: List[float] = []
+        all_candidate_valid_probability_mass: List[float] = []
+        all_candidate_valid_invalid_logit_margin: List[float] = []
+        all_hybrid_correct_flags: List[float] = []
+        all_hybrid_set_nll: List[float] = []
+        all_ambiguous_flags: List[float] = []
+        all_lengths: List[int] = []
+        all_versions: List[str] = []
+        all_candidate_target_in_set_rates: List[float] = []
+        all_candidate_missing_target_rates: List[float] = []
+        inference_graphs = 0
+        inference_started = perf_counter()
+        first_batch_debug_logged = False
+        forward_stats = self._new_forward_stats_accumulator()
+        contract_sanitized_batches = 0
+        logits_sanitized_batches = 0
+        probs_sanitized_batches = 0
+        test_batches_reporter = ProgressReporter(stage="test.batches", min_interval_sec=0.8)
+        try:
+            total_batches = int(len(loader))  # type: ignore[arg-type]
+        except Exception:
+            total_batches = 0
+        test_batches_reporter.start(
+            message=f"Test evaluation ({stage_label})",
+            current=0,
+            total=total_batches if total_batches > 0 else None,
+        )
+
+        with torch.no_grad():
+            iterator = tqdm(loader, desc="Test evaluation", leave=self.tqdm_leave, disable=self._is_tqdm_disabled())
+            for batch_idx, data in enumerate(iterator, start=1):
+                data = data.to(self.device)
+                contract = self._data_to_contract(data)
+                if self._sanitize_contract_numeric_tensors(contract):
+                    contract_sanitized_batches += 1
+                self._accumulate_forward_stats(forward_stats, contract)
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                candidate_output: CandidatePredictionOutput | None = None
+                target_candidate_mask: torch.Tensor | None = None
+                if self.candidate_contract_mode == "candidate_id":
+                    candidate_output = self._forward_candidate_output(contract)
+                    logits = candidate_output.candidate_logits
+                else:
+                    logits = self._forward_model_logits(contract)
+                self._accumulate_logit_contribution_stats(forward_stats)
+                self._accumulate_topology_state_stats(forward_stats)
+                self._accumulate_topology_graph_stats(forward_stats)
+                self._accumulate_structural_prior_stats(forward_stats)
+                self._accumulate_struct_xattn_stats(forward_stats)
+                self._accumulate_topology_conditioned_candidate_stats(forward_stats)
+                if not self._is_finite_tensor(logits):
+                    logits_sanitized_batches += 1
+                    logger.warning(
+                        "Numeric guard [%s]: non-finite logits detected. Applying nan_to_num.",
+                        stage_label,
+                    )
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                target_tensor = data.y.view(-1).long()
+                target_labels = self._target_labels_from_contract(contract, target_tensor)
+                if candidate_output is not None:
+                    if (
+                        self.candidate_identity_mode == "topology_native"
+                        and target_labels
+                        and len(candidate_output.candidate_labels) > 0
+                    ):
+                        target_candidate_mask = candidate_target_mask_from_labels(
+                            target_labels=target_labels,
+                            candidate_labels=candidate_output.candidate_labels,
+                            candidate_ids=candidate_output.candidate_ids,
+                            device=logits.device,
+                        )
+                    else:
+                        target_candidate_mask = candidate_output.map_targets_to_candidate_mask(target_tensor)
+                    summary = candidate_target_summary(logits, target_candidate_mask)
+                    all_candidate_target_in_set_rates.append(float(summary["target_in_candidate_set_rate"]))
+                    all_candidate_missing_target_rates.append(float(summary["missing_target_rate"]))
+                allowed_mask = self._normalize_allowed_mask(
+                    contract.get("allowed_target_mask"),
+                    expected_rows=int(target_tensor.shape[0]),
+                )
+                mask_policy = self._resolve_mask_guided_policy(
+                    training=False,
+                    batch_target_in_mask_rate=None,
+                    batch_samples=int(target_tensor.shape[0]),
+                )
+                if candidate_output is not None and isinstance(allowed_mask, torch.Tensor):
+                    candidate_allowed_mask = self._candidate_allowed_mask(
+                        candidate_output=candidate_output,
+                        allowed_mask=allowed_mask,
+                    )
+                    if candidate_allowed_mask is not None:
+                        flow_summary = candidate_allowed_flow_summary(logits.detach(), candidate_allowed_mask)
+                        self._accumulate_candidate_flow_stats(forward_stats, flow_summary)
+                        flow_arrays = self._candidate_flow_arrays(logits.detach(), candidate_allowed_mask)
+                        all_candidate_oos_flags.extend(flow_arrays["candidate_oos_flags"].tolist())
+                        all_candidate_invalid_probability_mass.extend(
+                            flow_arrays["candidate_invalid_probability_mass"].tolist()
+                        )
+                        all_candidate_valid_probability_mass.extend(
+                            flow_arrays["candidate_valid_probability_mass"].tolist()
+                        )
+                        all_candidate_valid_invalid_logit_margin.extend(
+                            flow_arrays["candidate_valid_invalid_logit_margin"].tolist()
+                        )
+                raw_logits = logits
+                if candidate_output is not None:
+                    candidate_probs = torch.softmax(raw_logits, dim=1)
+                    probs = self._candidate_probs_to_fixed_probs(candidate_output, candidate_probs)
+                    effective_logits = torch.log(probs.clamp_min(1e-12))
+                else:
+                    effective_logits = self._apply_mask_guided_logits(
+                        logits=raw_logits,
+                        allowed_mask=allowed_mask,
+                        policy=mask_policy,
+                    )
+                    probs = torch.softmax(effective_logits, dim=1)
+                if not self._is_finite_tensor(probs):
+                    probs_sanitized_batches += 1
+                    probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+                    if probs.dim() == 2 and probs.size(1) > 0:
+                        row_sum = probs.sum(dim=1, keepdim=True)
+                        safe_uniform = torch.full_like(probs, 1.0 / float(probs.size(1)))
+                        probs = torch.where(row_sum > 0.0, probs / row_sum.clamp_min(1e-12), safe_uniform)
+                if candidate_output is not None:
+                    pred_tensor = candidate_predictions_to_global(
+                        candidate_output.candidate_logits,
+                        candidate_output.candidate_class_index,
+                    ).long()
+                else:
+                    pred_tensor = torch.argmax(probs, dim=1).long()
+                preds = pred_tensor.cpu().numpy()
+                batch_size = int(pred_tensor.shape[0])
+                batch_oos_aligned = np.full(batch_size, np.nan, dtype=np.float32)
+                batch_target_in_mask = np.full(batch_size, np.nan, dtype=np.float32)
+                batch_pred_in_mask = np.full(batch_size, np.nan, dtype=np.float32)
+                batch_strict_error_but_allowed = np.full(batch_size, np.nan, dtype=np.float32)
+                batch_mask_cardinality = np.full(batch_size, np.nan, dtype=np.float32)
+
+                if candidate_output is not None:
+                    if self.candidate_identity_mode == "topology_native" and len(candidate_output.candidate_labels) > 0:
+                        true_keys, pred_keys, has_target = self._candidate_metric_label_keys(
+                            candidate_logits=logits,
+                            target_candidate_mask=target_candidate_mask,
+                            candidate_output=candidate_output,
+                            contract=contract,
+                            targets=target_tensor,
+                        )
+                        all_true.extend(true_keys)
+                        all_pred.extend(pred_keys)
+                        batch_correct = torch.tensor([
+                            1.0 if tk == pk else 0.0
+                            for tk, pk in zip(true_keys, pred_keys)
+                        ], dtype=torch.float32, device=pred_tensor.device)
+                    else:
+                        fallback_true = []
+                        fallback_pred = []
+                        for val in target_tensor.tolist():
+                            lbl = self._reverse_activity_vocab.get(int(val)) if hasattr(self, "_reverse_activity_vocab") and self._reverse_activity_vocab else None
+                            fallback_true.append(lbl if lbl else f"class:{int(val)}")
+                        for val in preds.tolist():
+                            lbl = self._reverse_activity_vocab.get(int(val)) if hasattr(self, "_reverse_activity_vocab") and self._reverse_activity_vocab else None
+                            fallback_pred.append(lbl if lbl else f"class:{int(val)}")
+                        all_true.extend(fallback_true)
+                        all_pred.extend(fallback_pred)
+                        batch_correct = (pred_tensor == target_tensor.to(pred_tensor.device)).float()
+
+                    pred_fixed = candidate_predictions_to_global(
+                        candidate_output.candidate_logits,
+                        candidate_output.candidate_class_index,
+                    ).long().cpu().numpy().tolist()
+                    all_fixed_true.extend(target_tensor.tolist())
+                    all_fixed_pred.extend(pred_fixed)
+                else:
+                    true_keys, pred_keys = self._fixed_head_metric_label_keys(
+                        predictions=pred_tensor,
+                        contract=contract,
+                        targets=target_tensor,
+                    )
+                    all_true.extend(true_keys)
+                    all_pred.extend(pred_keys)
+                    batch_correct = torch.tensor([
+                        1.0 if tk == pk else 0.0
+                        for tk, pk in zip(true_keys, pred_keys)
+                    ], dtype=torch.float32, device=pred_tensor.device)
+                    all_fixed_true.extend(target_tensor.tolist())
+                    all_fixed_pred.extend(preds.tolist())
+
+                fixed_confidence_tensor = torch.max(probs, dim=1).values
+                fixed_correct_tensor = (pred_tensor == target_tensor.to(pred_tensor.device)).float()
+                fixed_set_nll_tensor = -torch.log(
+                    self._fixed_numeric_target_probabilities(
+                        probs=probs,
+                        targets=target_tensor,
+                    )
+                )
+                if candidate_output is not None:
+                    primary_confidence_tensor = torch.max(candidate_probs, dim=1).values
+                    primary_set_nll_tensor = -torch.log(
+                        self._candidate_target_probabilities(
+                            candidate_probs=candidate_probs,
+                            target_candidate_mask=target_candidate_mask,
+                        )
+                    )
+                else:
+                    primary_confidence_tensor = fixed_confidence_tensor
+                    primary_set_nll_tensor = -torch.log(
+                        self._fixed_head_label_target_probabilities(
+                            probs=probs,
+                            contract=contract,
+                            targets=target_tensor,
+                        )
+                    )
+
+                batch_hybrid_correct = batch_correct
+                batch_ambiguous = torch.zeros(batch_size, dtype=torch.float32, device=pred_tensor.device)
+                batch_hybrid_set_nll = primary_set_nll_tensor
+                if self.mode == "eval_drift" and not first_batch_debug_logged:
+                    logger.info("Drift debug first batch y_true[:5]=%s y_pred[:5]=%s", target_tensor[:5].tolist(), preds[:5].tolist())
+                    first_batch_debug_logged = True
+
+                if isinstance(allowed_mask, torch.Tensor):
+                    if allowed_mask.dim() == 1:
+                        allowed_mask = allowed_mask.unsqueeze(0)
+                    if not self._logged_mask_debug:
+                        all_true_mask = bool(allowed_mask.all().item())
+                        logger.info(
+                            "DEBUG MASK: shape=%s, All True? %s",
+                            tuple(allowed_mask.shape),
+                            all_true_mask,
+                        )
+                        self._logged_mask_debug = True
+                    if not self._logged_oos_math:
+                        logger.info("--- OOS MATH DEBUG ---")
+                        logger.info(
+                            "y_hat shape: %s, min=%s, max=%s",
+                            tuple(pred_tensor.shape),
+                            int(pred_tensor.min().item()) if pred_tensor.numel() > 0 else None,
+                            int(pred_tensor.max().item()) if pred_tensor.numel() > 0 else None,
+                        )
+                        logger.info(
+                            "mask shape: %s, dtype=%s",
+                            tuple(allowed_mask.shape),
+                            allowed_mask.dtype,
+                        )
+                        try:
+                            batch_size = pred_tensor.size(0)
+                            row_ids = torch.arange(batch_size, device=pred_tensor.device)
+                            extracted_flags = allowed_mask[row_ids, pred_tensor]
+                            logger.info(
+                                "extracted_flags (allowed_target_mask[B, y_hat]): shape=%s, trues=%d/%d",
+                                tuple(extracted_flags.shape),
+                                int(extracted_flags.sum().item()),
+                                batch_size,
+                            )
+                            oos_math_flags = (~extracted_flags).float()
+                            logger.info(
+                                "oos_flags (~extracted_flags): trues=%.0f/%d",
+                                float(oos_math_flags.sum().item()),
+                                batch_size,
+                            )
+                        except Exception as exc:
+                            logger.error("Error during OOS indexing: %s", exc)
+                        self._logged_oos_math = True
+                    row_ids = torch.arange(batch_size, device=pred_tensor.device)
+                    pred_in_mask = allowed_mask[row_ids, pred_tensor].bool()
+                    target_in_mask = allowed_mask[row_ids, target_tensor.to(pred_tensor.device)].bool()
+                    strict_error_but_allowed = (pred_tensor != target_tensor.to(pred_tensor.device)) & pred_in_mask
+                    mask_cardinality = allowed_mask.sum(dim=1).float()
+                    oos_flags = (~pred_in_mask).float()
+                    ambiguous_mask = mask_cardinality > 1.0
+                    row_ids = torch.arange(batch_size, device=pred_tensor.device)
+                    batch_hybrid_correct = torch.where(
+                        ambiguous_mask,
+                        pred_in_mask.float(),
+                        batch_correct,
+                    )
+                    batch_ambiguous = ambiguous_mask.float()
+
+                    batch_oos_aligned = oos_flags.detach().cpu().numpy().astype(np.float32, copy=False)
+                    batch_target_in_mask = target_in_mask.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                    batch_pred_in_mask = pred_in_mask.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                    batch_strict_error_but_allowed = (
+                        strict_error_but_allowed.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                    )
+                    batch_mask_cardinality = mask_cardinality.detach().cpu().numpy().astype(np.float32, copy=False)
+
+                self._maybe_record_prediction_traces(
+                    stage_label=stage_label,
+                    contract=contract,
+                    logits=raw_logits,
+                    effective_logits=effective_logits,
+                    probs=probs,
+                    targets=target_tensor,
+                    predictions=pred_tensor,
+                    allowed_mask=allowed_mask,
+                    global_offset=inference_graphs,
+                )
+
+                all_oos_flags_aligned.extend(batch_oos_aligned.tolist())
+                all_target_in_mask_flags.extend(batch_target_in_mask.tolist())
+                all_pred_in_mask_flags.extend(batch_pred_in_mask.tolist())
+                all_strict_error_but_allowed_flags.extend(batch_strict_error_but_allowed.tolist())
+                all_mask_cardinality.extend(batch_mask_cardinality.tolist())
+                all_hybrid_correct_flags.extend(
+                    batch_hybrid_correct.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_hybrid_set_nll.extend(
+                    batch_hybrid_set_nll.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_confidence.extend(
+                    primary_confidence_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_correct.extend(batch_correct.detach().cpu().numpy().astype(np.float32, copy=False).tolist())
+                all_stable_set_nll.extend(
+                    primary_set_nll_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_fixed_confidence.extend(
+                    fixed_confidence_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_fixed_correct.extend(
+                    fixed_correct_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_fixed_set_nll.extend(
+                    fixed_set_nll_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                )
+                all_ambiguous_flags.extend(batch_ambiguous.detach().cpu().numpy().astype(np.float32, copy=False).tolist())
+
+                if hasattr(data, "prefix_len"):
+                    all_lengths.extend(data.prefix_len.view(-1).long().cpu().tolist())
+                else:
+                    graph_lengths = torch.bincount(data.batch.view(-1).long(), minlength=pred_tensor.shape[0])
+                    all_lengths.extend(graph_lengths.long().cpu().tolist())
+
+                if hasattr(data, "process_version_idx"):
+                    version_indices = data.process_version_idx.view(-1).long().cpu().tolist()
+                    for idx in version_indices:
+                        all_versions.append(self._idx_to_version.get(int(idx), f"v{int(idx)}"))
+
+                all_probs.extend(probs.cpu().numpy())
+                inference_graphs += int(target_tensor.shape[0])
+                test_batches_reporter.update(
+                    message=f"Test evaluation ({stage_label})",
+                    current=int(batch_idx),
+                    total=total_batches if total_batches > 0 else None,
+                    force=(batch_idx == 1 or (total_batches > 0 and batch_idx == total_batches)),
+                )
+
+        total_inference_ms = float((perf_counter() - inference_started) * 1000.0)
+        inference_ms_per_graph = float(total_inference_ms / inference_graphs) if inference_graphs > 0 else 0.0
+        if contract_sanitized_batches > 0 or logits_sanitized_batches > 0 or probs_sanitized_batches > 0:
+            logger.info(
+                "Numeric guard [%s]: contract_sanitized_batches=%d logits_sanitized_batches=%d probs_sanitized_batches=%d",
+                stage_label,
+                contract_sanitized_batches,
+                logits_sanitized_batches,
+                probs_sanitized_batches,
+            )
+        self._log_forward_stats_summary(stage_label, forward_stats)
+        self._log_trace_overhead_metrics()
+        test_batches_reporter.done(
+            message=f"Test evaluation ({stage_label}) completed",
+            current=total_batches if total_batches > 0 else None,
+            total=total_batches if total_batches > 0 else None,
+        )
+
+        if not all_true:
+            return {
+                "test_accuracy": 0.0,
+                "test_macro_f1": 0.0,
+                "test_weighted_f1": 0.0,
+                "test_set_nll": 0.0,
+                "test_top3_accuracy": 0.0,
+                "test_ece": 0.0,
+                "strict_test_accuracy": 0.0,
+                "strict_test_macro_f1": 0.0,
+                "strict_test_weighted_f1": 0.0,
+                "test_oos": None,
+                "test_oos_confidence_mean": None,
+                "test_target_in_mask_rate": None,
+                "test_pred_in_mask_rate": None,
+                "test_strict_error_but_allowed_rate": None,
+                "candidate_oos_rate": None,
+                "candidate_invalid_probability_mass": None,
+                "candidate_valid_probability_mass": None,
+                "candidate_valid_invalid_logit_margin": None,
+                "test_ambiguous_prefix_rate": None,
+                "test_set_hit_rate_ambiguous": None,
+                "test_accuracy_deterministic": None,
+                "test_mask_coverage": 0.0,
+                "test_precision_macro": 0.0,
+                "test_recall_macro": 0.0,
+                "test_inference_time_ms_per_graph": inference_ms_per_graph,
+                "candidate_target_in_candidate_set_rate": None,
+                "candidate_missing_target_rate": None,
+                "fixed_label_strict_test_accuracy": 0.0,
+                "fixed_label_strict_test_macro_f1": 0.0,
+                "fixed_label_strict_test_weighted_f1": 0.0,
+                "fixed_label_test_accuracy": 0.0,
+                "fixed_label_test_macro_f1": 0.0,
+                "fixed_label_test_weighted_f1": 0.0,
+                "fixed_label_test_ece": 0.0,
+                "fixed_label_test_set_nll": 0.0,
+            }
+
+        y_true = np.asarray(all_true, dtype=object)
+        y_pred = np.asarray(all_pred, dtype=object)
+        y_prob = np.asarray(all_probs)
+        y_prob = np.nan_to_num(y_prob, nan=0.0, posinf=1.0, neginf=0.0)
+        if y_prob.ndim == 2 and y_prob.shape[1] > 0:
+            row_sums = np.sum(y_prob, axis=1, keepdims=True)
+            zero_rows = row_sums <= 1e-12
+            if np.any(zero_rows):
+                y_prob[zero_rows[:, 0], :] = 1.0 / float(y_prob.shape[1])
+                row_sums = np.sum(y_prob, axis=1, keepdims=True)
+            y_prob = y_prob / np.clip(row_sums, 1e-12, None)
+        num_classes = y_prob.shape[1]
+
+        fixed_y_true = np.asarray(all_fixed_true, dtype=np.int64)
+        fixed_y_pred = np.asarray(all_fixed_pred, dtype=np.int64)
+
+        top_k = self._effective_top_k(num_classes, requested_k=3)
+        if num_classes <= 2:
+            top3_accuracy = float(accuracy_score(fixed_y_true, fixed_y_pred))
+        else:
+            top3_accuracy = float(top_k_accuracy_score(fixed_y_true, y_prob, k=top_k, labels=list(range(num_classes))))
+        strict_accuracy = float(accuracy_score(y_true, y_pred))
+        strict_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        strict_weighted_f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+        strict_precision_macro = float(precision_score(y_true, y_pred, average="macro", zero_division=0))
+        strict_recall_macro = float(recall_score(y_true, y_pred, average="macro", zero_division=0))
+        hybrid_correct_flags = np.asarray(all_hybrid_correct_flags, dtype=np.float32) if all_hybrid_correct_flags else None
+        hybrid_set_nll = np.asarray(all_hybrid_set_nll, dtype=np.float32) if all_hybrid_set_nll else None
+        confidence = np.asarray(all_confidence, dtype=np.float32) if all_confidence else np.asarray([], dtype=np.float32)
+        correct = np.asarray(all_correct, dtype=np.float32) if all_correct else np.asarray([], dtype=np.float32)
+        stable_set_nll = (
+            np.asarray(all_stable_set_nll, dtype=np.float32) if all_stable_set_nll else hybrid_set_nll
+        )
+        fixed_confidence = (
+            np.asarray(all_fixed_confidence, dtype=np.float32) if all_fixed_confidence else np.asarray([], dtype=np.float32)
+        )
+        fixed_correct = (
+            np.asarray(all_fixed_correct, dtype=np.float32) if all_fixed_correct else np.asarray([], dtype=np.float32)
+        )
+        fixed_set_nll = np.asarray(all_fixed_set_nll, dtype=np.float32) if all_fixed_set_nll else hybrid_set_nll
+        ambiguous_flags = np.asarray(all_ambiguous_flags, dtype=np.float32) if all_ambiguous_flags else None
+        pred_in_mask_flags_raw = np.asarray(all_pred_in_mask_flags, dtype=np.float32) if all_pred_in_mask_flags else None
+
+        y_true_hybrid = np.asarray(y_true, dtype=object).copy()
+        if (
+            isinstance(ambiguous_flags, np.ndarray)
+            and isinstance(pred_in_mask_flags_raw, np.ndarray)
+            and int(ambiguous_flags.shape[0]) == int(y_true_hybrid.shape[0])
+            and int(pred_in_mask_flags_raw.shape[0]) == int(y_true_hybrid.shape[0])
+        ):
+            override_idxs = np.where((ambiguous_flags > 0.5) & (pred_in_mask_flags_raw > 0.5))[0]
+            if override_idxs.size > 0:
+                y_true_hybrid[override_idxs] = y_pred[override_idxs]
+
+        fixed_y_true_hybrid = fixed_y_true.copy()
+        if (
+            isinstance(ambiguous_flags, np.ndarray)
+            and isinstance(pred_in_mask_flags_raw, np.ndarray)
+            and int(ambiguous_flags.shape[0]) == int(fixed_y_true_hybrid.shape[0])
+            and int(pred_in_mask_flags_raw.shape[0]) == int(fixed_y_true_hybrid.shape[0])
+        ):
+            override_idxs = np.where((ambiguous_flags > 0.5) & (pred_in_mask_flags_raw > 0.5))[0]
+            if override_idxs.size > 0:
+                fixed_y_true_hybrid[override_idxs] = fixed_y_pred[override_idxs]
+
+        hybrid_accuracy = self._nanmean_or_none(hybrid_correct_flags)
+        if hybrid_accuracy is None:
+            hybrid_accuracy = strict_accuracy
+
+        metrics = {
+            "test_accuracy": float(hybrid_accuracy),
+            "test_macro_f1": float(f1_score(y_true_hybrid, y_pred, average="macro", zero_division=0)),
+            "test_weighted_f1": float(f1_score(y_true_hybrid, y_pred, average="weighted", zero_division=0)),
+            "test_set_nll": float(self._nanmean_or_none(stable_set_nll) or 0.0),
+            "test_top3_accuracy": top3_accuracy,
+            "test_ece": float(self._expected_calibration_error_from_confidence(confidence, correct)),
+            "test_oos": None,
+            "test_precision_macro": float(precision_score(y_true_hybrid, y_pred, average="macro", zero_division=0)),
+            "test_recall_macro": float(recall_score(y_true_hybrid, y_pred, average="macro", zero_division=0)),
+            "strict_test_accuracy": strict_accuracy,
+            "strict_test_macro_f1": strict_macro_f1,
+            "strict_test_weighted_f1": strict_weighted_f1,
+            "strict_test_precision_macro": strict_precision_macro,
+            "strict_test_recall_macro": strict_recall_macro,
+            "test_inference_time_ms_per_graph": inference_ms_per_graph,
+            "candidate_target_in_candidate_set_rate": (
+                float(np.mean(all_candidate_target_in_set_rates)) if all_candidate_target_in_set_rates else None
+            ),
+            "candidate_missing_target_rate": (
+                float(np.mean(all_candidate_missing_target_rates)) if all_candidate_missing_target_rates else None
+            ),
+            "candidate_oos_rate": (
+                float(np.mean(all_candidate_oos_flags)) if all_candidate_oos_flags else None
+            ),
+            "candidate_invalid_probability_mass": (
+                float(np.mean(all_candidate_invalid_probability_mass))
+                if all_candidate_invalid_probability_mass
+                else None
+            ),
+            "candidate_valid_probability_mass": (
+                float(np.mean(all_candidate_valid_probability_mass))
+                if all_candidate_valid_probability_mass
+                else None
+            ),
+            "candidate_valid_invalid_logit_margin": (
+                float(np.mean(all_candidate_valid_invalid_logit_margin))
+                if all_candidate_valid_invalid_logit_margin
+                else None
+            ),
+            "fixed_label_strict_test_accuracy": float(accuracy_score(fixed_y_true, fixed_y_pred)),
+            "fixed_label_strict_test_macro_f1": float(f1_score(fixed_y_true, fixed_y_pred, average="macro", zero_division=0)),
+            "fixed_label_strict_test_weighted_f1": float(f1_score(fixed_y_true, fixed_y_pred, average="weighted", zero_division=0)),
+            "fixed_label_test_accuracy": float(accuracy_score(fixed_y_true_hybrid, fixed_y_pred)),
+            "fixed_label_test_macro_f1": float(f1_score(fixed_y_true_hybrid, fixed_y_pred, average="macro", zero_division=0)),
+            "fixed_label_test_weighted_f1": float(f1_score(fixed_y_true_hybrid, fixed_y_pred, average="weighted", zero_division=0)),
+            "fixed_label_test_ece": float(self._expected_calibration_error_from_confidence(fixed_confidence, fixed_correct)),
+            "fixed_label_test_set_nll": float(self._nanmean_or_none(fixed_set_nll) or 0.0),
+        }
+        oos_flags_aligned = np.asarray(all_oos_flags_aligned, dtype=np.float32) if all_oos_flags_aligned else None
+        target_in_mask_flags = np.asarray(all_target_in_mask_flags, dtype=np.float32) if all_target_in_mask_flags else None
+        pred_in_mask_flags = np.asarray(all_pred_in_mask_flags, dtype=np.float32) if all_pred_in_mask_flags else None
+        strict_error_but_allowed_flags = (
+            np.asarray(all_strict_error_but_allowed_flags, dtype=np.float32) if all_strict_error_but_allowed_flags else None
+        )
+        mask_cardinality = np.asarray(all_mask_cardinality, dtype=np.float32) if all_mask_cardinality else None
+
+        metrics["test_oos"] = self._nanmean_or_none(oos_flags_aligned)
+        metrics["test_target_in_mask_rate"] = self._nanmean_or_none(target_in_mask_flags)
+        metrics["test_pred_in_mask_rate"] = self._nanmean_or_none(pred_in_mask_flags)
+        metrics["test_strict_error_but_allowed_rate"] = self._nanmean_or_none(strict_error_but_allowed_flags)
+
+        ambiguous_prefix_rate: float | None = None
+        test_set_hit_rate_ambiguous: float | None = None
+        test_accuracy_deterministic: float | None = None
+        if isinstance(mask_cardinality, np.ndarray) and int(mask_cardinality.shape[0]) == int(y_true.shape[0]):
+            finite_mask_cardinality = np.isfinite(mask_cardinality)
+            if bool(np.any(finite_mask_cardinality)):
+                ambiguous_prefix_rate = float(np.mean(mask_cardinality[finite_mask_cardinality] > 1.0))
+                metrics["test_mask_coverage"] = float(np.mean(finite_mask_cardinality.astype(np.float32)))
+                if isinstance(pred_in_mask_flags, np.ndarray) and int(pred_in_mask_flags.shape[0]) == int(y_true.shape[0]):
+                    ambiguous_idxs = np.where((mask_cardinality > 1.0) & finite_mask_cardinality)[0]
+                    if ambiguous_idxs.size > 0:
+                        value = self._nanmean_or_none(pred_in_mask_flags[ambiguous_idxs])
+                        if value is not None:
+                            test_set_hit_rate_ambiguous = float(value)
+                    deterministic_idxs = np.where((mask_cardinality == 1.0) & finite_mask_cardinality)[0]
+                    if deterministic_idxs.size > 0 and isinstance(hybrid_correct_flags, np.ndarray):
+                        value = self._nanmean_or_none(hybrid_correct_flags[deterministic_idxs])
+                        if value is not None:
+                            test_accuracy_deterministic = float(value)
+            else:
+                metrics["test_mask_coverage"] = 0.0
+        else:
+            metrics["test_mask_coverage"] = 0.0
+        metrics["test_ambiguous_prefix_rate"] = ambiguous_prefix_rate
+        metrics["test_set_hit_rate_ambiguous"] = test_set_hit_rate_ambiguous
+        metrics["test_accuracy_deterministic"] = test_accuracy_deterministic
+
+        metrics.update(
+            self._compute_sliced_metrics(
+                y_true=y_true_hybrid,
+                y_pred=y_pred,
+                oos_flags=oos_flags_aligned,
+                target_in_mask_flags=target_in_mask_flags,
+                pred_in_mask_flags=pred_in_mask_flags,
+                strict_error_but_allowed_flags=strict_error_but_allowed_flags,
+                mask_cardinality=mask_cardinality,
+                prefix_lengths=np.asarray(all_lengths, dtype=np.int64) if all_lengths else None,
+                versions=all_versions if all_versions else None,
+                metric_prefix="",
+                emit_mask_metrics=True,
+            )
+        )
+        metrics.update(
+            self._compute_sliced_metrics(
+                y_true=y_true,
+                y_pred=y_pred,
+                oos_flags=oos_flags_aligned,
+                target_in_mask_flags=target_in_mask_flags,
+                pred_in_mask_flags=pred_in_mask_flags,
+                strict_error_but_allowed_flags=strict_error_but_allowed_flags,
+                mask_cardinality=mask_cardinality,
+                prefix_lengths=np.asarray(all_lengths, dtype=np.int64) if all_lengths else None,
+                versions=all_versions if all_versions else None,
+                metric_prefix="strict_",
+                emit_mask_metrics=False,
+            )
+        )
+        # Legacy aliases for one-release compatibility.
+        metrics["legacy_test_accuracy"] = float(metrics["strict_test_accuracy"])
+        metrics["legacy_test_macro_f1"] = float(metrics["strict_test_macro_f1"])
+        metrics["legacy_test_weighted_f1"] = float(metrics["strict_test_weighted_f1"])
+        return metrics
+
+    def _collect_drift_inference_records(self, loader: Iterable[Data]) -> DriftInferenceRecords:
+        """Run one non-shuffled drift inference pass and keep compact sample-level records."""
+        self.model.eval()
+        self._logged_mask_debug = False
+        self._logged_oos_math = False
+        all_trace_idx: List[int] = []
+        all_true: List[Any] = []
+        all_pred: List[Any] = []
+        all_fixed_true: List[int] = []
+        all_fixed_pred: List[int] = []
+        all_confidence: List[float] = []
+        all_correct: List[float] = []
+        all_fixed_confidence: List[float] = []
+        all_fixed_correct: List[float] = []
+        all_fixed_set_nll: List[float] = []
+        all_audit_observations: List[AuditObservation] = []
+        all_top3_hit: List[float] = []
+        all_oos_flags: List[float] = []
+        all_target_in_mask_flags: List[float] = []
+        all_pred_in_mask_flags: List[float] = []
+        all_strict_error_but_allowed_flags: List[float] = []
+        all_mask_cardinality: List[float] = []
+        all_candidate_oos_flags: List[float] = []
+        all_candidate_invalid_probability_mass: List[float] = []
+        all_candidate_valid_probability_mass: List[float] = []
+        all_candidate_valid_invalid_logit_margin: List[float] = []
+        all_hybrid_correct_flags: List[float] = []
+        all_hybrid_set_nll: List[float] = []
+        all_ambiguous_flags: List[float] = []
+        all_lengths: List[int] = []
+        all_versions: List[str] = []
+        inference_graphs = 0
+        inference_started = perf_counter()
+        forward_stats = self._new_forward_stats_accumulator()
+        contract_sanitized_batches = 0
+        logits_sanitized_batches = 0
+        probs_sanitized_batches = 0
+        try:
+            total_batches = int(len(loader))  # type: ignore[arg-type]
+        except (TypeError, AttributeError):
+            total_batches = None
+        total_graphs = None
+        loader_dataset = getattr(loader, "dataset", None)
+        try:
+            if loader_dataset is not None:
+                total_graphs = int(len(loader_dataset))  # type: ignore[arg-type]
+        except (TypeError, AttributeError):
+            total_graphs = None
+        progress_total = total_graphs if total_graphs is not None else total_batches
+        progress_reporter = ProgressReporter(
+            stage="eval_drift.one_pass_inference",
+            total=progress_total,
+            min_interval_sec=0.8,
+        )
+        progress_reporter.start(
+            message="Drift one-pass inference started",
+            current=0,
+            total=progress_total,
+            payload={"graphs_total": total_graphs, "batches_total": total_batches},
+        )
+
+        processed_batches = 0
+        try:
+            with torch.no_grad():
+                iterator = tqdm(loader, desc="Drift one-pass inference", leave=self.tqdm_leave, disable=self._is_tqdm_disabled())
+                for data in iterator:
+                    processed_batches += 1
+                    if not hasattr(data, "trace_idx"):
+                        raise ValueError("prebuilt drift dataset is missing required trace_idx metadata")
+                    data = data.to(self.device)
+                    contract = self._data_to_contract(data)
+                    if self._sanitize_contract_numeric_tensors(contract):
+                        contract_sanitized_batches += 1
+                    self._accumulate_forward_stats(forward_stats, contract)
+                    if self.device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    candidate_output: CandidatePredictionOutput | None = None
+                    if self.candidate_contract_mode == "candidate_id":
+                        candidate_output = self._forward_candidate_output(contract)
+                        logits = candidate_output.candidate_logits
+                    else:
+                        logits = self._forward_model_logits(contract)
+                    self._accumulate_logit_contribution_stats(forward_stats)
+                    self._accumulate_topology_state_stats(forward_stats)
+                    self._accumulate_topology_graph_stats(forward_stats)
+                    self._accumulate_structural_prior_stats(forward_stats)
+                    self._accumulate_struct_xattn_stats(forward_stats)
+                    self._accumulate_topology_conditioned_candidate_stats(forward_stats)
+                    if not self._is_finite_tensor(logits):
+                        logits_sanitized_batches += 1
+                        logger.warning(
+                            "Numeric guard [eval_drift_one_pass]: non-finite logits detected. Applying nan_to_num."
+                        )
+                        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+                    if self.device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+
+                    target_tensor = data.y.view(-1).long()
+                    allowed_mask = self._normalize_allowed_mask(
+                        contract.get("allowed_target_mask"),
+                        expected_rows=int(target_tensor.shape[0]),
+                    )
+                    mask_policy = self._resolve_mask_guided_policy(
+                        training=False,
+                        batch_target_in_mask_rate=None,
+                        batch_samples=int(target_tensor.shape[0]),
+                    )
+                    raw_logits = logits
+                    if candidate_output is not None:
+                        candidate_probs = torch.softmax(raw_logits, dim=1)
+                        probs = self._candidate_probs_to_fixed_probs(candidate_output, candidate_probs)
+                        effective_logits = torch.log(probs.clamp_min(1e-12))
+                    else:
+                        effective_logits = self._apply_mask_guided_logits(
+                            logits=raw_logits,
+                            allowed_mask=allowed_mask,
+                            policy=mask_policy,
+                        )
+                        probs = torch.softmax(effective_logits, dim=1)
+                    if not self._is_finite_tensor(probs):
+                        probs_sanitized_batches += 1
+                        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
+                        if probs.dim() == 2 and probs.size(1) > 0:
+                            row_sum = probs.sum(dim=1, keepdim=True)
+                            safe_uniform = torch.full_like(probs, 1.0 / float(probs.size(1)))
+                            probs = torch.where(row_sum > 0.0, probs / row_sum.clamp_min(1e-12), safe_uniform)
+
+                    batch_size = int(target_tensor.shape[0])
+                    target_candidate_mask = None
+                    target_labels = self._target_labels_from_contract(contract, target_tensor)
+                    if candidate_output is not None:
+                        if (
+                            self.candidate_identity_mode == "topology_native"
+                            and target_labels
+                            and len(candidate_output.candidate_labels) > 0
+                        ):
+                            target_candidate_mask = candidate_target_mask_from_labels(
+                                target_labels=target_labels,
+                                candidate_labels=candidate_output.candidate_labels,
+                                candidate_ids=candidate_output.candidate_ids,
+                                device=logits.device,
+                            )
+                        else:
+                            target_candidate_mask = candidate_output.map_targets_to_candidate_mask(target_tensor)
+
+                    if candidate_output is not None:
+                        pred_tensor = candidate_predictions_to_global(
+                            candidate_output.candidate_logits,
+                            candidate_output.candidate_class_index,
+                        ).long()
+                    else:
+                        pred_tensor = torch.argmax(probs, dim=1).long()
+                    fixed_confidence_tensor = torch.max(probs, dim=1).values
+                    fixed_correct_tensor = (pred_tensor == target_tensor.to(pred_tensor.device)).float()
+                    fixed_set_nll_tensor = -torch.log(
+                        self._fixed_numeric_target_probabilities(
+                            probs=probs,
+                            targets=target_tensor,
+                        )
+                    )
+
+                    if candidate_output is not None:
+                        if self.candidate_identity_mode == "topology_native" and len(candidate_output.candidate_labels) > 0:
+                            true_keys, pred_keys, has_target = self._candidate_metric_label_keys(
+                                candidate_logits=logits,
+                                target_candidate_mask=target_candidate_mask,
+                                candidate_output=candidate_output,
+                                contract=contract,
+                                targets=target_tensor,
+                            )
+                            correct_tensor = torch.tensor([
+                                1.0 if tk == pk else 0.0
+                                for tk, pk in zip(true_keys, pred_keys)
+                            ], dtype=torch.float32, device=pred_tensor.device)
+                        else:
+                            fallback_true = []
+                            fallback_pred = []
+                            for val in target_tensor.tolist():
+                                lbl = self._reverse_activity_vocab.get(int(val)) if hasattr(self, "_reverse_activity_vocab") and self._reverse_activity_vocab else None
+                                fallback_true.append(lbl if lbl else f"class:{int(val)}")
+                            for val in pred_tensor.cpu().numpy().tolist():
+                                lbl = self._reverse_activity_vocab.get(int(val)) if hasattr(self, "_reverse_activity_vocab") and self._reverse_activity_vocab else None
+                                fallback_pred.append(lbl if lbl else f"class:{int(val)}")
+                            true_keys = fallback_true
+                            pred_keys = fallback_pred
+                            correct_tensor = (pred_tensor == target_tensor.to(pred_tensor.device)).float()
+
+                        pred_fixed = candidate_predictions_to_global(
+                            candidate_output.candidate_logits,
+                            candidate_output.candidate_class_index,
+                        ).long().cpu().numpy().tolist()
+                        batch_fixed_true = target_tensor.tolist()
+                        batch_fixed_pred = pred_fixed
+                        confidence_tensor = torch.max(candidate_probs, dim=1).values
+                        batch_stable_set_nll = -torch.log(
+                            self._candidate_target_probabilities(
+                                candidate_probs=candidate_probs,
+                                target_candidate_mask=target_candidate_mask,
+                            )
+                        )
+                    else:
+                        true_keys, pred_keys = self._fixed_head_metric_label_keys(
+                            predictions=pred_tensor,
+                            contract=contract,
+                            targets=target_tensor,
+                        )
+                        correct_tensor = torch.tensor([
+                            1.0 if tk == pk else 0.0
+                            for tk, pk in zip(true_keys, pred_keys)
+                        ], dtype=torch.float32, device=pred_tensor.device)
+                        batch_fixed_true = target_tensor.tolist()
+                        batch_fixed_pred = pred_tensor.cpu().numpy().tolist()
+                        confidence_tensor = fixed_confidence_tensor
+                        batch_stable_set_nll = -torch.log(
+                            self._fixed_head_label_target_probabilities(
+                                probs=probs,
+                                contract=contract,
+                                targets=target_tensor,
+                            )
+                        )
+
+                    top_k = self._effective_top_k(int(probs.shape[1]), requested_k=3) if probs.dim() == 2 else 1
+                    topk = torch.topk(probs, k=top_k, dim=1).indices
+                    top3_hit = (topk == target_tensor.to(topk.device).unsqueeze(1)).any(dim=1).float()
+
+                    batch_oos = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_target_in_mask = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_pred_in_mask = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_strict_error_but_allowed = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_mask_cardinality = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_candidate_oos = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_candidate_invalid_probability_mass = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_candidate_valid_probability_mass = np.full(batch_size, np.nan, dtype=np.float32)
+                    batch_candidate_valid_invalid_logit_margin = np.full(batch_size, np.nan, dtype=np.float32)
+                    candidate_allowed_mask = None
+                    batch_hybrid_correct = correct_tensor
+                    batch_hybrid_set_nll = batch_stable_set_nll
+                    batch_ambiguous = torch.zeros(batch_size, dtype=torch.float32, device=pred_tensor.device)
+                    effective_native_mask = None
+
+                    if isinstance(allowed_mask, torch.Tensor):
+                        if allowed_mask.dim() == 1:
+                            allowed_mask = allowed_mask.unsqueeze(0)
+                        if candidate_output is not None:
+                            candidate_allowed_mask = self._candidate_allowed_mask(
+                                candidate_output=candidate_output,
+                                allowed_mask=allowed_mask,
+                            )
+                            if candidate_allowed_mask is not None:
+                                flow_summary = candidate_allowed_flow_summary(raw_logits.detach(), candidate_allowed_mask)
+                                self._accumulate_candidate_flow_stats(forward_stats, flow_summary)
+                                flow_arrays = self._candidate_flow_arrays(raw_logits.detach(), candidate_allowed_mask)
+                                batch_candidate_oos = flow_arrays["candidate_oos_flags"]
+                                batch_candidate_invalid_probability_mass = flow_arrays[
+                                    "candidate_invalid_probability_mass"
+                                ]
+                                batch_candidate_valid_probability_mass = flow_arrays["candidate_valid_probability_mass"]
+                                batch_candidate_valid_invalid_logit_margin = flow_arrays[
+                                    "candidate_valid_invalid_logit_margin"
+                                ]
+                        row_ids = torch.arange(batch_size, device=pred_tensor.device)
+                        pred_in_mask = allowed_mask[row_ids, pred_tensor].bool()
+                        target_in_mask = allowed_mask[row_ids, target_tensor.to(pred_tensor.device)].bool()
+                        strict_error_but_allowed = (pred_tensor != target_tensor.to(pred_tensor.device)) & pred_in_mask
+                        mask_cardinality = allowed_mask.sum(dim=1).float()
+                        oos_flags = (~pred_in_mask).float()
+                        ambiguous_mask = mask_cardinality > 1.0
+                        batch_hybrid_correct = torch.where(
+                            ambiguous_mask,
+                            pred_in_mask.float(),
+                            correct_tensor,
+                        )
+                        batch_ambiguous = ambiguous_mask.float()
+
+                        batch_oos = oos_flags.detach().cpu().numpy().astype(np.float32, copy=False)
+                        batch_target_in_mask = target_in_mask.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                        batch_pred_in_mask = pred_in_mask.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                        batch_strict_error_but_allowed = (
+                            strict_error_but_allowed.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                        )
+                        batch_mask_cardinality = mask_cardinality.detach().cpu().numpy().astype(np.float32, copy=False)
+
+                    if (
+                        candidate_output is not None
+                        and self.candidate_identity_mode == "topology_native"
+                    ):
+                        native_mask = contract.get("candidate_allowed_target_mask")
+                        if not isinstance(native_mask, torch.Tensor):
+                            native_mask = candidate_allowed_mask
+                        if isinstance(native_mask, torch.Tensor):
+                            effective_native_mask = native_mask.to(device=raw_logits.device, dtype=torch.bool)
+                            if effective_native_mask.dim() == 1:
+                                effective_native_mask = effective_native_mask.unsqueeze(0)
+                            if (
+                                effective_native_mask.dim() == 2
+                                and int(effective_native_mask.size(0)) == batch_size
+                                and int(effective_native_mask.size(1)) == int(raw_logits.size(1))
+                            ):
+                                native_pred = candidate_set_predictions(raw_logits.detach())
+                                row_ids = torch.arange(batch_size, device=raw_logits.device)
+                                native_pred_in_mask = effective_native_mask[row_ids, native_pred].bool()
+                                native_strict_error = correct_tensor.to(device=raw_logits.device) <= 0.5
+                                native_oos = native_strict_error & (~native_pred_in_mask)
+                                native_strict_error_but_allowed = native_strict_error & native_pred_in_mask
+                                native_mask_cardinality = effective_native_mask.sum(dim=1).float()
+                                native_ambiguous = native_mask_cardinality > 1.0
+                                batch_oos = native_oos.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                                batch_pred_in_mask = (
+                                    native_pred_in_mask.float().detach().cpu().numpy().astype(np.float32, copy=False)
+                                )
+                                batch_strict_error_but_allowed = (
+                                    native_strict_error_but_allowed.float()
+                                    .detach()
+                                    .cpu()
+                                    .numpy()
+                                    .astype(np.float32, copy=False)
+                                )
+                                batch_mask_cardinality = (
+                                    native_mask_cardinality.detach().cpu().numpy().astype(np.float32, copy=False)
+                                )
+                                batch_hybrid_correct = torch.where(
+                                    native_ambiguous,
+                                    native_pred_in_mask.float(),
+                                    correct_tensor.to(device=raw_logits.device),
+                                )
+                                batch_ambiguous = native_ambiguous.float()
+                                if (
+                                    isinstance(target_candidate_mask, torch.Tensor)
+                                    and target_candidate_mask.shape == effective_native_mask.shape
+                                ):
+                                    native_target_in_mask = (
+                                        target_candidate_mask.to(device=raw_logits.device, dtype=torch.bool)
+                                        & effective_native_mask
+                                    ).any(dim=1)
+                                    batch_target_in_mask = (
+                                        native_target_in_mask.float()
+                                        .detach()
+                                        .cpu()
+                                        .numpy()
+                                        .astype(np.float32, copy=False)
+                                    )
+                        native_allowed_sets = self._candidate_allowed_identity_sets(
+                            candidate_output,
+                            effective_native_mask if isinstance(effective_native_mask, torch.Tensor) else None,
+                        )
+                        prediction_space = "topology_native_candidate_label"
+                        mask_space = "topology_native_candidate_label"
+                        metric_contract_id = "topology_native_candidate_label_mask.v1"
+                    else:
+                        native_allowed_sets = self._fixed_head_allowed_identity_sets(allowed_mask)
+                        prediction_space = "fixed_vocab_label"
+                        mask_space = "fixed_vocab_label"
+                        metric_contract_id = "fixed_vocab_label_mask.v1"
+                    for row_idx in range(batch_size):
+                        audit_payloads = getattr(data, "audit_payload_json", None)
+                        if audit_payloads is not None:
+                            if isinstance(audit_payloads, str):
+                                audit_payloads = [audit_payloads]
+                            if len(audit_payloads) != batch_size:
+                                raise ValueError("Common audit payload must preserve one row per prefix")
+                            all_audit_observations.append(common_mask_observation(
+                                audit_payloads[row_idx], pred_keys[row_idx], true_keys[row_idx]))
+                            continue
+                        allowed_identities = (
+                            native_allowed_sets[row_idx]
+                            if row_idx < len(native_allowed_sets)
+                            else None
+                        )
+                        all_audit_observations.append(
+                            AuditObservation(
+                                prediction_identity=str(pred_keys[row_idx]) if row_idx < len(pred_keys) else None,
+                                target_identity=str(true_keys[row_idx]) if row_idx < len(true_keys) else None,
+                                allowed_identities=allowed_identities,
+                                prediction_space=prediction_space,
+                                mask_space=mask_space,
+                                metric_contract_id=metric_contract_id,
+                            )
+                        )
+
+                    self._maybe_record_prediction_traces(
+                        stage_label="eval_drift_one_pass",
+                        contract=contract,
+                        logits=raw_logits,
+                        effective_logits=effective_logits,
+                        probs=probs,
+                        targets=target_tensor,
+                        predictions=pred_tensor,
+                        allowed_mask=allowed_mask,
+                        global_offset=inference_graphs,
+                    )
+
+                    all_trace_idx.extend(data.trace_idx.view(-1).long().detach().cpu().tolist())
+                    all_true.extend(true_keys)
+                    all_pred.extend(pred_keys)
+                    all_fixed_true.extend(batch_fixed_true)
+                    all_fixed_pred.extend(batch_fixed_pred)
+                    all_confidence.extend(confidence_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist())
+                    all_correct.extend(correct_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist())
+                    all_fixed_confidence.extend(
+                        fixed_confidence_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                    )
+                    all_fixed_correct.extend(
+                        fixed_correct_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                    )
+                    all_fixed_set_nll.extend(
+                        fixed_set_nll_tensor.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                    )
+                    all_top3_hit.extend(top3_hit.detach().cpu().numpy().astype(np.float32, copy=False).tolist())
+                    all_oos_flags.extend(batch_oos.tolist())
+                    all_target_in_mask_flags.extend(batch_target_in_mask.tolist())
+                    all_pred_in_mask_flags.extend(batch_pred_in_mask.tolist())
+                    all_strict_error_but_allowed_flags.extend(batch_strict_error_but_allowed.tolist())
+                    all_mask_cardinality.extend(batch_mask_cardinality.tolist())
+                    all_candidate_oos_flags.extend(batch_candidate_oos.tolist())
+                    all_candidate_invalid_probability_mass.extend(batch_candidate_invalid_probability_mass.tolist())
+                    all_candidate_valid_probability_mass.extend(batch_candidate_valid_probability_mass.tolist())
+                    all_candidate_valid_invalid_logit_margin.extend(batch_candidate_valid_invalid_logit_margin.tolist())
+                    all_hybrid_correct_flags.extend(
+                        batch_hybrid_correct.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                    )
+                    all_hybrid_set_nll.extend(
+                        batch_hybrid_set_nll.detach().cpu().numpy().astype(np.float32, copy=False).tolist()
+                    )
+                    all_ambiguous_flags.extend(batch_ambiguous.detach().cpu().numpy().astype(np.float32, copy=False).tolist())
+
+                    if hasattr(data, "prefix_len"):
+                        all_lengths.extend(data.prefix_len.view(-1).long().cpu().tolist())
+                    else:
+                        graph_lengths = torch.bincount(data.batch.view(-1).long(), minlength=batch_size)
+                        all_lengths.extend(graph_lengths.long().cpu().tolist())
+
+                    if hasattr(data, "process_version_idx"):
+                        version_indices = data.process_version_idx.view(-1).long().cpu().tolist()
+                        for idx in version_indices:
+                            all_versions.append(self._idx_to_version.get(int(idx), f"v{int(idx)}"))
+
+                    inference_graphs += int(batch_size)
+                    current_progress = inference_graphs if total_graphs is not None else processed_batches
+                    progress_reporter.update(
+                        message="Drift one-pass inference",
+                        current=current_progress,
+                        total=progress_total,
+                        payload={
+                            "graphs_processed": inference_graphs,
+                            "batches_processed": processed_batches,
+                            "graphs_total": total_graphs,
+                            "batches_total": total_batches,
+                        },
+                        force=True,
+                    )
+                    if processed_batches % 50 == 0:
+                        import gc
+                        gc.collect()
+        except Exception as exc:
+            progress_reporter.error(message=f"Drift one-pass inference failed: {exc}")
+            raise
+
+        progress_reporter.done(
+            message="Drift one-pass inference completed",
+            current=inference_graphs if total_graphs is not None else processed_batches,
+            total=progress_total,
+            payload={
+                "graphs_processed": inference_graphs,
+                "batches_processed": processed_batches,
+                "graphs_total": total_graphs,
+                "batches_total": total_batches,
+            },
+        )
+
+        total_inference_ms = float((perf_counter() - inference_started) * 1000.0)
+        inference_ms_per_graph = float(total_inference_ms / inference_graphs) if inference_graphs > 0 else 0.0
+        if contract_sanitized_batches > 0 or logits_sanitized_batches > 0 or probs_sanitized_batches > 0:
+            logger.info(
+                "Numeric guard [eval_drift_one_pass]: contract_sanitized_batches=%d "
+                "logits_sanitized_batches=%d probs_sanitized_batches=%d",
+                contract_sanitized_batches,
+                logits_sanitized_batches,
+                probs_sanitized_batches,
+            )
+        self._log_forward_stats_summary("eval_drift_one_pass", forward_stats)
+        self._log_trace_overhead_metrics()
+
+        import gc
+        gc.collect()
+        return DriftInferenceRecords(
+            trace_idx=np.asarray(all_trace_idx, dtype=np.int64),
+            y_true=np.asarray(all_true, dtype=object),
+            y_pred=np.asarray(all_pred, dtype=object),
+            confidence=np.asarray(all_confidence, dtype=np.float32),
+            correct=np.asarray(all_correct, dtype=np.float32),
+            top3_hit=np.asarray(all_top3_hit, dtype=np.float32),
+            oos_flags=np.asarray(all_oos_flags, dtype=np.float32),
+            target_in_mask_flags=np.asarray(all_target_in_mask_flags, dtype=np.float32),
+            pred_in_mask_flags=np.asarray(all_pred_in_mask_flags, dtype=np.float32),
+            strict_error_but_allowed_flags=np.asarray(all_strict_error_but_allowed_flags, dtype=np.float32),
+            mask_cardinality=np.asarray(all_mask_cardinality, dtype=np.float32),
+            candidate_oos_flags=np.asarray(all_candidate_oos_flags, dtype=np.float32),
+            candidate_invalid_probability_mass=np.asarray(all_candidate_invalid_probability_mass, dtype=np.float32),
+            candidate_valid_probability_mass=np.asarray(all_candidate_valid_probability_mass, dtype=np.float32),
+            candidate_valid_invalid_logit_margin=np.asarray(all_candidate_valid_invalid_logit_margin, dtype=np.float32),
+            hybrid_correct_flags=np.asarray(all_hybrid_correct_flags, dtype=np.float32),
+            hybrid_set_nll=np.asarray(all_hybrid_set_nll, dtype=np.float32),
+            ambiguous_flags=np.asarray(all_ambiguous_flags, dtype=np.float32),
+            prefix_lengths=np.asarray(all_lengths, dtype=np.int64),
+            version_labels=all_versions,
+            inference_ms_per_graph=inference_ms_per_graph,
+            fixed_y_true=np.asarray(all_fixed_true, dtype=np.int64),
+            fixed_y_pred=np.asarray(all_fixed_pred, dtype=np.int64),
+            fixed_confidence=np.asarray(all_fixed_confidence, dtype=np.float32),
+            fixed_correct=np.asarray(all_fixed_correct, dtype=np.float32),
+            fixed_set_nll=np.asarray(all_fixed_set_nll, dtype=np.float32),
+            audit_observations=tuple(all_audit_observations),
+        )
+
+    def _compute_test_metrics_from_records(self, records: DriftInferenceRecords, idxs: np.ndarray) -> Dict[str, Any]:
+        """Compute test/eval metrics for a subset of compact drift inference records."""
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if idxs.size == 0:
+            return {
+                "test_accuracy": 0.0,
+                "test_macro_f1": 0.0,
+                "test_weighted_f1": 0.0,
+                "test_set_nll": 0.0,
+                "test_top3_accuracy": 0.0,
+                "test_ece": 0.0,
+                "strict_test_accuracy": 0.0,
+                "strict_test_macro_f1": 0.0,
+                "strict_test_weighted_f1": 0.0,
+                "test_oos": None,
+                "test_target_in_mask_rate": None,
+                "test_pred_in_mask_rate": None,
+                "test_strict_error_but_allowed_rate": None,
+                "test_ambiguous_prefix_rate": None,
+                "test_set_hit_rate_ambiguous": None,
+                "test_accuracy_deterministic": None,
+                "test_mask_coverage": 0.0,
+                "test_precision_macro": 0.0,
+                "test_recall_macro": 0.0,
+                "test_inference_time_ms_per_graph": float(records.inference_ms_per_graph),
+            }
+
+        y_true = records.y_true[idxs]
+        y_pred = records.y_pred[idxs]
+        confidence = records.confidence[idxs]
+        correct = records.correct[idxs]
+        top3_hit = records.top3_hit[idxs]
+        hybrid_correct_flags = records.hybrid_correct_flags[idxs]
+        hybrid_set_nll = records.hybrid_set_nll[idxs]
+        ambiguous_flags = records.ambiguous_flags[idxs]
+        pred_in_mask_flags_raw = records.pred_in_mask_flags[idxs]
+        oos_flags = records.oos_flags[idxs]
+        target_in_mask_flags = records.target_in_mask_flags[idxs]
+        pred_in_mask_flags = records.pred_in_mask_flags[idxs]
+        strict_error_but_allowed_flags = records.strict_error_but_allowed_flags[idxs]
+        mask_cardinality = records.mask_cardinality[idxs]
+        candidate_oos_flags = records.candidate_oos_flags[idxs]
+        candidate_invalid_probability_mass = records.candidate_invalid_probability_mass[idxs]
+        candidate_valid_probability_mass = records.candidate_valid_probability_mass[idxs]
+        candidate_valid_invalid_logit_margin = records.candidate_valid_invalid_logit_margin[idxs]
+        prefix_lengths = records.prefix_lengths[idxs] if records.prefix_lengths.shape[0] >= int(np.max(idxs)) + 1 else None
+        versions = [records.version_labels[int(idx)] for idx in idxs if int(idx) < len(records.version_labels)]
+
+        fixed_y_true = records.fixed_y_true[idxs]
+        fixed_y_pred = records.fixed_y_pred[idxs]
+        fixed_confidence = records.fixed_confidence[idxs]
+        fixed_correct = records.fixed_correct[idxs]
+        fixed_set_nll = records.fixed_set_nll[idxs]
+
+        strict_accuracy = float(accuracy_score(y_true, y_pred))
+        strict_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        strict_weighted_f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+        strict_precision_macro = float(precision_score(y_true, y_pred, average="macro", zero_division=0))
+        strict_recall_macro = float(recall_score(y_true, y_pred, average="macro", zero_division=0))
+
+        y_true_hybrid = np.asarray(y_true, dtype=object).copy()
+        if int(ambiguous_flags.shape[0]) == int(y_true_hybrid.shape[0]) and int(pred_in_mask_flags_raw.shape[0]) == int(
+            y_true_hybrid.shape[0]
+        ):
+            override_idxs = np.where((ambiguous_flags > 0.5) & (pred_in_mask_flags_raw > 0.5))[0]
+            if override_idxs.size > 0:
+                y_true_hybrid[override_idxs] = y_pred[override_idxs]
+
+        fixed_y_true_hybrid = fixed_y_true.copy()
+        if int(ambiguous_flags.shape[0]) == int(fixed_y_true_hybrid.shape[0]) and int(pred_in_mask_flags_raw.shape[0]) == int(
+            fixed_y_true_hybrid.shape[0]
+        ):
+            override_idxs = np.where((ambiguous_flags > 0.5) & (pred_in_mask_flags_raw > 0.5))[0]
+            if override_idxs.size > 0:
+                fixed_y_true_hybrid[override_idxs] = fixed_y_pred[override_idxs]
+
+        hybrid_accuracy = self._nanmean_or_none(hybrid_correct_flags)
+        if hybrid_accuracy is None:
+            hybrid_accuracy = strict_accuracy
+
+        metrics = {
+            "test_accuracy": float(hybrid_accuracy),
+            "test_macro_f1": float(f1_score(y_true_hybrid, y_pred, average="macro", zero_division=0)),
+            "test_weighted_f1": float(f1_score(y_true_hybrid, y_pred, average="weighted", zero_division=0)),
+            "test_set_nll": float(self._nanmean_or_none(hybrid_set_nll) or 0.0),
+            "test_top3_accuracy": float(self._nanmean_or_none(top3_hit) or 0.0),
+            "test_ece": float(self._expected_calibration_error_from_confidence(confidence, correct)),
+            "test_oos": self._nanmean_or_none(oos_flags),
+            "test_precision_macro": float(precision_score(y_true_hybrid, y_pred, average="macro", zero_division=0)),
+            "test_recall_macro": float(recall_score(y_true_hybrid, y_pred, average="macro", zero_division=0)),
+            "strict_test_accuracy": strict_accuracy,
+            "strict_test_macro_f1": strict_macro_f1,
+            "strict_test_weighted_f1": strict_weighted_f1,
+            "strict_test_precision_macro": strict_precision_macro,
+            "strict_test_recall_macro": strict_recall_macro,
+            "test_inference_time_ms_per_graph": float(records.inference_ms_per_graph),
+            "fixed_label_strict_test_accuracy": float(accuracy_score(fixed_y_true, fixed_y_pred)),
+            "fixed_label_strict_test_macro_f1": float(f1_score(fixed_y_true, fixed_y_pred, average="macro", zero_division=0)),
+            "fixed_label_strict_test_weighted_f1": float(f1_score(fixed_y_true, fixed_y_pred, average="weighted", zero_division=0)),
+            "fixed_label_test_accuracy": float(accuracy_score(fixed_y_true_hybrid, fixed_y_pred)),
+            "fixed_label_test_macro_f1": float(f1_score(fixed_y_true_hybrid, fixed_y_pred, average="macro", zero_division=0)),
+            "fixed_label_test_weighted_f1": float(f1_score(fixed_y_true_hybrid, fixed_y_pred, average="weighted", zero_division=0)),
+            "fixed_label_test_ece": float(self._expected_calibration_error_from_confidence(fixed_confidence, fixed_correct)),
+            "fixed_label_test_set_nll": float(self._nanmean_or_none(fixed_set_nll) or 0.0),
+        }
+        metrics["test_target_in_mask_rate"] = self._nanmean_or_none(target_in_mask_flags)
+        metrics["test_pred_in_mask_rate"] = self._nanmean_or_none(pred_in_mask_flags)
+        metrics["test_strict_error_but_allowed_rate"] = self._nanmean_or_none(strict_error_but_allowed_flags)
+        if records.audit_observations:
+            selected_observations = [
+                records.audit_observations[int(idx)]
+                for idx in idxs.tolist()
+                if int(idx) < len(records.audit_observations)
+            ]
+            audit_summary = aggregate_outcomes(selected_observations)
+            metrics.update(self._audit_metrics_from_summary(audit_summary))
+            if int(audit_summary.valid_prediction_count) == int(y_true.shape[0]):
+                audit_contract_tolerance = 1.0e-6
+                if abs(float(metrics["strict_test_accuracy"]) - float(audit_summary.strict_correct_rate)) > audit_contract_tolerance:
+                    raise ValueError("RS-01 strict_correct_rate does not match strict_test_accuracy.")
+                strict_allowed_rate = (
+                    audit_summary.parallelism_admissible_error_rate
+                    if audit_summary.metric_contract_id == COMMON_MASK_CONTRACT
+                    else metrics.get("test_strict_error_but_allowed_rate")
+                )
+                if strict_allowed_rate is not None and abs(
+                    float(strict_allowed_rate) - float(audit_summary.parallelism_admissible_error_rate)
+                ) <= audit_contract_tolerance:
+                    metrics["audit_contract_discrepancy_count"] = 0.0
+                    metrics["audit_contract_discrepancy_rate"] = 0.0
+                elif strict_allowed_rate is not None:
+                    metrics["audit_contract_discrepancy_count"] = 1.0
+                    metrics["audit_contract_discrepancy_rate"] = 1.0
+        metrics["topology_tolerant_macro_f1"] = float(metrics["test_macro_f1"])
+        metrics["topology_tolerant_macro_f1_gain"] = float(metrics["test_macro_f1"]) - float(
+            metrics["strict_test_macro_f1"]
+        )
+        metrics["candidate_oos_rate"] = self._nanmean_or_none(candidate_oos_flags)
+        metrics["candidate_invalid_probability_mass"] = self._nanmean_or_none(candidate_invalid_probability_mass)
+        metrics["candidate_valid_probability_mass"] = self._nanmean_or_none(candidate_valid_probability_mass)
+        metrics["candidate_valid_invalid_logit_margin"] = self._nanmean_or_none(candidate_valid_invalid_logit_margin)
+        finite_oos = np.isfinite(oos_flags)
+        oos_idxs = np.where(finite_oos & (oos_flags > 0.5))[0]
+        metrics["test_oos_confidence_mean"] = (
+            float(np.mean(confidence[oos_idxs])) if int(oos_idxs.size) > 0 else None
+        )
+
+        ambiguous_prefix_rate: float | None = None
+        test_set_hit_rate_ambiguous: float | None = None
+        test_accuracy_deterministic: float | None = None
+        if int(mask_cardinality.shape[0]) == int(y_true.shape[0]):
+            finite_mask_cardinality = np.isfinite(mask_cardinality)
+            if bool(np.any(finite_mask_cardinality)):
+                ambiguous_prefix_rate = float(np.mean(mask_cardinality[finite_mask_cardinality] > 1.0))
+                metrics["test_mask_coverage"] = float(np.mean(finite_mask_cardinality.astype(np.float32)))
+                ambiguous_idxs = np.where((mask_cardinality > 1.0) & finite_mask_cardinality)[0]
+                if ambiguous_idxs.size > 0:
+                    value = self._nanmean_or_none(pred_in_mask_flags[ambiguous_idxs])
+                    if value is not None:
+                        test_set_hit_rate_ambiguous = float(value)
+                deterministic_idxs = np.where((mask_cardinality == 1.0) & finite_mask_cardinality)[0]
+                if deterministic_idxs.size > 0:
+                    value = self._nanmean_or_none(hybrid_correct_flags[deterministic_idxs])
+                    if value is not None:
+                        test_accuracy_deterministic = float(value)
+            else:
+                metrics["test_mask_coverage"] = 0.0
+        else:
+            metrics["test_mask_coverage"] = 0.0
+
+        metrics["test_ambiguous_prefix_rate"] = ambiguous_prefix_rate
+        metrics["test_set_hit_rate_ambiguous"] = test_set_hit_rate_ambiguous
+        metrics["test_accuracy_deterministic"] = test_accuracy_deterministic
+
+        metrics.update(
+            self._compute_sliced_metrics(
+                y_true=y_true_hybrid,
+                y_pred=y_pred,
+                oos_flags=oos_flags,
+                target_in_mask_flags=target_in_mask_flags,
+                pred_in_mask_flags=pred_in_mask_flags,
+                strict_error_but_allowed_flags=strict_error_but_allowed_flags,
+                mask_cardinality=mask_cardinality,
+                prefix_lengths=prefix_lengths,
+                versions=versions if len(versions) == int(y_true.shape[0]) else None,
+                metric_prefix="",
+                emit_mask_metrics=True,
+            )
+        )
+        metrics.update(
+            self._compute_sliced_metrics(
+                y_true=y_true,
+                y_pred=y_pred,
+                oos_flags=oos_flags,
+                target_in_mask_flags=target_in_mask_flags,
+                pred_in_mask_flags=pred_in_mask_flags,
+                strict_error_but_allowed_flags=strict_error_but_allowed_flags,
+                mask_cardinality=mask_cardinality,
+                prefix_lengths=prefix_lengths,
+                versions=versions if len(versions) == int(y_true.shape[0]) else None,
+                metric_prefix="strict_",
+                emit_mask_metrics=False,
+            )
+        )
+        metrics["legacy_test_accuracy"] = float(metrics["strict_test_accuracy"])
+        metrics["legacy_test_macro_f1"] = float(metrics["strict_test_macro_f1"])
+        metrics["legacy_test_weighted_f1"] = float(metrics["strict_test_weighted_f1"])
+        return metrics
+
+    @staticmethod
+    def _is_finite_tensor(value: Any) -> bool:
+        if not isinstance(value, torch.Tensor):
+            return True
+        if value.numel() == 0:
+            return True
+        return bool(torch.isfinite(value).all().item())
+
+    def _sanitize_contract_numeric_tensors(self, contract: GraphTensorContract) -> bool:
+        sanitized = False
+        for key in ("x_num", "struct_x", "structural_edge_weight"):
+            tensor = contract.get(key)
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            if self._is_finite_tensor(tensor):
+                continue
+            contract[key] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+            sanitized = True
+        return sanitized
+
+    def _evaluate_drift_windows(self, traces: Sequence[RawTrace]) -> List[Dict[str, float]]:
+        """Run fixed-size chronological window evaluation for concept-drift tracking."""
+        if self.drift_window_size <= 0:
+            raise ValueError("drift_window_size must be positive.")
+        windows = self._generate_drift_windows(traces)
+        drift_results: List[Dict[str, float]] = []
+        logger.info(
+            "Drift windows prepared: size=%d, step=%d, keep_short_tail=false, windows=%d",
+            self.drift_window_size,
+            self._resolve_drift_step(),
+            len(windows),
+        )
+
+        iterator = tqdm(
+            windows,
+            desc="Eval drift",
+            leave=self.tqdm_leave,
+            disable=self._is_tqdm_disabled(),
+        )
+        total_windows = len(windows)
+        emit_progress_event(stage="eval_drift.windows", status="start", message="Evaluating drift windows", current=0, total=total_windows)
+        for window_idx, (start, window_traces) in enumerate(iterator):
+            window_loader = self._build_loader(window_traces, shuffle=False)
+            metrics = self._evaluate_test(window_loader, stage_label="eval_drift")
+            macro_f1 = float(metrics.get("test_macro_f1", 0.0))
+            strict_macro_f1 = float(metrics.get("strict_test_macro_f1", 0.0))
+            ece = float(metrics.get("test_ece", 0.0))
+            window_oos = metrics.get("test_oos")
+            window_target_in_mask = metrics.get("test_target_in_mask_rate")
+            window_pred_in_mask = metrics.get("test_pred_in_mask_rate")
+            window_strict_error_but_allowed = metrics.get("test_strict_error_but_allowed_rate")
+            window_ambiguous_prefix = metrics.get("test_ambiguous_prefix_rate")
+            window_set_nll = metrics.get("test_set_nll")
+            window_oos_confidence_mean = metrics.get("test_oos_confidence_mean")
+            window_candidate_oos = metrics.get("candidate_oos_rate")
+            window_candidate_invalid_mass = metrics.get("candidate_invalid_probability_mass")
+            window_candidate_valid_mass = metrics.get("candidate_valid_probability_mass")
+            window_candidate_margin = metrics.get("candidate_valid_invalid_logit_margin")
+            audit_window_metrics = self._window_audit_metrics(metrics)
+
+            iterator.set_postfix({"f1": f"{macro_f1:.4f}", "strict_f1": f"{strict_macro_f1:.4f}", "ece": f"{ece:.4f}"})
+
+            if self.tracker is not None:
+                self.tracker.log_metric("drift_window_macro_f1", macro_f1, step=window_idx)
+                self.tracker.log_metric("drift_window_strict_macro_f1", strict_macro_f1, step=window_idx)
+                self.tracker.log_metric("drift_window_test_ece", ece, step=window_idx)
+                if window_set_nll is not None:
+                    self.tracker.log_metric("drift_window_test_set_nll", float(window_set_nll), step=window_idx)
+                if window_oos is not None:
+                    self.tracker.log_metric("drift_window_test_oos", float(window_oos), step=window_idx)
+                if window_oos_confidence_mean is not None:
+                    self.tracker.log_metric(
+                        "drift_window_oos_confidence_mean",
+                        float(window_oos_confidence_mean),
+                        step=window_idx,
+                    )
+                if window_target_in_mask is not None:
+                    self.tracker.log_metric(
+                        "drift_window_target_in_mask_rate",
+                        float(window_target_in_mask),
+                        step=window_idx,
+                    )
+                if window_pred_in_mask is not None:
+                    self.tracker.log_metric(
+                        "drift_window_pred_in_mask_rate",
+                        float(window_pred_in_mask),
+                        step=window_idx,
+                    )
+                if window_strict_error_but_allowed is not None:
+                    self.tracker.log_metric(
+                        "drift_window_strict_error_but_allowed_rate",
+                        float(window_strict_error_but_allowed),
+                        step=window_idx,
+                    )
+                if window_ambiguous_prefix is not None:
+                    self.tracker.log_metric(
+                        "drift_window_ambiguous_prefix_rate",
+                        float(window_ambiguous_prefix),
+                        step=window_idx,
+                    )
+                if window_candidate_oos is not None:
+                    self.tracker.log_metric("drift_window_candidate_oos", float(window_candidate_oos), step=window_idx)
+                if window_candidate_invalid_mass is not None:
+                    self.tracker.log_metric(
+                        "drift_window_candidate_invalid_probability_mass",
+                        float(window_candidate_invalid_mass),
+                        step=window_idx,
+                    )
+                if window_candidate_valid_mass is not None:
+                    self.tracker.log_metric(
+                        "drift_window_candidate_valid_probability_mass",
+                        float(window_candidate_valid_mass),
+                        step=window_idx,
+                    )
+                if window_candidate_margin is not None:
+                    self.tracker.log_metric(
+                        "drift_window_candidate_valid_invalid_logit_margin",
+                        float(window_candidate_margin),
+                        step=window_idx,
+                    )
+                for key, value in audit_window_metrics.items():
+                    self.tracker.log_metric(f"drift_{key}", float(value), step=window_idx)
+
+            start_ts = float(window_traces[0].events[0].timestamp) if window_traces and window_traces[0].events else 0.0
+            end_ts = float(window_traces[-1].events[-1].timestamp) if window_traces and window_traces[-1].events else start_ts
+            logger.info(
+                "Window %d/%d (%.3f - %.3f) | F1(hybrid): %.4f | F1(strict): %.4f...",
+                window_idx + 1,
+                total_windows,
+                start_ts,
+                end_ts,
+                macro_f1,
+                strict_macro_f1,
+            )
+
+            drift_results.append(
+                {
+                    "window_index": float(window_idx),
+                    "window_start_trace": float(start),
+                    "window_end_trace": float(start + len(window_traces) - 1),
+                    "window_start_ts": start_ts,
+                    "window_end_ts": end_ts,
+                    "window_macro_f1": macro_f1,
+                    "window_strict_macro_f1": strict_macro_f1,
+                    "window_test_ece": ece,
+                    "window_test_set_nll": float(window_set_nll) if window_set_nll is not None else float("nan"),
+                    "window_test_oos": float(window_oos) if window_oos is not None else float("nan"),
+                    "window_oos_confidence_mean": (
+                        float(window_oos_confidence_mean)
+                        if window_oos_confidence_mean is not None
+                        else float("nan")
+                    ),
+                    "window_target_in_mask_rate": (
+                        float(window_target_in_mask) if window_target_in_mask is not None else float("nan")
+                    ),
+                    "window_pred_in_mask_rate": (
+                        float(window_pred_in_mask) if window_pred_in_mask is not None else float("nan")
+                    ),
+                    "window_strict_error_but_allowed_rate": (
+                        float(window_strict_error_but_allowed)
+                        if window_strict_error_but_allowed is not None
+                        else float("nan")
+                    ),
+                    "window_ambiguous_prefix_rate": (
+                        float(window_ambiguous_prefix) if window_ambiguous_prefix is not None else float("nan")
+                    ),
+                    "window_candidate_oos": (
+                        float(window_candidate_oos) if window_candidate_oos is not None else float("nan")
+                    ),
+                    "window_candidate_invalid_probability_mass": (
+                        float(window_candidate_invalid_mass)
+                        if window_candidate_invalid_mass is not None
+                        else float("nan")
+                    ),
+                    "window_candidate_valid_probability_mass": (
+                        float(window_candidate_valid_mass) if window_candidate_valid_mass is not None else float("nan")
+                    ),
+                    "window_candidate_valid_invalid_logit_margin": (
+                        float(window_candidate_margin) if window_candidate_margin is not None else float("nan")
+                    ),
+                    **audit_window_metrics,
+                }
+            )
+
+            if self.tracker is not None:
+                self.tracker.log_metric("drift_window_start_ts", start_ts, step=window_idx)
+                self.tracker.log_metric("drift_window_end_ts", end_ts, step=window_idx)
+
+            emit_progress_event(
+                stage="eval_drift.windows",
+                status="update",
+                message=f"Window {window_idx + 1}/{total_windows}",
+                current=int(window_idx + 1),
+                total=total_windows,
+                payload={
+                    "macro_f1": float(macro_f1),
+                    "strict_macro_f1": float(strict_macro_f1),
+                    "ece": float(ece),
+                    "target_in_mask_rate": float(window_target_in_mask) if window_target_in_mask is not None else None,
+                    "pred_in_mask_rate": float(window_pred_in_mask) if window_pred_in_mask is not None else None,
+                },
+            )
+
+        emit_progress_event(stage="eval_drift.windows", status="done", message="Drift evaluation completed", current=total_windows, total=total_windows)
+
+        return drift_results
+
+    def _prebuilt_dataset_has_trace_idx(self, dataset: Optional[Any]) -> bool:
+        """Return True when a prebuilt graph dataset can support one-pass drift windows."""
+        if dataset is None:
+            return False
+        try:
+            if isinstance(dataset, dict) and dataset.get("kind") == "sharded_cache_split":
+                lazy_dataset = self._create_lazy_dataset_from_payload(dataset)
+                return len(lazy_dataset) > 0 and hasattr(lazy_dataset[0], "trace_idx")
+            if isinstance(dataset, Sequence) and not isinstance(dataset, (str, bytes, dict)):
+                if len(dataset) <= 0:
+                    return False
+                first = dataset[0]
+                return isinstance(first, Data) and hasattr(first, "trace_idx")
+        except Exception as exc:
+            logger.warning("Unable to inspect prebuilt drift dataset trace metadata: %s", exc)
+            return False
+        return False
+
+    @staticmethod
+    def _graph_trace_idx(graph: Data) -> int:
+        raw_trace_idx = getattr(graph, "trace_idx", None)
+        if not isinstance(raw_trace_idx, torch.Tensor) or raw_trace_idx.numel() <= 0:
+            raise ValueError("prebuilt drift finetune dataset is missing required trace_idx metadata")
+        return int(raw_trace_idx.view(-1)[0].item())
+
+    def _iter_prebuilt_graphs(self, dataset: Any) -> List[Data]:
+        if isinstance(dataset, dict) and dataset.get("kind") == "sharded_cache_split":
+            source: Any = self._create_lazy_dataset_from_payload(dataset)
+        else:
+            source = dataset or []
+        if not (hasattr(source, "__len__") and hasattr(source, "__getitem__")):
+            raise ValueError("eval_drift_finetune requires an indexable prebuilt graph dataset.")
+        total = int(len(source))
+        reporter = ProgressReporter(
+            stage="eval_drift.one_pass_inference",
+            total=total,
+            min_interval_sec=0.8,
+        )
+        reporter.start(
+            message="Indexing adaptive drift graph stream",
+            current=0,
+            total=total,
+            payload={"graphs_total": total, "adaptive": True},
+        )
+        logger.info("Adaptive drift graph indexing started: graphs=%d", total)
+        graphs: List[Data] = []
+        try:
+            for idx in range(total):
+                graph = source[idx]
+                if not isinstance(graph, Data):
+                    raise ValueError("eval_drift_finetune prebuilt dataset must yield torch_geometric.data.Data samples.")
+                self._graph_trace_idx(graph)
+                graphs.append(graph)
+                reporter.update(
+                    message="Indexing adaptive drift graph stream",
+                    current=idx + 1,
+                    total=total,
+                    payload={"graphs_indexed": idx + 1},
+                )
+        except Exception as exc:
+            reporter.error(message=f"Adaptive drift graph indexing failed: {exc}")
+            raise
+        reporter.done(
+            message="Adaptive drift graph stream indexed",
+            current=total,
+            total=total,
+            payload={"graphs_indexed": len(graphs)},
+        )
+        logger.info("Adaptive drift graph indexing completed: graphs=%d", len(graphs))
+        return graphs
+
+    def _select_prebuilt_graphs_by_trace_indices(self, graphs: Sequence[Data], trace_indices: Iterable[int]) -> List[Data]:
+        wanted = {int(value) for value in trace_indices}
+        return [graph for graph in graphs if self._graph_trace_idx(graph) in wanted]
+
+    def _index_prebuilt_graphs_by_trace(self, graphs: Sequence[Data]) -> dict[int, list[tuple[int, Data]]]:
+        indexed: dict[int, list[tuple[int, Data]]] = {}
+        for position, graph in enumerate(graphs):
+            indexed.setdefault(self._graph_trace_idx(graph), []).append((position, graph))
+        return indexed
+
+    def _select_indexed_graphs(
+        self,
+        indexed: Mapping[int, Sequence[tuple[int, Data]]],
+        trace_indices: Iterable[int],
+    ) -> List[Data]:
+        selected = [
+            item
+            for trace_idx in {int(value) for value in trace_indices}
+            for item in indexed.get(trace_idx, ())
+        ]
+        return [graph for _, graph in sorted(selected, key=lambda item: item[0])]
+
+    def _ensure_training_criterion(self) -> None:
+        if not hasattr(self, "criterion"):
+            class_weights = self.class_weights.to(self.device) if self.class_weights is not None else None
+            self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    def _run_finetune_update(self, release_graphs: Sequence[Data]) -> Dict[str, Any]:
+        """Run one fully-valid adaptive update without using future class weights."""
+        trainable_params = [
+            param
+            for param in self.model.parameters()
+            if param.requires_grad and not isinstance(param, UninitializedParameter)
+        ]
+        if not release_graphs or not trainable_params:
+            return {
+                "optimizer_steps": 0,
+                "attempted_batches": 0,
+                "skipped_batches": 0,
+                "non_finite_loss_batches": 0,
+                "parameters_changed": False,
+                "optimizer": None,
+            }
+
+        before = [param.detach().clone() for param in trainable_params]
+        optimizer = Adam(trainable_params, lr=self.finetune_learning_rate)
+        release_loader = self._build_loader_from_dataset(release_graphs, shuffle=True)
+        original_criterion = self.criterion
+        self.criterion = nn.CrossEntropyLoss(weight=None)
+        optimizer_steps = 0
+        skipped_batches = 0
+        non_finite_loss_batches = 0
+        attempted_batches = 0
+        try:
+            for epoch in range(1, int(self.finetune_epochs) + 1):
+                self._run_epoch(
+                    release_loader,
+                    optimizer=optimizer,
+                    training=True,
+                    epoch_index=epoch,
+                    total_epochs=int(self.finetune_epochs),
+                )
+                summary = self._last_epoch_update_summary
+                optimizer_steps += int(summary["optimizer_steps"])
+                non_finite_loss_batches += int(summary["non_finite_loss_batches"])
+                skipped_batches += (
+                    int(summary["non_finite_loss_batches"])
+                    + int(summary["non_finite_gradient_batches"])
+                    + int(summary["non_finite_parameter_batches"])
+                )
+                attempted_batches += int(len(release_loader))
+        finally:
+            self.criterion = original_criterion
+
+        parameters_changed = any(
+            not torch.equal(before_value, parameter.detach())
+            for before_value, parameter in zip(before, trainable_params)
+        )
+        return {
+            "optimizer_steps": int(optimizer_steps),
+            "attempted_batches": int(attempted_batches),
+            "skipped_batches": int(skipped_batches),
+            "non_finite_loss_batches": int(non_finite_loss_batches),
+            "parameters_changed": bool(parameters_changed),
+            "optimizer": optimizer,
+        }
+
+    def _log_drift_window_metrics(
+        self,
+        *,
+        metrics: Dict[str, Any],
+        window_idx: int,
+        start_ts: float,
+        end_ts: float,
+        finetune_update_index: int,
+        finetune_unique_traces_seen: int,
+        finetune_traces_this_update: int,
+        finetune_start_ratio: float,
+        finetune_start_trace: int,
+    ) -> None:
+        if self.tracker is None:
+            return
+        metric_map = {
+            "drift_window_macro_f1": "test_macro_f1",
+            "drift_window_strict_macro_f1": "strict_test_macro_f1",
+            "drift_window_test_ece": "test_ece",
+            "drift_window_test_set_nll": "test_set_nll",
+            "drift_window_test_oos": "test_oos",
+            "drift_window_oos_confidence_mean": "test_oos_confidence_mean",
+            "drift_window_target_in_mask_rate": "test_target_in_mask_rate",
+            "drift_window_pred_in_mask_rate": "test_pred_in_mask_rate",
+            "drift_window_strict_error_but_allowed_rate": "test_strict_error_but_allowed_rate",
+            "drift_window_ambiguous_prefix_rate": "test_ambiguous_prefix_rate",
+            "drift_window_candidate_oos": "candidate_oos_rate",
+            "drift_window_candidate_invalid_probability_mass": "candidate_invalid_probability_mass",
+            "drift_window_candidate_valid_probability_mass": "candidate_valid_probability_mass",
+            "drift_window_candidate_valid_invalid_logit_margin": "candidate_valid_invalid_logit_margin",
+        }
+        for output_key, source_key in metric_map.items():
+            value = metrics.get(source_key)
+            if value is not None:
+                self.tracker.log_metric(output_key, float(value), step=window_idx)
+        self.tracker.log_metric("drift_window_start_ts", float(start_ts), step=window_idx)
+        self.tracker.log_metric("drift_window_end_ts", float(end_ts), step=window_idx)
+        self.tracker.log_metric("finetune_update_index", float(finetune_update_index), step=window_idx)
+        self.tracker.log_metric("finetune_unique_traces_seen", float(finetune_unique_traces_seen), step=window_idx)
+        self.tracker.log_metric("finetune_traces_this_update", float(finetune_traces_this_update), step=window_idx)
+        self.tracker.log_metric("finetune_start_ratio", float(finetune_start_ratio), step=window_idx)
+        self.tracker.log_metric("finetune_start_trace", float(finetune_start_trace), step=window_idx)
+        self.tracker.log_metric("finetune_effective_start_trace", float(finetune_start_trace), step=window_idx)
+
+    def _log_finetune_update_metrics(
+        self,
+        *,
+        window_idx: int,
+        optimizer_steps: int,
+        skipped_optimizer_steps: int,
+        applied: bool,
+    ) -> None:
+        if self.tracker is None:
+            return
+        self.tracker.log_metric("finetune_optimizer_steps", float(optimizer_steps), step=window_idx)
+        self.tracker.log_metric("finetune_skipped_optimizer_steps", float(skipped_optimizer_steps), step=window_idx)
+        self.tracker.log_metric("finetune_update_applied", 1.0 if applied else 0.0, step=window_idx)
+
+    def _evaluate_drift_finetune_windows_from_prebuilt_dataset(
+        self,
+        traces: Sequence[RawTrace],
+        prebuilt_test_dataset: Optional[Any],
+    ) -> Optional[List[Dict[str, float]]]:
+        """Replay drift windows causally, adapting only after each adaptive forecast."""
+        if not self._prebuilt_dataset_has_trace_idx(prebuilt_test_dataset):
+            return None
+        if self.drift_window_size <= 0:
+            raise ValueError("drift_window_size must be positive.")
+
+        graphs = self._iter_prebuilt_graphs(prebuilt_test_dataset)
+        graphs_by_trace = self._index_prebuilt_graphs_by_trace(graphs)
+        windows = self._generate_drift_windows(traces)
+        total_windows = len(windows)
+        if total_windows <= 0:
+            return []
+        window_step = self._resolve_drift_step()
+        finetune_start_trace = int(len(traces) * self.finetune_start_ratio)
+        effective_start_trace = adaptive_window_start_trace(
+            cut_trace=finetune_start_trace,
+            window_step=window_step,
+        )
+        baseline_windows = [
+            (window_idx, start, window_traces)
+            for window_idx, (start, window_traces) in enumerate(windows)
+            if int(start) < effective_start_trace
+        ]
+        adaptive_windows = [
+            (window_idx, start, window_traces)
+            for window_idx, (start, window_traces) in enumerate(windows)
+            if int(start) >= effective_start_trace
+        ]
+        if adaptive_windows and len(adaptive_windows) < 2:
+            raise ValueError("eval_drift_finetune needs an adaptive window with a successor to apply an update.")
+        logger.info(
+            "Drift finetune windows prepared: size=%d, step=%d, keep_short_tail=false, windows=%d",
+            self.drift_window_size,
+            window_step,
+            total_windows,
+        )
+        logger.info(
+            "Drift finetune adaptive updates start at trace index %d (effective boundary=%d, ratio=%.4f).",
+            finetune_start_trace,
+            effective_start_trace,
+            self.finetune_start_ratio,
+        )
+
+        drift_results: List[Dict[str, float]] = []
+        seen_trace_indices: set[int] = set()
+        completed_updates = 0
+        traces_this_completed_update = 0
+        self._ensure_training_criterion()
+
+        def evaluate_window(
+            *,
+            window_idx: int,
+            start: int,
+            window_traces: Sequence[RawTrace],
+            records: DriftInferenceRecords,
+            phase: str,
+        ) -> None:
+            nonlocal traces_this_completed_update
+            current_trace_indices = tuple(range(int(start), int(start) + len(window_traces)))
+            idxs = np.where(np.isin(records.trace_idx, np.asarray(current_trace_indices, dtype=np.int64)))[0]
+            if idxs.size == 0:
+                raise ValueError(f"eval_drift_finetune found no graph samples for window {window_idx}.")
+            metrics = self._compute_test_metrics_from_records(records, idxs)
+            macro_f1 = float(metrics.get("test_macro_f1", 0.0))
+            strict_macro_f1 = float(metrics.get("strict_test_macro_f1", 0.0))
+            ece = float(metrics.get("test_ece", 0.0))
+            start_ts = float(window_traces[0].events[0].timestamp) if window_traces and window_traces[0].events else 0.0
+            end_ts = float(window_traces[-1].events[-1].timestamp) if window_traces and window_traces[-1].events else start_ts
+
+            self._log_drift_window_metrics(
+                metrics=metrics,
+                window_idx=window_idx,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                finetune_update_index=completed_updates,
+                finetune_unique_traces_seen=len(seen_trace_indices),
+                finetune_traces_this_update=traces_this_completed_update,
+                finetune_start_ratio=self.finetune_start_ratio,
+                finetune_start_trace=effective_start_trace,
+            )
+            drift_results.append(
+                {
+                    "window_index": float(window_idx),
+                    "window_start_trace": float(start),
+                    "window_end_trace": float(max(current_trace_indices) if current_trace_indices else start),
+                    "window_start_ts": float(start_ts),
+                    "window_end_ts": float(end_ts),
+                    "window_macro_f1": macro_f1,
+                    "window_strict_macro_f1": strict_macro_f1,
+                    "window_test_ece": ece,
+                    "finetune_update_index": float(completed_updates),
+                    "finetune_unique_traces_seen": float(len(seen_trace_indices)),
+                    "finetune_traces_this_update": float(traces_this_completed_update),
+                    "finetune_start_ratio": float(self.finetune_start_ratio),
+                    "finetune_start_trace": float(effective_start_trace),
+                }
+            )
+            emit_progress_event(
+                stage="eval_drift.windows",
+                status="update",
+                message=f"{'Baseline' if phase == 'baseline_one_pass' else 'Adaptive'} window {window_idx + 1}/{total_windows}",
+                current=int(window_idx + 1),
+                total=total_windows,
+                payload={
+                    "phase": phase,
+                    "macro_f1": float(macro_f1),
+                    "strict_macro_f1": float(strict_macro_f1),
+                    "updates_completed": int(completed_updates),
+                    "window_graphs": int(idxs.size),
+                },
+            )
+
+        if baseline_windows:
+            last_baseline_start, last_baseline_traces = baseline_windows[-1][1:]
+            baseline_trace_indices = tuple(range(int(last_baseline_start) + len(last_baseline_traces)))
+            baseline_graphs = self._select_indexed_graphs(graphs_by_trace, baseline_trace_indices)
+            if not baseline_graphs:
+                raise ValueError("eval_drift_finetune found no graph samples for baseline windows.")
+            emit_progress_event(
+                stage="eval_drift.baseline_one_pass",
+                status="start",
+                message="Drift baseline one-pass inference",
+                current=0,
+                total=len(baseline_graphs),
+            )
+            baseline_records = self._collect_drift_inference_records(
+                self._build_loader_from_dataset(baseline_graphs, shuffle=False)
+            )
+            emit_progress_event(
+                stage="eval_drift.baseline_one_pass",
+                status="done",
+                message="Drift baseline one-pass inference completed",
+                current=len(baseline_graphs),
+                total=len(baseline_graphs),
+            )
+            for window_idx, start, window_traces in baseline_windows:
+                evaluate_window(
+                    window_idx=window_idx,
+                    start=start,
+                    window_traces=window_traces,
+                    records=baseline_records,
+                    phase="baseline_one_pass",
+                )
+                self._log_finetune_update_metrics(
+                    window_idx=window_idx,
+                    optimizer_steps=0,
+                    skipped_optimizer_steps=0,
+                    applied=False,
+                )
+
+        emit_progress_event(
+            stage="eval_drift.windows",
+            status="start",
+            message="Evaluating adaptive drift windows",
+            current=len(baseline_windows),
+            total=total_windows,
+        )
+        for adaptive_position, (window_idx, start, window_traces) in enumerate(adaptive_windows):
+            current_trace_indices = tuple(range(int(start), int(start) + len(window_traces)))
+            window_graphs = self._select_indexed_graphs(graphs_by_trace, current_trace_indices)
+            if not window_graphs:
+                raise ValueError(f"eval_drift_finetune found no graph samples for window {window_idx}.")
+            records = self._collect_drift_inference_records(
+                self._build_loader_from_dataset(window_graphs, shuffle=False)
+            )
+            evaluate_window(
+                window_idx=window_idx,
+                start=start,
+                window_traces=window_traces,
+                records=records,
+                phase="adaptive_window",
+            )
+            traces_this_completed_update = 0
+            if adaptive_position >= len(adaptive_windows) - 1:
+                self._log_finetune_update_metrics(
+                    window_idx=window_idx,
+                    optimizer_steps=0,
+                    skipped_optimizer_steps=0,
+                    applied=False,
+                )
+                continue
+            _, next_start, next_window_traces = adaptive_windows[adaptive_position + 1]
+            following_trace_indices = tuple(range(int(next_start), int(next_start) + len(next_window_traces)))
+            release_indices = newly_observed_trace_indices(
+                current_trace_indices,
+                following_trace_indices,
+                frozenset(seen_trace_indices),
+            )
+            release_graphs = self._select_indexed_graphs(graphs_by_trace, release_indices)
+            update = self._run_finetune_update(release_graphs)
+            if (
+                int(update["optimizer_steps"]) != int(update["attempted_batches"])
+                or int(update["skipped_batches"]) != 0
+                or not bool(update["parameters_changed"])
+            ):
+                self._log_finetune_update_metrics(
+                    window_idx=window_idx,
+                    optimizer_steps=int(update["optimizer_steps"]),
+                    skipped_optimizer_steps=int(update["skipped_batches"]),
+                    applied=False,
+                )
+                raise RuntimeError("eval_drift_finetune incomplete or ineffective update; run is invalid.")
+            self._log_finetune_update_metrics(
+                window_idx=window_idx,
+                optimizer_steps=int(update["optimizer_steps"]),
+                skipped_optimizer_steps=int(update["skipped_batches"]),
+                applied=True,
+            )
+            seen_trace_indices.update(int(idx) for idx in release_indices)
+            traces_this_completed_update = len(set(int(idx) for idx in release_indices))
+            completed_updates += 1
+            source_checkpoint = getattr(self, "_finetune_source_checkpoint", None)
+            source_val_loss = (
+                float(source_checkpoint.get("val_loss", 0.0))
+                if isinstance(source_checkpoint, dict)
+                else 0.0
+            )
+            source_epoch = (
+                int(source_checkpoint.get("epoch", completed_updates))
+                if isinstance(source_checkpoint, dict)
+                else completed_updates
+            )
+            self._save_finetune_checkpoint(
+                epoch=source_epoch,
+                val_loss=source_val_loss,
+                checkpoint=source_checkpoint if isinstance(source_checkpoint, dict) else None,
+                update_index=completed_updates,
+                optimizer=update["optimizer"],
+            )
+
+        emit_progress_event(
+            stage="eval_drift.windows",
+            status="done",
+            message="Adaptive drift evaluation completed",
+            current=total_windows,
+            total=total_windows,
+        )
+        return drift_results
+
+    def _evaluate_drift_windows_from_prebuilt_dataset(
+        self,
+        traces: Sequence[RawTrace],
+        prebuilt_test_dataset: Optional[Any],
+    ) -> Optional[List[Dict[str, float]]]:
+        """Evaluate drift windows from one streaming pass over prebuilt graph data."""
+        if not self._prebuilt_dataset_has_trace_idx(prebuilt_test_dataset):
+            return None
+        if self.drift_window_size <= 0:
+            raise ValueError("drift_window_size must be positive.")
+
+        logger.info("Drift evaluation path: one_pass_prebuilt_dataset")
+        loader = self._build_loader_from_dataset(prebuilt_test_dataset, shuffle=False)
+        records = self._collect_drift_inference_records(loader)
+        max_trace_idx = int(np.max(records.trace_idx)) if records.trace_idx.size > 0 else -1
+        unique_traces = int(np.unique(records.trace_idx).shape[0]) if records.trace_idx.size > 0 else 0
+        logger.info(
+            "Drift one-pass records: samples=%d traces=%d max_trace_idx=%d",
+            int(records.y_true.shape[0]),
+            unique_traces,
+            max_trace_idx,
+        )
+        self._log_eval_drift_endpoint_audit_metrics(records)
+
+        resolved_windows = self._resolve_drift_window_record_indices(records, traces)
+        total_windows = len(resolved_windows)
+        logger.info(
+            "Drift windows prepared: size=%d, step=%d, keep_short_tail=false, windows=%d",
+            self.drift_window_size,
+            self._resolve_drift_step(),
+            total_windows,
+        )
+        emit_progress_event(
+            stage="eval_drift.windows",
+            status="start",
+            message="Evaluating drift windows",
+            current=0,
+            total=total_windows,
+        )
+
+        drift_results: List[Dict[str, float]] = []
+        iterator = tqdm(
+            resolved_windows,
+            desc="Eval drift",
+            leave=self.tqdm_leave,
+            disable=self._is_tqdm_disabled(),
+        )
+        for window_idx, (start, idxs, start_ts, end_ts) in enumerate(iterator):
+            metrics = self._compute_test_metrics_from_records(records, idxs)
+            macro_f1 = float(metrics.get("test_macro_f1", 0.0))
+            strict_macro_f1 = float(metrics.get("strict_test_macro_f1", 0.0))
+            ece = float(metrics.get("test_ece", 0.0))
+            window_oos = metrics.get("test_oos")
+            window_target_in_mask = metrics.get("test_target_in_mask_rate")
+            window_pred_in_mask = metrics.get("test_pred_in_mask_rate")
+            window_strict_error_but_allowed = metrics.get("test_strict_error_but_allowed_rate")
+            window_ambiguous_prefix = metrics.get("test_ambiguous_prefix_rate")
+            window_set_nll = metrics.get("test_set_nll")
+            window_oos_confidence_mean = metrics.get("test_oos_confidence_mean")
+            audit_window_metrics = self._window_audit_metrics(metrics)
+
+            iterator.set_postfix({"f1": f"{macro_f1:.4f}", "strict_f1": f"{strict_macro_f1:.4f}", "ece": f"{ece:.4f}"})
+
+            if self.tracker is not None:
+                self.tracker.log_metric("drift_window_macro_f1", macro_f1, step=window_idx)
+                self.tracker.log_metric("drift_window_strict_macro_f1", strict_macro_f1, step=window_idx)
+                self.tracker.log_metric("drift_window_test_ece", ece, step=window_idx)
+                if window_set_nll is not None:
+                    self.tracker.log_metric("drift_window_test_set_nll", float(window_set_nll), step=window_idx)
+                if window_oos is not None:
+                    self.tracker.log_metric("drift_window_test_oos", float(window_oos), step=window_idx)
+                if window_oos_confidence_mean is not None:
+                    self.tracker.log_metric(
+                        "drift_window_oos_confidence_mean",
+                        float(window_oos_confidence_mean),
+                        step=window_idx,
+                    )
+                if window_target_in_mask is not None:
+                    self.tracker.log_metric("drift_window_target_in_mask_rate", float(window_target_in_mask), step=window_idx)
+                if window_pred_in_mask is not None:
+                    self.tracker.log_metric("drift_window_pred_in_mask_rate", float(window_pred_in_mask), step=window_idx)
+                if window_strict_error_but_allowed is not None:
+                    self.tracker.log_metric(
+                        "drift_window_strict_error_but_allowed_rate",
+                        float(window_strict_error_but_allowed),
+                        step=window_idx,
+                    )
+                if window_ambiguous_prefix is not None:
+                    self.tracker.log_metric(
+                        "drift_window_ambiguous_prefix_rate",
+                        float(window_ambiguous_prefix),
+                        step=window_idx,
+                    )
+                for key, value in audit_window_metrics.items():
+                    self.tracker.log_metric(f"drift_{key}", float(value), step=window_idx)
+
+            window_trace_count = max(0, int(idxs.shape[0]))
+            window_end_trace = int(start)
+            if window_trace_count > 0:
+                trace_values = records.trace_idx[idxs]
+                window_end_trace = int(np.max(trace_values))
+
+            drift_results.append(
+                {
+                    "window_index": float(window_idx),
+                    "window_start_trace": float(start),
+                    "window_end_trace": float(window_end_trace),
+                    "window_start_ts": float(start_ts),
+                    "window_end_ts": float(end_ts),
+                    "window_macro_f1": macro_f1,
+                    "window_strict_macro_f1": strict_macro_f1,
+                    "window_test_ece": ece,
+                    "window_test_set_nll": float(window_set_nll) if window_set_nll is not None else float("nan"),
+                    "window_test_oos": float(window_oos) if window_oos is not None else float("nan"),
+                    "window_oos_confidence_mean": (
+                        float(window_oos_confidence_mean)
+                        if window_oos_confidence_mean is not None
+                        else float("nan")
+                    ),
+                    "window_target_in_mask_rate": (
+                        float(window_target_in_mask) if window_target_in_mask is not None else float("nan")
+                    ),
+                    "window_pred_in_mask_rate": (
+                        float(window_pred_in_mask) if window_pred_in_mask is not None else float("nan")
+                    ),
+                    "window_strict_error_but_allowed_rate": (
+                        float(window_strict_error_but_allowed)
+                        if window_strict_error_but_allowed is not None
+                        else float("nan")
+                    ),
+                    "window_ambiguous_prefix_rate": (
+                        float(window_ambiguous_prefix) if window_ambiguous_prefix is not None else float("nan")
+                    ),
+                    **audit_window_metrics,
+                }
+            )
+
+            if self.tracker is not None:
+                self.tracker.log_metric("drift_window_start_ts", float(start_ts), step=window_idx)
+                self.tracker.log_metric("drift_window_end_ts", float(end_ts), step=window_idx)
+
+            emit_progress_event(
+                stage="eval_drift.windows",
+                status="update",
+                message=f"Window {window_idx + 1}/{total_windows}",
+                current=int(window_idx + 1),
+                total=total_windows,
+                payload={
+                    "macro_f1": float(macro_f1),
+                    "strict_macro_f1": float(strict_macro_f1),
+                    "ece": float(ece),
+                    "target_in_mask_rate": float(window_target_in_mask) if window_target_in_mask is not None else None,
+                    "pred_in_mask_rate": float(window_pred_in_mask) if window_pred_in_mask is not None else None,
+                },
+            )
+
+        emit_progress_event(
+            stage="eval_drift.windows",
+            status="done",
+            message="Drift evaluation completed",
+            current=total_windows,
+            total=total_windows,
+        )
+        return drift_results
+
+    def _resolve_drift_window_record_indices(
+        self,
+        records: DriftInferenceRecords,
+        traces: Sequence[RawTrace],
+    ) -> List[Tuple[int, np.ndarray, float, float]]:
+        """Resolve trace windows to compact inference-record indexes."""
+        windows = self._generate_drift_windows(traces)
+        resolved: List[Tuple[int, np.ndarray, float, float]] = []
+        for start, window_traces in windows:
+            start_trace_idx = int(start)
+            end_trace_idx = int(start + len(window_traces) - 1)
+            idxs = np.where(
+                (records.trace_idx >= start_trace_idx)
+                & (records.trace_idx <= end_trace_idx)
+            )[0]
+            start_ts = float(window_traces[0].events[0].timestamp) if window_traces and window_traces[0].events else 0.0
+            end_ts = float(window_traces[-1].events[-1].timestamp) if window_traces and window_traces[-1].events else start_ts
+            resolved.append((int(start), idxs.astype(np.int64, copy=False), start_ts, end_ts))
+        return resolved
+
+    def _generate_drift_windows(self, traces: Sequence[RawTrace]) -> List[Tuple[int, List[RawTrace]]]:
+        """Generate chronological drift windows and drop short tail windows."""
+        ordered_traces = sorted((trace for trace in traces if trace.events), key=lambda trace: trace.events[0].timestamp)
+        size = self.drift_window_size
+        step = self._resolve_drift_step()
+
+        windows: List[Tuple[int, List[RawTrace]]] = []
+        for start in range(0, len(ordered_traces), step):
+            window = ordered_traces[start : start + size]
+            if len(window) < size:
+                continue
+            windows.append((start, window))
+        return windows
+
+    def _resolve_drift_step(self) -> int:
+        """Resolve drift step from sliding-window policy."""
+        if self.drift_window_sliding < 0:
+            raise ValueError("drift_window_sliding must be non-negative.")
+        return self.drift_window_sliding or self.drift_window_size
+
+    @staticmethod
+    def _compute_oos_flags(y_hat: torch.Tensor, allowed_target_mask: torch.Tensor) -> torch.Tensor:
+        """Return per-sample OOS flags (1.0 when predicted class is not allowed)."""
+        if y_hat.dim() != 1:
+            y_hat = y_hat.view(-1)
+        if allowed_target_mask.dim() != 2:
+            raise ValueError("allowed_target_mask must have shape [B, C].")
+        batch_size = y_hat.shape[0]
+        if allowed_target_mask.shape[0] != batch_size:
+            raise ValueError("allowed_target_mask batch dimension must match predictions.")
+        row_ids = torch.arange(batch_size, device=y_hat.device)
+        return (~allowed_target_mask[row_ids, y_hat]).float()
+
+    @staticmethod
+    def _normalize_allowed_mask(raw_mask: Any, *, expected_rows: int) -> Optional[torch.Tensor]:
+        if not isinstance(raw_mask, torch.Tensor):
+            return None
+        mask = raw_mask.bool()
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 2:
+            return None
+        if int(mask.shape[0]) != int(expected_rows):
+            return None
+        return mask
+
+    @staticmethod
+    def _batch_target_in_mask_rate(*, allowed_mask: Optional[torch.Tensor], targets: torch.Tensor) -> Tuple[Optional[float], int]:
+        if not isinstance(allowed_mask, torch.Tensor):
+            return None, 0
+        if allowed_mask.dim() != 2:
+            return None, 0
+        if targets.dim() != 1:
+            targets = targets.view(-1)
+        if int(allowed_mask.shape[0]) != int(targets.shape[0]):
+            return None, 0
+        row_ids = torch.arange(int(targets.shape[0]), device=targets.device)
+        target_in_mask = allowed_mask[row_ids, targets].bool()
+        sample_count = int(target_in_mask.shape[0])
+        if sample_count <= 0:
+            return None, 0
+        return float(target_in_mask.float().mean().item()), sample_count
+
+    def _update_mask_guided_reliability(self, *, rate: float, samples: int) -> None:
+        if samples <= 0:
+            return
+        if not math.isfinite(float(rate)):
+            return
+        samples_int = int(samples)
+        if samples_int <= 0:
+            return
+        if self._mask_guided_reliability_rate is None or self._mask_guided_reliability_samples <= 0:
+            self._mask_guided_reliability_rate = float(rate)
+            self._mask_guided_reliability_samples = samples_int
+            return
+        prev_samples = int(self._mask_guided_reliability_samples)
+        prev_rate = float(self._mask_guided_reliability_rate)
+        total_samples = prev_samples + samples_int
+        weighted = ((prev_rate * prev_samples) + (float(rate) * samples_int)) / float(total_samples)
+        self._mask_guided_reliability_rate = float(weighted)
+        self._mask_guided_reliability_samples = int(total_samples)
+
+    def _resolve_mask_guided_policy(
+        self,
+        *,
+        training: bool,
+        batch_target_in_mask_rate: Optional[float],
+        batch_samples: int,
+    ) -> str:
+        if not self.mask_guided_enabled:
+            effective_policy = "off"
+        elif self.mask_guided_policy in {"off", "soft", "hard"}:
+            if not training and not self.mask_guided_apply_in_eval:
+                effective_policy = "off"
+            else:
+                effective_policy = self.mask_guided_policy
+        elif training:
+            if batch_target_in_mask_rate is None:
+                effective_policy = "soft"
+            elif int(batch_samples) >= int(self.mask_guided_min_samples_for_hard) and float(batch_target_in_mask_rate) >= float(
+                self.mask_guided_hard_threshold
+            ):
+                effective_policy = "hard"
+            else:
+                effective_policy = "soft"
+        elif not self.mask_guided_apply_in_eval:
+            effective_policy = "off"
+        else:
+            rate = self._mask_guided_reliability_rate
+            samples = int(self._mask_guided_reliability_samples)
+            effective_policy = (
+                "hard"
+                if rate is not None
+                and samples >= int(self.mask_guided_min_samples_for_hard)
+                and float(rate) >= float(self.mask_guided_hard_threshold)
+                else "soft"
+            )
+        if training and self.mode == "eval_drift_finetune" and effective_policy == "hard":
+            return "soft"
+        return effective_policy
+
+    def _apply_mask_guided_logits(
+        self,
+        *,
+        logits: torch.Tensor,
+        allowed_mask: Optional[torch.Tensor],
+        policy: str,
+    ) -> torch.Tensor:
+        if policy == "off":
+            return logits
+        if not isinstance(allowed_mask, torch.Tensor):
+            return logits
+        if allowed_mask.dim() != 2 or logits.dim() != 2:
+            return logits
+        if int(allowed_mask.shape[0]) != int(logits.shape[0]) or int(allowed_mask.shape[1]) != int(logits.shape[1]):
+            return logits
+        row_has_allowed = allowed_mask.any(dim=1, keepdim=True)
+        effective_disallowed = (~allowed_mask) & row_has_allowed
+        if not bool(effective_disallowed.any().item()):
+            return logits
+        if policy == "hard":
+            hard_floor = torch.finfo(logits.dtype).min / 4.0
+            return logits.masked_fill(effective_disallowed, float(hard_floor))
+        penalty = max(0.0, float(self.mask_guided_soft_penalty))
+        if penalty <= 0.0:
+            return logits
+        return logits - (effective_disallowed.to(logits.dtype) * penalty)
+
+    @staticmethod
+    def _nanmean_or_none(values: Optional[np.ndarray]) -> Optional[float]:
+        if not isinstance(values, np.ndarray):
+            return None
+        if values.size == 0:
+            return None
+        finite_mask = np.isfinite(values)
+        if not bool(np.any(finite_mask)):
+            return None
+        return float(np.mean(values[finite_mask]))
+
+    @staticmethod
+    def _length_bin(length: int) -> str:
+        """Map prefix length to configured slicing bin."""
+        if 1 <= length <= 5:
+            return "len_1_5"
+        if 6 <= length <= 10:
+            return "len_6_10"
+        if 11 <= length <= 20:
+            return "len_11_20"
+        return "len_21_plus"
+
+    @staticmethod
+    def _safe_key_suffix(text: str) -> str:
+        """Normalize free-form labels into metric-safe suffixes."""
+        return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(text))
+
+    @classmethod
+    def _compute_sliced_metrics(
+        cls,
+        *,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        oos_flags: Optional[np.ndarray],
+        target_in_mask_flags: Optional[np.ndarray],
+        pred_in_mask_flags: Optional[np.ndarray],
+        strict_error_but_allowed_flags: Optional[np.ndarray],
+        mask_cardinality: Optional[np.ndarray],
+        prefix_lengths: Optional[np.ndarray],
+        versions: Optional[List[str]],
+        metric_prefix: str = "",
+        emit_mask_metrics: bool = True,
+    ) -> Dict[str, float]:
+        """Compute slicing metrics by prefix length bins and process versions."""
+        metrics: Dict[str, float] = {}
+        sample_count = int(y_true.shape[0])
+        prefix = str(metric_prefix or "")
+
+        def _append_mask_slice_metrics(metric_suffix: str, idxs: List[int]) -> None:
+            if not emit_mask_metrics:
+                return
+            if target_in_mask_flags is not None and int(target_in_mask_flags.shape[0]) == sample_count:
+                value = cls._nanmean_or_none(target_in_mask_flags[idxs])
+                if value is not None:
+                    metrics[f"{prefix}test_target_in_mask_rate_{metric_suffix}"] = value
+            if pred_in_mask_flags is not None and int(pred_in_mask_flags.shape[0]) == sample_count:
+                value = cls._nanmean_or_none(pred_in_mask_flags[idxs])
+                if value is not None:
+                    metrics[f"{prefix}test_pred_in_mask_rate_{metric_suffix}"] = value
+            if strict_error_but_allowed_flags is not None and int(strict_error_but_allowed_flags.shape[0]) == sample_count:
+                value = cls._nanmean_or_none(strict_error_but_allowed_flags[idxs])
+                if value is not None:
+                    metrics[f"{prefix}test_strict_error_but_allowed_rate_{metric_suffix}"] = value
+
+        if prefix_lengths is not None and int(prefix_lengths.shape[0]) == sample_count:
+            length_bins = ["len_1_5", "len_6_10", "len_11_20", "len_21_plus"]
+            grouped: Dict[str, List[int]] = {name: [] for name in length_bins}
+            for idx, raw_len in enumerate(prefix_lengths.tolist()):
+                grouped[cls._length_bin(int(raw_len))].append(idx)
+
+            for bin_name, idxs in grouped.items():
+                if not idxs:
+                    continue
+                bin_true = y_true[idxs]
+                bin_pred = y_pred[idxs]
+                metrics[f"{prefix}test_accuracy_{bin_name}"] = float(accuracy_score(bin_true, bin_pred))
+                metrics[f"{prefix}test_f1_{bin_name}"] = float(f1_score(bin_true, bin_pred, average="macro", zero_division=0))
+                if oos_flags is not None and int(oos_flags.shape[0]) == sample_count:
+                    value = cls._nanmean_or_none(oos_flags[idxs])
+                    if value is not None:
+                        metrics[f"{prefix}test_oos_{bin_name}"] = value
+                _append_mask_slice_metrics(bin_name, idxs)
+
+        if versions is not None and len(versions) == sample_count:
+            grouped_idx: Dict[str, List[int]] = {}
+            for idx, version in enumerate(versions):
+                grouped_idx.setdefault(str(version), []).append(idx)
+
+            for version, idxs in grouped_idx.items():
+                ver_true = y_true[idxs]
+                ver_pred = y_pred[idxs]
+                suffix = cls._safe_key_suffix(version)
+                metrics[f"{prefix}test_accuracy_{suffix}"] = float(accuracy_score(ver_true, ver_pred))
+                metrics[f"{prefix}test_f1_{suffix}"] = float(f1_score(ver_true, ver_pred, average="macro", zero_division=0))
+                if oos_flags is not None and int(oos_flags.shape[0]) == sample_count:
+                    value = cls._nanmean_or_none(oos_flags[idxs])
+                    if value is not None:
+                        metrics[f"{prefix}test_oos_{suffix}"] = value
+                _append_mask_slice_metrics(suffix, idxs)
+
+        if mask_cardinality is not None and int(mask_cardinality.shape[0]) == sample_count:
+            grouped_mask: Dict[str, List[int]] = {
+                "mask_card_1": [],
+                "mask_card_2": [],
+                "mask_card_3_plus": [],
+            }
+            for idx, raw in enumerate(mask_cardinality.tolist()):
+                if not math.isfinite(float(raw)):
+                    continue
+                cardinality = int(raw)
+                if cardinality == 1:
+                    grouped_mask["mask_card_1"].append(idx)
+                elif cardinality == 2:
+                    grouped_mask["mask_card_2"].append(idx)
+                elif cardinality >= 3:
+                    grouped_mask["mask_card_3_plus"].append(idx)
+
+            for group_name, idxs in grouped_mask.items():
+                if not idxs:
+                    continue
+                bin_true = y_true[idxs]
+                bin_pred = y_pred[idxs]
+                metrics[f"{prefix}test_accuracy_{group_name}"] = float(accuracy_score(bin_true, bin_pred))
+                metrics[f"{prefix}test_f1_{group_name}"] = float(f1_score(bin_true, bin_pred, average="macro", zero_division=0))
+                if oos_flags is not None and int(oos_flags.shape[0]) == sample_count:
+                    value = cls._nanmean_or_none(oos_flags[idxs])
+                    if value is not None:
+                        metrics[f"{prefix}test_oos_{group_name}"] = value
+                _append_mask_slice_metrics(group_name, idxs)
+
+        return metrics
+
+    def _expected_calibration_error(self, y_true: np.ndarray, y_prob: np.ndarray) -> float:
+        """Compute ECE over confidence bins for probabilistic calibration quality."""
+        confidences = np.max(y_prob, axis=1)
+        predictions = np.argmax(y_prob, axis=1)
+        correctness = (predictions == y_true).astype(float)
+        return self._expected_calibration_error_from_confidence(confidences, correctness)
+
+    def _expected_calibration_error_from_confidence(self, confidences: np.ndarray, correctness: np.ndarray) -> float:
+        """Compute ECE from compact confidence/correctness arrays."""
+        confidences = np.asarray(confidences, dtype=float)
+        correctness = np.asarray(correctness, dtype=float)
+        bin_edges = np.linspace(0.0, 1.0, self.num_ece_bins + 1)
+        ece = 0.0
+        total = int(confidences.shape[0])
+        if total <= 0:
+            return 0.0
+        for idx in range(self.num_ece_bins):
+            lower = bin_edges[idx]
+            upper = bin_edges[idx + 1]
+            in_bin = (confidences > lower) & (confidences <= upper)
+            count = int(np.sum(in_bin))
+            if count == 0:
+                continue
+            bin_acc = float(np.mean(correctness[in_bin]))
+            bin_conf = float(np.mean(confidences[in_bin]))
+            ece += abs(bin_acc - bin_conf) * (count / total)
+        return float(ece)
+
+    @staticmethod
+    def _safe_iso_to_epoch(value: Any) -> float | None:
+        """Parse ISO timestamp into epoch seconds for tensor payload compatibility."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return float(parsed.timestamp())
+
+    @staticmethod
+    def _epoch_to_iso(epoch: float) -> str | None:
+        """Render epoch seconds to UTC ISO string with timezone for logging output."""
+        try:
+            return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    @staticmethod
+    def _new_forward_stats_accumulator() -> Dict[str, Any]:
+        return {
+            "batches": 0,
+            "graphs": 0,
+            "batches_with_struct_x": 0,
+            "batches_with_struct_edges": 0,
+            "batches_with_snapshot_meta": 0,
+            "stats_allowed_true": 0,
+            "stats_allowed_false": 0,
+            "stats_missing_asof_true": 0,
+            "stats_missing_asof_false": 0,
+            "batches_with_missing_asof": 0,
+            "struct_feature_dims": set(),
+            "struct_node_rows": set(),
+            "struct_edge_counts": [],
+            "snapshot_versions": set(),
+            "snapshot_as_of_ts": set(),
+            "topology_projection_aligned_true": 0,
+            "topology_projection_aligned_false": 0,
+            "topology_projection_skipped_edges": 0,
+            "topology_projection_missing_vocab": 0,
+            "topology_projection_duplicate_labels": 0,
+            "topology_projection_missing_node_metadata": 0,
+            "topology_projection_projected_edges": [],
+            "topology_projection_source_paths": [],
+            "observed_logits_abs_sum": 0.0,
+            "observed_logits_count": 0,
+            "structural_logits_abs_sum": 0.0,
+            "structural_logits_abs_max": 0.0,
+            "structural_logits_count": 0,
+            "structural_aux_set_loss_sum": 0.0,
+            "structural_aux_exact_loss_sum": 0.0,
+            "structural_aux_total_loss_sum": 0.0,
+            "structural_aux_loss_batches": 0,
+            "topology_state_prefix_mean_abs_sum": 0.0,
+            "topology_state_prefix_max_abs": 0.0,
+            "topology_state_entropy_sum": 0.0,
+            "topology_state_mean_class_cardinality_sum": 0.0,
+            "topology_state_max_class_cardinality": 0.0,
+            "topology_state_gate_mean_sum": 0.0,
+            "topology_state_gate_max": 0.0,
+            "topology_state_diag_batches": 0,
+            "topology_graph_context_abs_sum": 0.0,
+            "topology_graph_context_abs_max": 0.0,
+            "topology_graph_context_count": 0,
+            "topology_graph_logits_abs_sum": 0.0,
+            "topology_graph_logits_count": 0,
+            "topology_graph_entropy_sum": 0.0,
+            "topology_graph_diag_batches": 0,
+            "observed_context_abs_sum": 0.0,
+            "observed_context_count": 0,
+            "structural_prior_context_abs_sum": 0.0,
+            "structural_prior_context_count": 0,
+            "structural_prior_gate_sum": 0.0,
+            "structural_prior_gate_count": 0,
+            "structural_prior_gate_max": 0.0,
+            "struct_xattn_context_mean_abs_sum": 0.0,
+            "struct_xattn_delta_mean_abs_sum": 0.0,
+            "struct_xattn_to_observed_ratio_sum": 0.0,
+            "struct_xattn_attention_entropy_sum": 0.0,
+            "struct_xattn_scale_sum": 0.0,
+            "struct_xattn_gate_mean_sum": 0.0,
+            "struct_xattn_l1_delta_mean_abs_sum": 0.0,
+            "struct_xattn_l2_delta_mean_abs_sum": 0.0,
+            "struct_xattn_l1_attention_entropy_sum": 0.0,
+            "struct_xattn_l2_attention_entropy_sum": 0.0,
+            "struct_xattn_diag_batches": 0,
+            "struct_xattn_correct_ce_sum": 0.0,
+            "struct_xattn_corrupt_ce_sum": 0.0,
+            "struct_xattn_correct_vs_corrupt_ce_delta_sum": 0.0,
+            "struct_xattn_contrastive_loss_sum": 0.0,
+            "struct_xattn_prediction_flip_rate_sum": 0.0,
+            "struct_xattn_contrastive_batches": 0,
+            "topology_conditioned_allowed_set_loss_sum": 0.0,
+            "topology_conditioned_allowed_set_batches": 0,
+            "topology_conditioned_retention_loss_sum": 0.0,
+            "topology_conditioned_retention_batches": 0,
+            "topology_conditioned_drop_edges_ce_sum": 0.0,
+            "topology_conditioned_drop_edges_delta_sum": 0.0,
+            "topology_conditioned_drop_edges_loss_sum": 0.0,
+            "topology_conditioned_drop_edges_batches": 0,
+            "topology_conditioned_wrong_version_ce_sum": 0.0,
+            "topology_conditioned_wrong_version_delta_sum": 0.0,
+            "topology_conditioned_wrong_version_loss_sum": 0.0,
+            "topology_conditioned_wrong_version_batches": 0,
+            "topology_conditioned_mixed_version_batches": 0,
+            "topology_conditioned_wrong_version_skipped_mixed_batches": 0,
+            "topology_conditioned_wrong_version_skipped_candidate_id_batches": 0,
+            "topology_conditioned_drop_edges_skipped_candidate_id_batches": 0,
+            "candidate_diag_batches": 0,
+            "candidate_node_score_mean_abs_sum": 0.0,
+            "candidate_class_score_mean_abs_sum": 0.0,
+            "duplicate_candidate_count_max": 0.0,
+            "candidate_temperature_sum": 0.0,
+            "candidate_prediction_entropy_sum": 0.0,
+            "candidate_target_score_sum": 0.0,
+            "candidate_pred_score_sum": 0.0,
+            "candidate_score_gap_sum": 0.0,
+            "candidate_dynamic_count_sum": 0.0,
+            "process_state_mask_active_candidate_count_sum": 0.0,
+            "process_state_mask_relaxed_candidate_count_sum": 0.0,
+            "process_state_mask_diag_batches": 0,
+        }
+
+    @staticmethod
+    def _effective_top_k(num_classes: int, *, requested_k: int = 3) -> int:
+        """Return top-k that is meaningful for the available class count."""
+        classes = max(1, int(num_classes))
+        if classes <= 2:
+            return 1
+        return max(1, min(int(requested_k), classes - 1))
+
+    def _accumulate_forward_stats(self, bucket: Dict[str, Any], contract: GraphTensorContract) -> None:
+        bucket["batches"] = int(bucket.get("batches", 0)) + 1
+
+        graph_count = 0
+        batch_tensor = contract.get("batch")
+        if isinstance(batch_tensor, torch.Tensor) and batch_tensor.numel() > 0:
+            graph_count = int(batch_tensor.max().item()) + 1
+        elif isinstance(contract.get("y"), torch.Tensor):
+            graph_count = int(contract["y"].view(-1).shape[0])
+        bucket["graphs"] = int(bucket.get("graphs", 0)) + max(graph_count, 0)
+
+        struct_x = contract.get("struct_x")
+        if isinstance(struct_x, torch.Tensor) and struct_x.numel() > 0:
+            bucket["batches_with_struct_x"] = int(bucket.get("batches_with_struct_x", 0)) + 1
+            dims = struct_x.dim()
+            rows = int(struct_x.size(0)) if dims >= 1 else 0
+            features = int(struct_x.size(1)) if dims >= 2 else 1
+            bucket.setdefault("struct_feature_dims", set()).add(features)
+            bucket.setdefault("struct_node_rows", set()).add(rows)
+
+        structural_edge_index = contract.get("structural_edge_index")
+        if isinstance(structural_edge_index, torch.Tensor):
+            edge_count = int(structural_edge_index.size(1)) if structural_edge_index.dim() >= 2 else 0
+            bucket.setdefault("struct_edge_counts", []).append(edge_count)
+            if structural_edge_index.numel() > 0:
+                bucket["batches_with_struct_edges"] = int(bucket.get("batches_with_struct_edges", 0)) + 1
+
+        active_count = contract.get("process_state_mask_active_candidate_count")
+        relaxed_count = contract.get("process_state_mask_relaxed_candidate_count")
+        has_process_state_diag = False
+        if isinstance(active_count, torch.Tensor) and active_count.numel() > 0:
+            bucket["process_state_mask_active_candidate_count_sum"] = float(
+                bucket.get("process_state_mask_active_candidate_count_sum", 0.0)
+            ) + float(active_count.float().mean().item())
+            has_process_state_diag = True
+        if isinstance(relaxed_count, torch.Tensor) and relaxed_count.numel() > 0:
+            bucket["process_state_mask_relaxed_candidate_count_sum"] = float(
+                bucket.get("process_state_mask_relaxed_candidate_count_sum", 0.0)
+            ) + float(relaxed_count.float().mean().item())
+            has_process_state_diag = True
+        if has_process_state_diag:
+            bucket["process_state_mask_diag_batches"] = int(bucket.get("process_state_mask_diag_batches", 0)) + 1
+
+        versions = contract.get("stats_snapshot_versions")
+        if isinstance(versions, list):
+            if versions:
+                bucket["batches_with_snapshot_meta"] = int(bucket.get("batches_with_snapshot_meta", 0)) + 1
+            for value in versions:
+                text = str(value).strip()
+                if text:
+                    bucket.setdefault("snapshot_versions", set()).add(text)
+        else:
+            single_version = contract.get("stats_snapshot_version")
+            if single_version is not None:
+                text = str(single_version).strip()
+                if text:
+                    bucket.setdefault("snapshot_versions", set()).add(text)
+
+        as_of_values = contract.get("stats_snapshot_as_of_ts_batch")
+        if isinstance(as_of_values, list):
+            for value in as_of_values:
+                text = str(value).strip()
+                if text:
+                    bucket.setdefault("snapshot_as_of_ts", set()).add(text)
+        else:
+            single_as_of = contract.get("stats_snapshot_as_of_ts")
+            if single_as_of is not None:
+                text = str(single_as_of).strip()
+                if text:
+                    bucket.setdefault("snapshot_as_of_ts", set()).add(text)
+
+        stats_allowed_batch = contract.get("stats_allowed_batch")
+        if isinstance(stats_allowed_batch, list):
+            for raw in stats_allowed_batch:
+                if bool(raw):
+                    bucket["stats_allowed_true"] = int(bucket.get("stats_allowed_true", 0)) + 1
+                else:
+                    bucket["stats_allowed_false"] = int(bucket.get("stats_allowed_false", 0)) + 1
+        else:
+            single_stats_allowed = contract.get("stats_allowed")
+            if single_stats_allowed is not None:
+                if bool(single_stats_allowed):
+                    bucket["stats_allowed_true"] = int(bucket.get("stats_allowed_true", 0)) + 1
+                else:
+                    bucket["stats_allowed_false"] = int(bucket.get("stats_allowed_false", 0)) + 1
+
+        stats_missing_batch = contract.get("stats_missing_asof_snapshot_batch")
+        if isinstance(stats_missing_batch, list):
+            had_missing = False
+            for raw in stats_missing_batch:
+                if bool(raw):
+                    bucket["stats_missing_asof_true"] = int(bucket.get("stats_missing_asof_true", 0)) + 1
+                    had_missing = True
+                else:
+                    bucket["stats_missing_asof_false"] = int(bucket.get("stats_missing_asof_false", 0)) + 1
+            if had_missing:
+                bucket["batches_with_missing_asof"] = int(bucket.get("batches_with_missing_asof", 0)) + 1
+        else:
+            single_stats_missing = contract.get("stats_missing_asof_snapshot")
+            if single_stats_missing is not None:
+                if bool(single_stats_missing):
+                    bucket["stats_missing_asof_true"] = int(bucket.get("stats_missing_asof_true", 0)) + 1
+                    bucket["batches_with_missing_asof"] = int(bucket.get("batches_with_missing_asof", 0)) + 1
+                else:
+                    bucket["stats_missing_asof_false"] = int(bucket.get("stats_missing_asof_false", 0)) + 1
+
+        projection_aligned_batch = contract.get("topology_projection_aligned_batch")
+        if isinstance(projection_aligned_batch, list):
+            for raw in projection_aligned_batch:
+                if bool(raw):
+                    bucket["topology_projection_aligned_true"] = int(bucket.get("topology_projection_aligned_true", 0)) + 1
+                else:
+                    bucket["topology_projection_aligned_false"] = int(bucket.get("topology_projection_aligned_false", 0)) + 1
+        elif contract.get("topology_projection_aligned") is not None:
+            if bool(contract.get("topology_projection_aligned")):
+                bucket["topology_projection_aligned_true"] = int(bucket.get("topology_projection_aligned_true", 0)) + 1
+            else:
+                bucket["topology_projection_aligned_false"] = int(bucket.get("topology_projection_aligned_false", 0)) + 1
+
+        for contract_key, bucket_key in (
+            ("topology_projection_skipped_edge_count_batch", "topology_projection_skipped_edges"),
+            ("topology_projection_missing_vocab_count_batch", "topology_projection_missing_vocab"),
+            ("topology_projection_duplicate_label_count_batch", "topology_projection_duplicate_labels"),
+            ("topology_projection_missing_node_metadata_batch", "topology_projection_missing_node_metadata"),
+        ):
+            values = contract.get(contract_key)
+            if isinstance(values, list):
+                bucket[bucket_key] = int(bucket.get(bucket_key, 0)) + sum(int(item) for item in values)
+                continue
+            scalar_key = contract_key.removesuffix("_batch")
+            scalar_value = contract.get(scalar_key)
+            if isinstance(scalar_value, (int, bool)) and not isinstance(scalar_value, float):
+                bucket[bucket_key] = int(bucket.get(bucket_key, 0)) + int(scalar_value)
+
+        for contract_key, bucket_key in (
+            ("topology_projection_projected_edge_count_batch", "topology_projection_projected_edges"),
+            ("topology_projection_source_path_count_batch", "topology_projection_source_paths"),
+        ):
+            values = contract.get(contract_key)
+            if isinstance(values, list):
+                bucket.setdefault(bucket_key, []).extend(int(item) for item in values)
+                continue
+            scalar_key = contract_key.removesuffix("_batch")
+            scalar_value = contract.get(scalar_key)
+            if isinstance(scalar_value, int) and not isinstance(scalar_value, bool):
+                bucket.setdefault(bucket_key, []).append(int(scalar_value))
+
+    def _accumulate_logit_contribution_stats(self, bucket: Dict[str, Any]) -> None:
+        observed_logits = getattr(self.model, "last_observed_logits", None)
+        structural_logits = getattr(self.model, "last_structural_class_logits", None)
+        if not isinstance(observed_logits, torch.Tensor) or not isinstance(structural_logits, torch.Tensor):
+            return
+        if observed_logits.numel() <= 0 or structural_logits.numel() <= 0:
+            return
+
+        observed_abs = torch.abs(
+            torch.nan_to_num(observed_logits.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6)
+        )
+        structural_abs = torch.abs(
+            torch.nan_to_num(structural_logits.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6)
+        )
+        bucket["observed_logits_abs_sum"] = float(bucket.get("observed_logits_abs_sum", 0.0)) + float(
+            observed_abs.sum().item()
+        )
+        bucket["observed_logits_count"] = int(bucket.get("observed_logits_count", 0)) + int(observed_abs.numel())
+        bucket["structural_logits_abs_sum"] = float(bucket.get("structural_logits_abs_sum", 0.0)) + float(
+            structural_abs.sum().item()
+        )
+        bucket["structural_logits_count"] = int(bucket.get("structural_logits_count", 0)) + int(structural_abs.numel())
+        bucket["structural_logits_abs_max"] = max(
+            float(bucket.get("structural_logits_abs_max", 0.0)),
+            float(structural_abs.max().item()),
+        )
+
+    @staticmethod
+    def _parameter_grad_norm_groups(model: nn.Module) -> Dict[str, float]:
+        sums = {"observed": 0.0, "struct_xattn": 0.0, "structural": 0.0}
+        for name, parameter in model.named_parameters():
+            grad = getattr(parameter, "grad", None)
+            if grad is None:
+                continue
+            norm_sq = float(torch.sum(torch.nan_to_num(grad.detach().float(), nan=0.0, posinf=0.0, neginf=0.0) ** 2).item())
+            lower_name = str(name).lower()
+            if "struct_xattn" in lower_name:
+                sums["struct_xattn"] += norm_sq
+            elif "struct" in lower_name or "topology" in lower_name:
+                sums["structural"] += norm_sq
+            else:
+                sums["observed"] += norm_sq
+        return {key: math.sqrt(value) for key, value in sums.items()}
+
+    @staticmethod
+    def _diagnostic_scalar(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            scalar = float(value)
+            return scalar if math.isfinite(scalar) else None
+        if not isinstance(value, torch.Tensor):
+            return None
+        if value.numel() <= 0:
+            return None
+        scalar = float(torch.nan_to_num(value.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6).mean().item())
+        if not math.isfinite(scalar):
+            return None
+        return scalar
+
+    def _accumulate_topology_state_stats(self, bucket: Dict[str, Any]) -> None:
+        diagnostics = {
+            "prefix_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_prefix_mean_abs", None)
+            ),
+            "prefix_max_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_prefix_max_abs", None)
+            ),
+            "entropy": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_entropy", None)
+            ),
+            "mean_class_cardinality": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_mean_class_cardinality", None)
+            ),
+            "max_class_cardinality": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_max_class_cardinality", None)
+            ),
+            "gate_mean": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_gate_mean", None)
+            ),
+            "gate_max": self._diagnostic_scalar(
+                getattr(self.model, "last_topology_state_gate_max", None)
+            ),
+        }
+        if not any(value is not None for value in diagnostics.values()):
+            return
+        bucket["topology_state_diag_batches"] = int(bucket.get("topology_state_diag_batches", 0)) + 1
+        if diagnostics["prefix_mean_abs"] is not None:
+            bucket["topology_state_prefix_mean_abs_sum"] = float(
+                bucket.get("topology_state_prefix_mean_abs_sum", 0.0)
+            ) + float(diagnostics["prefix_mean_abs"])
+        if diagnostics["prefix_max_abs"] is not None:
+            bucket["topology_state_prefix_max_abs"] = max(
+                float(bucket.get("topology_state_prefix_max_abs", 0.0)),
+                float(diagnostics["prefix_max_abs"]),
+            )
+        if diagnostics["entropy"] is not None:
+            bucket["topology_state_entropy_sum"] = float(bucket.get("topology_state_entropy_sum", 0.0)) + float(
+                diagnostics["entropy"]
+            )
+        if diagnostics["mean_class_cardinality"] is not None:
+            bucket["topology_state_mean_class_cardinality_sum"] = float(
+                bucket.get("topology_state_mean_class_cardinality_sum", 0.0)
+            ) + float(diagnostics["mean_class_cardinality"])
+        if diagnostics["max_class_cardinality"] is not None:
+            bucket["topology_state_max_class_cardinality"] = max(
+                float(bucket.get("topology_state_max_class_cardinality", 0.0)),
+                float(diagnostics["max_class_cardinality"]),
+            )
+        if diagnostics["gate_mean"] is not None:
+            bucket["topology_state_gate_mean_sum"] = float(bucket.get("topology_state_gate_mean_sum", 0.0)) + float(
+                diagnostics["gate_mean"]
+            )
+        if diagnostics["gate_max"] is not None:
+            bucket["topology_state_gate_max"] = max(
+                float(bucket.get("topology_state_gate_max", 0.0)),
+                float(diagnostics["gate_max"]),
+            )
+
+    def _accumulate_topology_conditioned_candidate_stats(self, bucket: Dict[str, Any]) -> None:
+        diagnostics = {
+            "node_score_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_candidate_node_score_mean_abs", None)
+            ),
+            "class_score_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_candidate_class_score_mean_abs", None)
+            ),
+            "duplicate_count_max": self._diagnostic_scalar(
+                getattr(self.model, "last_duplicate_candidate_count_max", None)
+            ),
+            "temperature": self._diagnostic_scalar(getattr(self.model, "last_candidate_temperature", None)),
+            "prediction_entropy": self._diagnostic_scalar(
+                getattr(self.model, "last_candidate_prediction_entropy", None)
+            ),
+            "target_score": self._diagnostic_scalar(getattr(self.model, "last_candidate_target_score", None)),
+            "pred_score": self._diagnostic_scalar(getattr(self.model, "last_candidate_pred_score", None)),
+            "score_gap": self._diagnostic_scalar(getattr(self.model, "last_candidate_score_gap", None)),
+            "dynamic_count": self._diagnostic_scalar(getattr(self.model, "last_candidate_dynamic_count", None)),
+            "impulse_activation_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_impulse_activation_mean_abs", None)
+            ),
+            "impulse_activation_max_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_impulse_activation_max_abs", None)
+            ),
+            "impulse_to_base_node_ratio": self._diagnostic_scalar(
+                getattr(self.model, "last_impulse_to_base_node_ratio", None)
+            ),
+            "impulse_gnn_oversmoothing_ratio": self._diagnostic_scalar(
+                getattr(self.model, "last_impulse_gnn_oversmoothing_ratio", None)
+            ),
+            "unseen_score_mean": self._diagnostic_scalar(
+                getattr(self.model, "last_candidate_unseen_score_mean", None)
+            ),
+            "seen_score_mean": self._diagnostic_scalar(getattr(self.model, "last_candidate_seen_score_mean", None)),
+            "seen_unseen_score_gap": self._diagnostic_scalar(
+                getattr(self.model, "last_candidate_seen_unseen_score_gap", None)
+            ),
+        }
+        if not any(value is not None for value in diagnostics.values()):
+            return
+
+        bucket["candidate_diag_batches"] = int(bucket.get("candidate_diag_batches", 0)) + 1
+        for name in (
+            "node_score_mean_abs",
+            "class_score_mean_abs",
+            "temperature",
+            "prediction_entropy",
+            "target_score",
+            "pred_score",
+            "score_gap",
+            "dynamic_count",
+            "impulse_activation_mean_abs",
+            "impulse_activation_max_abs",
+            "impulse_to_base_node_ratio",
+            "impulse_gnn_oversmoothing_ratio",
+            "unseen_score_mean",
+            "seen_score_mean",
+            "seen_unseen_score_gap",
+        ):
+            value = diagnostics[name]
+            if value is None:
+                continue
+            bucket[f"candidate_{name}_sum"] = float(bucket.get(f"candidate_{name}_sum", 0.0)) + float(value)
+
+        duplicate_count_max = diagnostics["duplicate_count_max"]
+        if duplicate_count_max is not None:
+            bucket["duplicate_candidate_count_max"] = max(
+                float(bucket.get("duplicate_candidate_count_max", 0.0)),
+                float(duplicate_count_max),
+            )
+
+        candidate_is_unseen = getattr(self.model, "last_candidate_is_unseen", None)
+        if isinstance(candidate_is_unseen, (list, tuple)) and len(candidate_is_unseen) > 0:
+            unseen_rate = float(sum(1 for u in candidate_is_unseen if u)) / float(len(candidate_is_unseen))
+            bucket["candidate_unseen_candidate_rate_sum"] = float(
+                bucket.get("candidate_unseen_candidate_rate_sum", 0.0)
+            ) + unseen_rate
+
+    def _accumulate_topology_graph_stats(self, bucket: Dict[str, Any]) -> None:
+        context = getattr(self.model, "last_topology_graph_context", None)
+        logits = getattr(self.model, "last_topology_graph_logits", None)
+        entropy = self._diagnostic_scalar(getattr(self.model, "last_topology_graph_entropy", None))
+        if not isinstance(context, torch.Tensor) and not isinstance(logits, torch.Tensor) and entropy is None:
+            return
+        bucket["topology_graph_diag_batches"] = int(bucket.get("topology_graph_diag_batches", 0)) + 1
+        if isinstance(context, torch.Tensor):
+            safe_context = torch.abs(
+                torch.nan_to_num(context.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6)
+            )
+            bucket["topology_graph_context_abs_sum"] = float(
+                bucket.get("topology_graph_context_abs_sum", 0.0)
+            ) + float(safe_context.sum().item())
+            bucket["topology_graph_context_count"] = int(bucket.get("topology_graph_context_count", 0)) + int(
+                safe_context.numel()
+            )
+            bucket["topology_graph_context_abs_max"] = max(
+                float(bucket.get("topology_graph_context_abs_max", 0.0)),
+                float(safe_context.max().item()),
+            )
+        if isinstance(logits, torch.Tensor):
+            safe_logits = torch.abs(
+                torch.nan_to_num(logits.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6)
+            )
+            bucket["topology_graph_logits_abs_sum"] = float(
+                bucket.get("topology_graph_logits_abs_sum", 0.0)
+            ) + float(safe_logits.sum().item())
+            bucket["topology_graph_logits_count"] = int(bucket.get("topology_graph_logits_count", 0)) + int(
+                safe_logits.numel()
+            )
+        if entropy is not None:
+            bucket["topology_graph_entropy_sum"] = float(
+                bucket.get("topology_graph_entropy_sum", 0.0)
+            ) + float(entropy)
+
+    def _accumulate_structural_prior_stats(self, bucket: Dict[str, Any]) -> None:
+        observed_context = getattr(self.model, "last_observed_context", None)
+        struct_context = getattr(self.model, "last_structural_prior_context", None)
+        gate = getattr(self.model, "last_structural_prior_gate", None)
+        if isinstance(observed_context, torch.Tensor) and isinstance(struct_context, torch.Tensor):
+            observed_abs = torch.abs(
+                torch.nan_to_num(observed_context.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6)
+            )
+            struct_abs = torch.abs(
+                torch.nan_to_num(struct_context.detach().float(), nan=0.0, posinf=1e6, neginf=-1e6)
+            )
+            bucket["observed_context_abs_sum"] = float(bucket.get("observed_context_abs_sum", 0.0)) + float(
+                observed_abs.sum().item()
+            )
+            bucket["observed_context_count"] = int(bucket.get("observed_context_count", 0)) + int(
+                observed_abs.numel()
+            )
+            bucket["structural_prior_context_abs_sum"] = float(
+                bucket.get("structural_prior_context_abs_sum", 0.0)
+            ) + float(struct_abs.sum().item())
+            bucket["structural_prior_context_count"] = int(
+                bucket.get("structural_prior_context_count", 0)
+            ) + int(struct_abs.numel())
+        if isinstance(gate, torch.Tensor):
+            gate_safe = torch.nan_to_num(gate.detach().float(), nan=0.0, posinf=1.0, neginf=0.0)
+            bucket["structural_prior_gate_sum"] = float(bucket.get("structural_prior_gate_sum", 0.0)) + float(
+                gate_safe.sum().item()
+            )
+            bucket["structural_prior_gate_count"] = int(bucket.get("structural_prior_gate_count", 0)) + int(
+                gate_safe.numel()
+            )
+            bucket["structural_prior_gate_max"] = max(
+                float(bucket.get("structural_prior_gate_max", 0.0)),
+                float(gate_safe.max().item()),
+            )
+
+    def _accumulate_struct_xattn_stats(self, bucket: Dict[str, Any]) -> None:
+        diagnostics = {
+            "context_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_context_mean_abs", None)
+            ),
+            "delta_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_delta_mean_abs", None)
+            ),
+            "to_observed_ratio": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_to_observed_ratio", None)
+            ),
+            "attention_entropy": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_attention_entropy", None)
+            ),
+            "scale": self._diagnostic_scalar(getattr(self.model, "last_struct_xattn_scale", None)),
+            "gate_mean": self._diagnostic_scalar(getattr(self.model, "last_struct_xattn_gate_mean", None)),
+            "raw_context_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_raw_context_mean_abs", None)
+            ),
+            "pre_norm_delta_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_pre_norm_delta_mean_abs", None)
+            ),
+            "post_norm_delta_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_post_norm_delta_mean_abs", None)
+            ),
+            "raw_to_observed_ratio": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_raw_to_observed_ratio", None)
+            ),
+            "pre_norm_to_observed_ratio": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_pre_norm_to_observed_ratio", None)
+            ),
+            "post_norm_to_observed_ratio": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_post_norm_to_observed_ratio", None)
+            ),
+            "l1_delta_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_l1_delta_mean_abs", None)
+            ),
+            "l2_delta_mean_abs": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_l2_delta_mean_abs", None)
+            ),
+            "l1_attention_entropy": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_l1_attention_entropy", None)
+            ),
+            "l2_attention_entropy": self._diagnostic_scalar(
+                getattr(self.model, "last_struct_xattn_l2_attention_entropy", None)
+            ),
+        }
+        if not any(value is not None for value in diagnostics.values()):
+            return
+        bucket["struct_xattn_diag_batches"] = int(bucket.get("struct_xattn_diag_batches", 0)) + 1
+        for name, value in diagnostics.items():
+            if value is None:
+                continue
+            bucket[f"struct_xattn_{name}_sum"] = float(bucket.get(f"struct_xattn_{name}_sum", 0.0)) + float(value)
+
+    @staticmethod
+    def _format_unique_values(values: set[Any], limit: int = 3) -> str:
+        if not values:
+            return "none"
+        ordered = [str(item) for item in sorted(values, key=lambda item: str(item))]
+        if len(ordered) <= limit:
+            return ",".join(ordered)
+        head = ",".join(ordered[:limit])
+        return f"{head},...(+{len(ordered) - limit})"
+
+    def _log_forward_stats_summary(self, stage_label: str, bucket: Dict[str, Any]) -> None:
+        batches = int(bucket.get("batches", 0))
+        if batches <= 0:
+            logger.info("Forward stats [%s]: no batches.", stage_label)
+            return
+
+        struct_edge_counts = [int(item) for item in bucket.get("struct_edge_counts", [])]
+        if struct_edge_counts:
+            edge_min = min(struct_edge_counts)
+            edge_max = max(struct_edge_counts)
+            edge_avg = float(sum(struct_edge_counts) / len(struct_edge_counts))
+        else:
+            edge_min = 0
+            edge_max = 0
+            edge_avg = 0.0
+
+        versions = bucket.get("snapshot_versions", set())
+        as_of_values = bucket.get("snapshot_as_of_ts", set())
+        feature_dims = bucket.get("struct_feature_dims", set())
+        struct_rows = bucket.get("struct_node_rows", set())
+        stats_allowed_true = int(bucket.get("stats_allowed_true", 0))
+        stats_allowed_false = int(bucket.get("stats_allowed_false", 0))
+        stats_missing_asof_true = int(bucket.get("stats_missing_asof_true", 0))
+        stats_missing_asof_false = int(bucket.get("stats_missing_asof_false", 0))
+        batches_with_missing_asof = int(bucket.get("batches_with_missing_asof", 0))
+        snapshot_meta_batches = int(bucket.get("batches_with_snapshot_meta", 0))
+        topology_projection_aligned_true = int(bucket.get("topology_projection_aligned_true", 0))
+        topology_projection_aligned_false = int(bucket.get("topology_projection_aligned_false", 0))
+        topology_projection_projected_edges = [int(item) for item in bucket.get("topology_projection_projected_edges", [])]
+        topology_projection_source_paths = [int(item) for item in bucket.get("topology_projection_source_paths", [])]
+        projected_avg = (
+            float(sum(topology_projection_projected_edges) / len(topology_projection_projected_edges))
+            if topology_projection_projected_edges
+            else 0.0
+        )
+        source_paths_avg = (
+            float(sum(topology_projection_source_paths) / len(topology_projection_source_paths))
+            if topology_projection_source_paths
+            else 0.0
+        )
+        observed_logits_count = int(bucket.get("observed_logits_count", 0))
+        structural_logits_count = int(bucket.get("structural_logits_count", 0))
+        observed_logits_mean_abs = (
+            float(bucket.get("observed_logits_abs_sum", 0.0)) / float(observed_logits_count)
+            if observed_logits_count > 0
+            else 0.0
+        )
+        structural_logits_mean_abs = (
+            float(bucket.get("structural_logits_abs_sum", 0.0)) / float(structural_logits_count)
+            if structural_logits_count > 0
+            else 0.0
+        )
+        structural_logits_max_abs = float(bucket.get("structural_logits_abs_max", 0.0))
+        structural_to_observed_logit_ratio = structural_logits_mean_abs / max(observed_logits_mean_abs, 1e-12)
+        structural_aux_loss_batches = int(bucket.get("structural_aux_loss_batches", 0))
+        structural_aux_set_loss = (
+            float(bucket.get("structural_aux_set_loss_sum", 0.0)) / float(structural_aux_loss_batches)
+            if structural_aux_loss_batches > 0
+            else 0.0
+        )
+        structural_aux_exact_loss = (
+            float(bucket.get("structural_aux_exact_loss_sum", 0.0)) / float(structural_aux_loss_batches)
+            if structural_aux_loss_batches > 0
+            else 0.0
+        )
+        structural_aux_total_loss = (
+            float(bucket.get("structural_aux_total_loss_sum", 0.0)) / float(structural_aux_loss_batches)
+            if structural_aux_loss_batches > 0
+            else 0.0
+        )
+        topology_state_diag_batches = int(bucket.get("topology_state_diag_batches", 0))
+        topology_state_prefix_mean_abs = (
+            float(bucket.get("topology_state_prefix_mean_abs_sum", 0.0)) / float(topology_state_diag_batches)
+            if topology_state_diag_batches > 0
+            else 0.0
+        )
+        topology_state_prefix_max_abs = float(bucket.get("topology_state_prefix_max_abs", 0.0))
+        topology_state_entropy = (
+            float(bucket.get("topology_state_entropy_sum", 0.0)) / float(topology_state_diag_batches)
+            if topology_state_diag_batches > 0
+            else 0.0
+        )
+        topology_state_mean_class_cardinality = (
+            float(bucket.get("topology_state_mean_class_cardinality_sum", 0.0)) / float(topology_state_diag_batches)
+            if topology_state_diag_batches > 0
+            else 0.0
+        )
+        topology_state_max_class_cardinality = float(bucket.get("topology_state_max_class_cardinality", 0.0))
+        topology_state_gate_mean = (
+            float(bucket.get("topology_state_gate_mean_sum", 0.0)) / float(topology_state_diag_batches)
+            if topology_state_diag_batches > 0
+            else 0.0
+        )
+        topology_state_gate_max = float(bucket.get("topology_state_gate_max", 0.0))
+        topology_graph_context_count = int(bucket.get("topology_graph_context_count", 0))
+        topology_graph_logits_count = int(bucket.get("topology_graph_logits_count", 0))
+        topology_graph_diag_batches = int(bucket.get("topology_graph_diag_batches", 0))
+        topology_graph_context_mean_abs = (
+            float(bucket.get("topology_graph_context_abs_sum", 0.0)) / float(topology_graph_context_count)
+            if topology_graph_context_count > 0
+            else 0.0
+        )
+        topology_graph_context_max_abs = float(bucket.get("topology_graph_context_abs_max", 0.0))
+        topology_graph_logits_mean_abs = (
+            float(bucket.get("topology_graph_logits_abs_sum", 0.0)) / float(topology_graph_logits_count)
+            if topology_graph_logits_count > 0
+            else 0.0
+        )
+        topology_graph_entropy = (
+            float(bucket.get("topology_graph_entropy_sum", 0.0)) / float(topology_graph_diag_batches)
+            if topology_graph_diag_batches > 0
+            else 0.0
+        )
+        observed_context_count = int(bucket.get("observed_context_count", 0))
+        structural_prior_context_count = int(bucket.get("structural_prior_context_count", 0))
+        observed_context_mean_abs = (
+            float(bucket.get("observed_context_abs_sum", 0.0)) / float(observed_context_count)
+            if observed_context_count > 0
+            else 0.0
+        )
+        structural_prior_context_mean_abs = (
+            float(bucket.get("structural_prior_context_abs_sum", 0.0)) / float(structural_prior_context_count)
+            if structural_prior_context_count > 0
+            else 0.0
+        )
+        structural_prior_to_observed_context_ratio = structural_prior_context_mean_abs / max(
+            observed_context_mean_abs,
+            1e-12,
+        )
+        structural_prior_gate_count = int(bucket.get("structural_prior_gate_count", 0))
+        structural_prior_gate_mean = (
+            float(bucket.get("structural_prior_gate_sum", 0.0)) / float(structural_prior_gate_count)
+            if structural_prior_gate_count > 0
+            else 0.0
+        )
+        structural_prior_gate_max = float(bucket.get("structural_prior_gate_max", 0.0))
+        struct_xattn_diag_batches = int(bucket.get("struct_xattn_diag_batches", 0))
+        struct_xattn_context_mean_abs = (
+            float(bucket.get("struct_xattn_context_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_delta_mean_abs = (
+            float(bucket.get("struct_xattn_delta_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_to_observed_ratio = (
+            float(bucket.get("struct_xattn_to_observed_ratio_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_attention_entropy = (
+            float(bucket.get("struct_xattn_attention_entropy_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_scale = (
+            float(bucket.get("struct_xattn_scale_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_gate_mean = (
+            float(bucket.get("struct_xattn_gate_mean_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_raw_context_mean_abs = (
+            float(bucket.get("struct_xattn_raw_context_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_pre_norm_delta_mean_abs = (
+            float(bucket.get("struct_xattn_pre_norm_delta_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_post_norm_delta_mean_abs = (
+            float(bucket.get("struct_xattn_post_norm_delta_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_raw_to_observed_ratio = (
+            float(bucket.get("struct_xattn_raw_to_observed_ratio_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_pre_norm_to_observed_ratio = (
+            float(bucket.get("struct_xattn_pre_norm_to_observed_ratio_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_post_norm_to_observed_ratio = (
+            float(bucket.get("struct_xattn_post_norm_to_observed_ratio_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_l1_delta_mean_abs = (
+            float(bucket.get("struct_xattn_l1_delta_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_l2_delta_mean_abs = (
+            float(bucket.get("struct_xattn_l2_delta_mean_abs_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_l1_attention_entropy = (
+            float(bucket.get("struct_xattn_l1_attention_entropy_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_l2_attention_entropy = (
+            float(bucket.get("struct_xattn_l2_attention_entropy_sum", 0.0)) / float(struct_xattn_diag_batches)
+            if struct_xattn_diag_batches > 0
+            else 0.0
+        )
+        struct_xattn_contrastive_batches = int(bucket.get("struct_xattn_contrastive_batches", 0))
+        struct_xattn_correct_ce = (
+            float(bucket.get("struct_xattn_correct_ce_sum", 0.0)) / float(struct_xattn_contrastive_batches)
+            if struct_xattn_contrastive_batches > 0
+            else 0.0
+        )
+        struct_xattn_corrupt_ce = (
+            float(bucket.get("struct_xattn_corrupt_ce_sum", 0.0)) / float(struct_xattn_contrastive_batches)
+            if struct_xattn_contrastive_batches > 0
+            else 0.0
+        )
+        struct_xattn_correct_vs_corrupt_ce_delta = (
+            float(bucket.get("struct_xattn_correct_vs_corrupt_ce_delta_sum", 0.0))
+            / float(struct_xattn_contrastive_batches)
+            if struct_xattn_contrastive_batches > 0
+            else 0.0
+        )
+        struct_xattn_contrastive_loss = (
+            float(bucket.get("struct_xattn_contrastive_loss_sum", 0.0)) / float(struct_xattn_contrastive_batches)
+            if struct_xattn_contrastive_batches > 0
+            else 0.0
+        )
+        struct_xattn_prediction_flip_rate = (
+            float(bucket.get("struct_xattn_prediction_flip_rate_sum", 0.0))
+            / float(struct_xattn_contrastive_batches)
+            if struct_xattn_contrastive_batches > 0
+            else 0.0
+        )
+        struct_xattn_contrastive_margin_violation_rate = (
+            float(bucket.get("struct_xattn_contrastive_margin_violations", 0)) / float(struct_xattn_contrastive_batches)
+            if struct_xattn_contrastive_batches > 0
+            else 0.0
+        )
+        allowed_set_mass_leakage_batches = int(bucket.get("allowed_set_mass_leakage_batches", 0))
+        allowed_set_mass_leakage_value = (
+            float(bucket.get("allowed_set_mass_leakage_sum", 0.0)) / float(allowed_set_mass_leakage_batches)
+            if allowed_set_mass_leakage_batches > 0
+            else 0.0
+        )
+        grad_norm_batches = int(bucket.get("grad_norm_batches", 0))
+        grad_norm_observed = (
+            float(bucket.get("grad_norm_observed_sum", 0.0)) / float(grad_norm_batches)
+            if grad_norm_batches > 0
+            else 0.0
+        )
+        grad_norm_struct_xattn = (
+            float(bucket.get("grad_norm_struct_xattn_sum", 0.0)) / float(grad_norm_batches)
+            if grad_norm_batches > 0
+            else 0.0
+        )
+        grad_norm_structural = (
+            float(bucket.get("grad_norm_structural_sum", 0.0)) / float(grad_norm_batches)
+            if grad_norm_batches > 0
+            else 0.0
+        )
+        candidate_diag_batches = int(bucket.get("candidate_diag_batches", 0))
+
+        def _candidate_average(name: str) -> float:
+            if candidate_diag_batches <= 0:
+                return 0.0
+            return float(bucket.get(f"candidate_{name}_sum", 0.0)) / float(candidate_diag_batches)
+
+        candidate_node_score_mean_abs = _candidate_average("node_score_mean_abs")
+        candidate_class_score_mean_abs = _candidate_average("class_score_mean_abs")
+        duplicate_candidate_count_max = float(bucket.get("duplicate_candidate_count_max", 0.0))
+        candidate_temperature = _candidate_average("temperature")
+        candidate_prediction_entropy = _candidate_average("prediction_entropy")
+        candidate_target_score = _candidate_average("target_score")
+        candidate_pred_score = _candidate_average("pred_score")
+        candidate_score_gap = _candidate_average("score_gap")
+        candidate_dynamic_count = _candidate_average("dynamic_count")
+        candidate_unseen_candidate_rate = _candidate_average("unseen_candidate_rate")
+        impulse_activation_mean_abs = _candidate_average("impulse_activation_mean_abs")
+        impulse_activation_max_abs = _candidate_average("impulse_activation_max_abs")
+        impulse_to_base_node_ratio = _candidate_average("impulse_to_base_node_ratio")
+        impulse_gnn_oversmoothing_ratio = _candidate_average("impulse_gnn_oversmoothing_ratio")
+        candidate_unseen_score_mean = _candidate_average("unseen_score_mean")
+        candidate_seen_score_mean = _candidate_average("seen_score_mean")
+        candidate_seen_unseen_score_gap = _candidate_average("seen_unseen_score_gap")
+        candidate_target_mapping_batches = int(bucket.get("candidate_target_mapping_batches", 0))
+
+        def _candidate_target_average(name: str) -> float:
+            if candidate_target_mapping_batches <= 0:
+                return 0.0
+            return float(bucket.get(f"candidate_{name}_sum", 0.0)) / float(candidate_target_mapping_batches)
+
+        candidate_target_in_candidate_set_rate = _candidate_target_average("target_in_candidate_set_rate")
+        candidate_missing_target_rate = _candidate_target_average("missing_target_rate")
+        candidate_target_duplicate_count_max = _candidate_target_average("target_duplicate_count_max")
+        candidate_target_set_logit_variance_mean = _candidate_target_average("target_set_logit_variance_mean")
+        candidate_target_set_entropy_mean = _candidate_target_average("target_set_entropy_mean")
+        candidate_unseen_target_rate = _candidate_target_average("unseen_target_rate")
+        candidate_flow_batches = int(bucket.get("candidate_flow_batches", 0))
+
+        def _candidate_flow_average(name: str) -> float:
+            if candidate_flow_batches <= 0:
+                return 0.0
+            return float(bucket.get(f"{name}_sum", 0.0)) / float(candidate_flow_batches)
+
+        candidate_oos_rate = _candidate_flow_average("candidate_oos_rate")
+        candidate_invalid_probability_mass = _candidate_flow_average("candidate_invalid_probability_mass")
+        candidate_valid_probability_mass = _candidate_flow_average("candidate_valid_probability_mass")
+        candidate_valid_invalid_logit_margin = _candidate_flow_average("candidate_valid_invalid_logit_margin")
+        process_state_mask_diag_batches = int(bucket.get("process_state_mask_diag_batches", 0))
+        process_state_mask_active_candidate_count = (
+            float(bucket.get("process_state_mask_active_candidate_count_sum", 0.0))
+            / float(process_state_mask_diag_batches)
+            if process_state_mask_diag_batches > 0
+            else 0.0
+        )
+        process_state_mask_relaxed_candidate_count = (
+            float(bucket.get("process_state_mask_relaxed_candidate_count_sum", 0.0))
+            / float(process_state_mask_diag_batches)
+            if process_state_mask_diag_batches > 0
+            else 0.0
+        )
+
+        logger.info(
+            "Forward stats [%s]: batches=%d graphs=%d struct_x_batches=%d struct_edge_batches=%d "
+            "snapshot_meta_batches=%d stats_allowed[true/false]=%d/%d "
+            "missing_asof_snapshot_batches=%d missing_asof_snapshot[true/false]=%d/%d "
+            "struct_feature_dims=%s struct_rows=%s edge_count[min/avg/max]=%d/%.2f/%d "
+            "snapshot_versions=%s snapshot_as_of_ts=%s "
+            "topology_projection_aligned[true/false]=%d/%d "
+            "topology_projection_projected_edges_avg=%.2f topology_projection_source_paths_avg=%.2f "
+            "topology_projection_skipped_edges=%d topology_projection_missing_vocab=%d "
+            "topology_projection_duplicate_labels=%d topology_projection_missing_node_metadata=%d "
+            "observed_logits_mean_abs=%.6f structural_logits_mean_abs=%.6f "
+            "structural_logits_max_abs=%.6f structural_to_observed_logit_ratio=%.6f "
+            "structural_aux_set_loss=%.6f structural_aux_exact_loss=%.6f structural_aux_total_loss=%.6f "
+            "topology_state_prefix_mean_abs=%.6f topology_state_prefix_max_abs=%.6f "
+            "topology_state_entropy=%.6f topology_state_mean_class_cardinality=%.6f "
+            "topology_state_max_class_cardinality=%.6f topology_state_gate_mean=%.6f "
+            "topology_state_gate_max=%.6f "
+            "topology_graph_context_mean_abs=%.6f topology_graph_context_max_abs=%.6f "
+            "topology_graph_logits_mean_abs=%.6f topology_graph_entropy=%.6f "
+            "observed_context_mean_abs=%.6f structural_prior_context_mean_abs=%.6f "
+            "structural_prior_to_observed_context_ratio=%.6f "
+            "structural_prior_gate_mean=%.6f structural_prior_gate_max=%.6f "
+            "struct_xattn_context_mean_abs=%.6f struct_xattn_delta_mean_abs=%.6f "
+            "struct_xattn_to_observed_ratio=%.6f struct_xattn_attention_entropy=%.6f "
+            "struct_xattn_scale=%.6f struct_xattn_gate_mean=%.6f "
+            "struct_xattn_l1_delta_mean_abs=%.6f struct_xattn_l2_delta_mean_abs=%.6f "
+            "struct_xattn_l1_attention_entropy=%.6f struct_xattn_l2_attention_entropy=%.6f "
+            "struct_xattn_correct_ce=%.6f struct_xattn_corrupt_ce=%.6f "
+            "struct_xattn_correct_vs_corrupt_ce_delta=%.6f "
+            "struct_xattn_contrastive_loss=%.6f struct_xattn_prediction_flip_rate=%.6f "
+            "candidate_node_score_mean_abs=%.6f candidate_class_score_mean_abs=%.6f "
+            "duplicate_candidate_count_max=%.6f candidate_temperature=%.6f "
+            "candidate_prediction_entropy=%.6f candidate_target_score=%.6f "
+            "candidate_pred_score=%.6f candidate_score_gap=%.6f "
+            "candidate_dynamic_count=%.6f "
+            "candidate_unseen_candidate_rate=%.6f "
+            "impulse_activation_mean_abs=%.6f impulse_activation_max_abs=%.6f "
+            "impulse_to_base_node_ratio=%.6f impulse_gnn_oversmoothing_ratio=%.6f "
+            "candidate_unseen_score_mean=%.6f candidate_seen_score_mean=%.6f "
+            "candidate_seen_unseen_score_gap=%.6f "
+            "candidate_target_in_candidate_set_rate=%.6f candidate_missing_target_rate=%.6f "
+            "candidate_target_duplicate_count_max=%.6f candidate_target_set_logit_variance_mean=%.6f "
+            "candidate_target_set_entropy_mean=%.6f "
+            "candidate_unseen_target_rate=%.6f "
+            "candidate_oos_rate=%.6f candidate_invalid_probability_mass=%.6f "
+            "candidate_valid_probability_mass=%.6f candidate_valid_invalid_logit_margin=%.6f "
+            "process_state_mask_active_candidate_count=%.6f "
+            "process_state_mask_relaxed_candidate_count=%.6f",
+            stage_label,
+            batches,
+            int(bucket.get("graphs", 0)),
+            int(bucket.get("batches_with_struct_x", 0)),
+            int(bucket.get("batches_with_struct_edges", 0)),
+            snapshot_meta_batches,
+            stats_allowed_true,
+            stats_allowed_false,
+            batches_with_missing_asof,
+            stats_missing_asof_true,
+            stats_missing_asof_false,
+            self._format_unique_values(set(feature_dims)),
+            self._format_unique_values(set(struct_rows)),
+            edge_min,
+            edge_avg,
+            edge_max,
+            self._format_unique_values(set(versions)),
+            self._format_unique_values(set(as_of_values)),
+            topology_projection_aligned_true,
+            topology_projection_aligned_false,
+            projected_avg,
+            source_paths_avg,
+            int(bucket.get("topology_projection_skipped_edges", 0)),
+            int(bucket.get("topology_projection_missing_vocab", 0)),
+            int(bucket.get("topology_projection_duplicate_labels", 0)),
+            int(bucket.get("topology_projection_missing_node_metadata", 0)),
+            observed_logits_mean_abs,
+            structural_logits_mean_abs,
+            structural_logits_max_abs,
+            structural_to_observed_logit_ratio,
+            structural_aux_set_loss,
+            structural_aux_exact_loss,
+            structural_aux_total_loss,
+            topology_state_prefix_mean_abs,
+            topology_state_prefix_max_abs,
+            topology_state_entropy,
+            topology_state_mean_class_cardinality,
+            topology_state_max_class_cardinality,
+            topology_state_gate_mean,
+            topology_state_gate_max,
+            topology_graph_context_mean_abs,
+            topology_graph_context_max_abs,
+            topology_graph_logits_mean_abs,
+            topology_graph_entropy,
+            observed_context_mean_abs,
+            structural_prior_context_mean_abs,
+            structural_prior_to_observed_context_ratio,
+            structural_prior_gate_mean,
+            structural_prior_gate_max,
+            struct_xattn_context_mean_abs,
+            struct_xattn_delta_mean_abs,
+            struct_xattn_to_observed_ratio,
+            struct_xattn_attention_entropy,
+            struct_xattn_scale,
+            struct_xattn_gate_mean,
+            struct_xattn_l1_delta_mean_abs,
+            struct_xattn_l2_delta_mean_abs,
+            struct_xattn_l1_attention_entropy,
+            struct_xattn_l2_attention_entropy,
+            struct_xattn_correct_ce,
+            struct_xattn_corrupt_ce,
+            struct_xattn_correct_vs_corrupt_ce_delta,
+            struct_xattn_contrastive_loss,
+            struct_xattn_prediction_flip_rate,
+            candidate_node_score_mean_abs,
+            candidate_class_score_mean_abs,
+            duplicate_candidate_count_max,
+            candidate_temperature,
+            candidate_prediction_entropy,
+            candidate_target_score,
+            candidate_pred_score,
+            candidate_score_gap,
+            candidate_dynamic_count,
+            candidate_unseen_candidate_rate,
+            impulse_activation_mean_abs,
+            impulse_activation_max_abs,
+            impulse_to_base_node_ratio,
+            impulse_gnn_oversmoothing_ratio,
+            candidate_unseen_score_mean,
+            candidate_seen_score_mean,
+            candidate_seen_unseen_score_gap,
+            candidate_target_in_candidate_set_rate,
+            candidate_missing_target_rate,
+            candidate_target_duplicate_count_max,
+            candidate_target_set_logit_variance_mean,
+            candidate_target_set_entropy_mean,
+            candidate_unseen_target_rate,
+            candidate_oos_rate,
+            candidate_invalid_probability_mass,
+            candidate_valid_probability_mass,
+            candidate_valid_invalid_logit_margin,
+            process_state_mask_active_candidate_count,
+            process_state_mask_relaxed_candidate_count,
+        )
+        metric_prefix = "drift_window" if str(stage_label) == "eval_drift" else str(stage_label).replace(".", "_")
+        if self.tracker is not None and structural_logits_count > 0 and observed_logits_count > 0:
+            self.tracker.log_metric(f"{metric_prefix}_observed_logits_mean_abs", observed_logits_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_structural_logits_mean_abs", structural_logits_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_structural_logits_max_abs", structural_logits_max_abs)
+            self.tracker.log_metric(
+                f"{metric_prefix}_structural_to_observed_logit_ratio",
+                structural_to_observed_logit_ratio,
+            )
+        if self.tracker is not None and structural_aux_loss_batches > 0:
+            self.tracker.log_metric(f"{metric_prefix}_structural_aux_set_loss", structural_aux_set_loss)
+            self.tracker.log_metric(f"{metric_prefix}_structural_aux_exact_loss", structural_aux_exact_loss)
+            self.tracker.log_metric(f"{metric_prefix}_structural_aux_total_loss", structural_aux_total_loss)
+        if self.tracker is not None and topology_state_diag_batches > 0:
+            self.tracker.log_metric(f"{metric_prefix}_topology_state_prefix_mean_abs", topology_state_prefix_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_topology_state_prefix_max_abs", topology_state_prefix_max_abs)
+            self.tracker.log_metric(f"{metric_prefix}_topology_state_entropy", topology_state_entropy)
+            self.tracker.log_metric(
+                f"{metric_prefix}_topology_state_mean_class_cardinality",
+                topology_state_mean_class_cardinality,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_topology_state_max_class_cardinality",
+                topology_state_max_class_cardinality,
+            )
+            self.tracker.log_metric(f"{metric_prefix}_topology_state_gate_mean", topology_state_gate_mean)
+            self.tracker.log_metric(f"{metric_prefix}_topology_state_gate_max", topology_state_gate_max)
+        if self.tracker is not None and topology_graph_diag_batches > 0:
+            self.tracker.log_metric(
+                f"{metric_prefix}_topology_graph_context_mean_abs",
+                topology_graph_context_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_topology_graph_context_max_abs",
+                topology_graph_context_max_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_topology_graph_logits_mean_abs",
+                topology_graph_logits_mean_abs,
+            )
+            self.tracker.log_metric(f"{metric_prefix}_topology_graph_entropy", topology_graph_entropy)
+        if self.tracker is not None and observed_context_count > 0 and structural_prior_context_count > 0:
+            self.tracker.log_metric(f"{metric_prefix}_observed_context_mean_abs", observed_context_mean_abs)
+            self.tracker.log_metric(
+                f"{metric_prefix}_structural_prior_context_mean_abs",
+                structural_prior_context_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_structural_prior_to_observed_context_ratio",
+                structural_prior_to_observed_context_ratio,
+            )
+            if structural_prior_gate_count > 0:
+                self.tracker.log_metric(f"{metric_prefix}_structural_prior_gate_mean", structural_prior_gate_mean)
+                self.tracker.log_metric(f"{metric_prefix}_structural_prior_gate_max", structural_prior_gate_max)
+        if self.tracker is not None and struct_xattn_diag_batches > 0:
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_context_mean_abs", struct_xattn_context_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_delta_mean_abs", struct_xattn_delta_mean_abs)
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_raw_context_mean_abs",
+                struct_xattn_raw_context_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_pre_norm_delta_mean_abs",
+                struct_xattn_pre_norm_delta_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_post_norm_delta_mean_abs",
+                struct_xattn_post_norm_delta_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_to_observed_ratio",
+                struct_xattn_to_observed_ratio,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_raw_to_observed_ratio",
+                struct_xattn_raw_to_observed_ratio,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_pre_norm_to_observed_ratio",
+                struct_xattn_pre_norm_to_observed_ratio,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_post_norm_to_observed_ratio",
+                struct_xattn_post_norm_to_observed_ratio,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_attention_entropy",
+                struct_xattn_attention_entropy,
+            )
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_scale", struct_xattn_scale)
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_gate_mean", struct_xattn_gate_mean)
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_l1_delta_mean_abs",
+                struct_xattn_l1_delta_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_l2_delta_mean_abs",
+                struct_xattn_l2_delta_mean_abs,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_l1_attention_entropy",
+                struct_xattn_l1_attention_entropy,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_l2_attention_entropy",
+                struct_xattn_l2_attention_entropy,
+            )
+        if self.tracker is not None and struct_xattn_contrastive_batches > 0:
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_correct_ce", struct_xattn_correct_ce)
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_corrupt_ce", struct_xattn_corrupt_ce)
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_correct_vs_corrupt_ce_delta",
+                struct_xattn_correct_vs_corrupt_ce_delta,
+            )
+            self.tracker.log_metric(f"{metric_prefix}_struct_xattn_contrastive_loss", struct_xattn_contrastive_loss)
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_prediction_flip_rate",
+                struct_xattn_prediction_flip_rate,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_struct_xattn_contrastive_margin_violation_rate",
+                struct_xattn_contrastive_margin_violation_rate,
+            )
+        if self.tracker is not None and candidate_diag_batches > 0:
+            self.tracker.log_metric(f"{metric_prefix}_candidate_node_score_mean_abs", candidate_node_score_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_class_score_mean_abs", candidate_class_score_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_duplicate_candidate_count_max", duplicate_candidate_count_max)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_temperature", candidate_temperature)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_prediction_entropy", candidate_prediction_entropy)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_target_score", candidate_target_score)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_pred_score", candidate_pred_score)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_score_gap", candidate_score_gap)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_dynamic_count", candidate_dynamic_count)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_unseen_candidate_rate", candidate_unseen_candidate_rate)
+            self.tracker.log_metric(f"{metric_prefix}_impulse_activation_mean_abs", impulse_activation_mean_abs)
+            self.tracker.log_metric(f"{metric_prefix}_impulse_activation_max_abs", impulse_activation_max_abs)
+            self.tracker.log_metric(f"{metric_prefix}_impulse_to_base_node_ratio", impulse_to_base_node_ratio)
+            self.tracker.log_metric(
+                f"{metric_prefix}_impulse_gnn_oversmoothing_ratio",
+                impulse_gnn_oversmoothing_ratio,
+            )
+            self.tracker.log_metric(f"{metric_prefix}_candidate_unseen_score_mean", candidate_unseen_score_mean)
+            self.tracker.log_metric(f"{metric_prefix}_candidate_seen_score_mean", candidate_seen_score_mean)
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_seen_unseen_score_gap",
+                candidate_seen_unseen_score_gap,
+            )
+        if self.tracker is not None and candidate_target_mapping_batches > 0:
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_target_in_candidate_set_rate",
+                candidate_target_in_candidate_set_rate,
+            )
+            self.tracker.log_metric(f"{metric_prefix}_candidate_missing_target_rate", candidate_missing_target_rate)
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_target_duplicate_count_max",
+                candidate_target_duplicate_count_max,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_target_set_logit_variance_mean",
+                candidate_target_set_logit_variance_mean,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_target_set_entropy_mean",
+                candidate_target_set_entropy_mean,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_unseen_target_rate",
+                candidate_unseen_target_rate,
+            )
+        if self.tracker is not None and candidate_flow_batches > 0:
+            self.tracker.log_metric(f"{metric_prefix}_candidate_oos_rate", candidate_oos_rate)
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_invalid_probability_mass",
+                candidate_invalid_probability_mass,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_valid_probability_mass",
+                candidate_valid_probability_mass,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_candidate_valid_invalid_logit_margin",
+                candidate_valid_invalid_logit_margin,
+            )
+        if self.tracker is not None and process_state_mask_diag_batches > 0:
+            self.tracker.log_metric(
+                f"{metric_prefix}_process_state_mask_active_candidate_count",
+                process_state_mask_active_candidate_count,
+            )
+            self.tracker.log_metric(
+                f"{metric_prefix}_process_state_mask_relaxed_candidate_count",
+                process_state_mask_relaxed_candidate_count,
+            )
+        if self.tracker is not None:
+            if allowed_set_mass_leakage_batches > 0:
+                self.tracker.log_metric(f"{metric_prefix}_allowed_set_mass_leakage", allowed_set_mass_leakage_value)
+            if grad_norm_batches > 0:
+                self.tracker.log_metric(f"{metric_prefix}_grad_norm_observed", grad_norm_observed)
+                self.tracker.log_metric(f"{metric_prefix}_grad_norm_struct_xattn", grad_norm_struct_xattn)
+                self.tracker.log_metric(f"{metric_prefix}_grad_norm_structural", grad_norm_structural)
+            allowed_batches = int(bucket.get("topology_conditioned_allowed_set_batches", 0))
+            if allowed_batches > 0:
+                self.tracker.log_metric(
+                    f"{metric_prefix}_topology_conditioned_allowed_set_loss",
+                    float(bucket.get("topology_conditioned_allowed_set_loss_sum", 0.0)) / float(allowed_batches),
+                )
+            retention_batches = int(bucket.get("topology_conditioned_retention_batches", 0))
+            if retention_batches > 0:
+                self.tracker.log_metric(
+                    f"{metric_prefix}_topology_conditioned_retention_loss",
+                    float(bucket.get("topology_conditioned_retention_loss_sum", 0.0)) / float(retention_batches),
+                )
+            for name in ("drop_edges", "wrong_version", "topology_flow_penalty"):
+                count = int(bucket.get(f"topology_conditioned_{name}_batches", 0))
+                if count <= 0:
+                    continue
+                if f"topology_conditioned_{name}_ce_sum" in bucket:
+                    self.tracker.log_metric(
+                        f"{metric_prefix}_topology_conditioned_{name}_ce",
+                        float(bucket.get(f"topology_conditioned_{name}_ce_sum", 0.0)) / float(count),
+                    )
+                if f"topology_conditioned_{name}_delta_sum" in bucket:
+                    self.tracker.log_metric(
+                        f"{metric_prefix}_topology_conditioned_{name}_ce_delta",
+                        float(bucket.get(f"topology_conditioned_{name}_delta_sum", 0.0)) / float(count),
+                    )
+                self.tracker.log_metric(
+                    f"{metric_prefix}_topology_conditioned_{name}_loss",
+                    float(bucket.get(f"topology_conditioned_{name}_loss_sum", 0.0)) / float(count),
+                )
+                if f"topology_conditioned_{name}_margin_violations" in bucket:
+                    self.tracker.log_metric(
+                        f"{metric_prefix}_topology_conditioned_{name}_margin_violation_rate",
+                        float(bucket.get(f"topology_conditioned_{name}_margin_violations", 0)) / float(count),
+                    )
+            mixed_batches = int(bucket.get("topology_conditioned_mixed_version_batches", 0))
+            skipped_mixed = int(bucket.get("topology_conditioned_wrong_version_skipped_mixed_batches", 0))
+            skipped_wrong_candidate_id = int(
+                bucket.get("topology_conditioned_wrong_version_skipped_candidate_id_batches", 0)
+            )
+            skipped_drop_candidate_id = int(
+                bucket.get("topology_conditioned_drop_edges_skipped_candidate_id_batches", 0)
+            )
+            if mixed_batches > 0:
+                self.tracker.log_metric(f"{metric_prefix}_topology_conditioned_mixed_version_batches", mixed_batches)
+            if skipped_mixed > 0:
+                self.tracker.log_metric(
+                    f"{metric_prefix}_topology_conditioned_wrong_version_skipped_mixed_batches",
+                    skipped_mixed,
+                )
+            if skipped_wrong_candidate_id > 0:
+                self.tracker.log_metric(
+                    f"{metric_prefix}_topology_conditioned_wrong_version_skipped_candidate_id_batches",
+                    skipped_wrong_candidate_id,
+                )
+            if skipped_drop_candidate_id > 0:
+                self.tracker.log_metric(
+                    f"{metric_prefix}_topology_conditioned_drop_edges_skipped_candidate_id_batches",
+                    skipped_drop_candidate_id,
+                )
+
+    def _maybe_record_prediction_traces(
+        self,
+        *,
+        stage_label: str,
+        contract: GraphTensorContract,
+        logits: torch.Tensor,
+        effective_logits: torch.Tensor,
+        probs: torch.Tensor,
+        targets: torch.Tensor,
+        predictions: torch.Tensor,
+        allowed_mask: torch.Tensor | None,
+        global_offset: int,
+    ) -> None:
+        if self.trace_recorder is None or not bool(self.trace_policy.enabled):
+            return
+        if probs.dim() != 2 or targets.numel() <= 0 or predictions.numel() <= 0:
+            return
+        batch_size = int(min(probs.size(0), targets.view(-1).size(0), predictions.view(-1).size(0)))
+        version_labels = contract.get("process_version_labels")
+        if not isinstance(version_labels, list):
+            version_labels = ["__unknown__"] * batch_size
+        normalized_mask = allowed_mask
+        if isinstance(normalized_mask, torch.Tensor) and normalized_mask.dim() == 1:
+            normalized_mask = normalized_mask.unsqueeze(0)
+
+        for row in range(batch_size):
+            version = str(version_labels[row]) if row < len(version_labels) else "__unknown__"
+            target_idx = int(targets.view(-1)[row].detach().cpu().item())
+            pred_idx = int(predictions.view(-1)[row].detach().cpu().item())
+            confidence = float(probs[row, pred_idx].detach().float().cpu().item())
+            target_in_mask: bool | None = None
+            pred_in_mask: bool | None = None
+            if isinstance(normalized_mask, torch.Tensor) and normalized_mask.numel() > 0:
+                mask_row = normalized_mask[row if normalized_mask.size(0) > row else 0].detach().bool().cpu()
+                if target_idx < int(mask_row.numel()):
+                    target_in_mask = bool(mask_row[target_idx].item())
+                if pred_idx < int(mask_row.numel()):
+                    pred_in_mask = bool(mask_row[pred_idx].item())
+            reason = classify_trace_reason(
+                strict_correct=bool(target_idx == pred_idx),
+                pred_in_mask=pred_in_mask,
+                target_in_mask=target_in_mask,
+                confidence=confidence,
+                version_seen=self.trace_policy.version_seen(version),
+                high_confidence_threshold=self.trace_policy.high_confidence_threshold,
+                low_confidence_threshold=self.trace_policy.low_confidence_threshold,
+            )
+            if not self.trace_policy.should_record(stage=stage_label, version=version, reason=reason):
+                continue
+            started = perf_counter()
+            event = build_structural_prediction_trace_event(
+                stage=stage_label,
+                global_index=int(global_offset + row),
+                contract=contract,
+                logits=logits,
+                effective_logits=effective_logits,
+                probs=probs,
+                targets=targets,
+                predictions=predictions,
+                model=self.model,
+                reverse_activity_vocab=self._reverse_activity_vocab,
+                row_index=row,
+                reason=str(reason or "random"),
+                top_k=int(self.trace_policy.top_k),
+            )
+            self.trace_recorder.record(event)
+            self._trace_events_recorded += 1
+            self._trace_record_time_ms_total += float((perf_counter() - started) * 1000.0)
+
+    def _log_trace_overhead_metrics(self) -> None:
+        if self.tracker is None or self._trace_events_recorded <= 0:
+            return
+        total_ms = float(self._trace_record_time_ms_total)
+        count = int(self._trace_events_recorded)
+        self.tracker.log_metric("tracing_events_recorded", float(count))
+        self.tracker.log_metric("tracing_record_time_ms_total", total_ms)
+        self.tracker.log_metric("tracing_record_time_ms_per_event", total_ms / max(float(count), 1.0))
+
+    def _warn_if_mixed_snapshot_versions(self, data: Data) -> None:
+        snapshot_version_idx = getattr(data, "stats_snapshot_version_idx", None)
+        if not isinstance(snapshot_version_idx, torch.Tensor):
+            return
+        raw = snapshot_version_idx.view(-1).long().cpu().tolist()
+        if not raw:
+            return
+        unique_idx = tuple(sorted({int(item) for item in raw}))
+        if len(unique_idx) <= 1:
+            return
+        if unique_idx in self._warned_mixed_snapshot_batches:
+            return
+        self._warned_mixed_snapshot_batches.add(unique_idx)
+        labels = [self._idx_to_stats_snapshot_version.get(item, f"k{item:06d}") for item in unique_idx]
+        warnings.warn(
+            "Mixed stats snapshots in one batch detected: "
+            f"{','.join(labels)}. Using first graph snapshot for structural tensors.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    @staticmethod
+    def _tensor_values_as_int_tuple(value: Any) -> tuple[int, ...]:
+        if isinstance(value, torch.Tensor):
+            return tuple(int(item) for item in value.view(-1).long().cpu().tolist())
+        if isinstance(value, (list, tuple)):
+            result: list[int] = []
+            for item in value:
+                try:
+                    result.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return tuple(result)
+        return ()
+
+    def _candidate_batch_topology_identities(self, data: Data) -> tuple[str, ...]:
+        versions = self._tensor_values_as_int_tuple(getattr(data, "process_version_idx", None))
+        snapshots = self._tensor_values_as_int_tuple(getattr(data, "stats_snapshot_version_idx", None))
+        if not versions:
+            return ()
+        if snapshots and len(snapshots) == len(versions):
+            return tuple(
+                f"version:{version}|snapshot:{snapshot}"
+                for version, snapshot in zip(versions, snapshots)
+            )
+        return tuple(f"version:{version}|snapshot:__none__" for version in versions)
+
+    def _guard_candidate_batch_topology(self, data: Data, contract: GraphTensorContract) -> None:
+        if self.candidate_contract_mode != "candidate_id":
+            return
+        identities = self._candidate_batch_topology_identities(data)
+        if not identities:
+            raise ValueError(
+                "candidate_contract_mode=candidate_id requires process_version_idx in each batch "
+                "to verify topology homogeneity."
+            )
+        unique = tuple(sorted(set(identities)))
+        contract["batch_topology_unique_count"] = int(len(unique))  # type: ignore[typeddict-unknown-key]
+        contract["batch_topology_identities"] = list(unique)  # type: ignore[typeddict-unknown-key]
+        if self.candidate_batch_topology_policy == "single_topology_required" and len(unique) > 1:
+            raise ValueError(
+                "candidate_contract_mode=candidate_id received a mixed topology batch; "
+                f"unique_topology_identities={list(unique)}. Use topology-homogeneous batching "
+                "or implement candidate_batch_topology_policy=group_by_topology."
+            )
+
+    @staticmethod
+    def _slice_first(tensor: torch.Tensor | None, key: str, slice_dict: dict | None, dim: int = 0) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        if not isinstance(tensor, torch.Tensor):
+            return tensor
+        if slice_dict is not None and key in slice_dict:
+            slices = slice_dict[key]
+            if isinstance(slices, torch.Tensor) and slices.numel() > 1:
+                end_idx = int(slices[1].item())
+                if dim == 0:
+                    return tensor[:end_idx]
+                elif dim == 1:
+                    return tensor[:, :end_idx]
+        return tensor
+
+    def _select_structural_payload_for_forward(
+        self,
+        data: Data,
+        batch_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Select structural payload for forward; use first graph payload on batched input."""
+        self._warn_if_mixed_snapshot_versions(data)
+
+        struct_x = data.struct_x if hasattr(data, "struct_x") and isinstance(data.struct_x, torch.Tensor) else None
+        structural_edge_index = (
+            data.structural_edge_index
+            if hasattr(data, "structural_edge_index") and isinstance(data.structural_edge_index, torch.Tensor)
+            else None
+        )
+        structural_edge_weight = (
+            data.structural_edge_weight
+            if hasattr(data, "structural_edge_weight") and isinstance(data.structural_edge_weight, torch.Tensor)
+            else None
+        )
+        struct_node_to_class_index = (
+            data.struct_node_to_class_index
+            if hasattr(data, "struct_node_to_class_index") and isinstance(data.struct_node_to_class_index, torch.Tensor)
+            else None
+        )
+
+        slice_dict = getattr(data, "_slice_dict", None)
+        struct_x = self._slice_first(struct_x, "struct_x", slice_dict, dim=0)
+        structural_edge_index = self._slice_first(structural_edge_index, "structural_edge_index", slice_dict, dim=1)
+        structural_edge_weight = self._slice_first(structural_edge_weight, "structural_edge_weight", slice_dict, dim=0)
+        struct_node_to_class_index = self._slice_first(struct_node_to_class_index, "struct_node_to_class_index", slice_dict, dim=0)
+
+        return struct_x, structural_edge_index, structural_edge_weight, struct_node_to_class_index
+
+    def _select_struct_prefix_state_for_forward(
+        self,
+        data: Data,
+        *,
+        graph_count: int,
+        struct_node_count: int | None,
+    ) -> torch.Tensor | None:
+        """Return per-graph topology prefix state as [B, V, F]."""
+        raw = data.struct_prefix_state_x if hasattr(data, "struct_prefix_state_x") and isinstance(data.struct_prefix_state_x, torch.Tensor) else None
+        if raw is None:
+            return None
+        raw = raw.float()
+        if raw.dim() == 3:
+            return raw
+        if raw.dim() != 2:
+            raise ValueError("struct_prefix_state_x must have shape [V, F] or [B, V, F].")
+        if graph_count <= 1:
+            return raw.unsqueeze(0)
+
+        # If graph_count > 1, try to reshape directly first
+        if struct_node_count is not None and struct_node_count > 0:
+            if int(raw.size(0)) == int(graph_count) * int(struct_node_count):
+                return raw.view(int(graph_count), int(struct_node_count), int(raw.size(1)))
+
+        # Slicing fallback without calling to_data_list()
+        # Since we are homogeneous, each graph's prefix state has shape [struct_node_count, feature_dim]
+        derived_node_count = raw.size(0) // graph_count
+        return raw.view(int(graph_count), int(derived_node_count), int(raw.size(1)))
+
+    def _select_candidate_payload_for_forward(
+        self,
+        data: Data,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        tuple[str, ...] | None,
+        tuple[str, ...] | None,
+    ]:
+        """Select candidate payload for forward; use first graph payload on batched input."""
+        batch_tensor = getattr(data, "batch", None)
+        graph_count = int(batch_tensor.max().item()) + 1 if (isinstance(batch_tensor, torch.Tensor) and batch_tensor.numel() > 0) else 1
+
+        struct_node_to_candidate_index = (
+            data.struct_node_to_candidate_index
+            if hasattr(data, "struct_node_to_candidate_index")
+            and isinstance(data.struct_node_to_candidate_index, torch.Tensor)
+            else None
+        )
+        candidate_class_index = (
+            data.candidate_class_index
+            if hasattr(data, "candidate_class_index")
+            and isinstance(data.candidate_class_index, torch.Tensor)
+            else None
+        )
+        candidate_is_unseen = (
+            data.candidate_is_unseen
+            if hasattr(data, "candidate_is_unseen")
+            and isinstance(data.candidate_is_unseen, torch.Tensor)
+            else None
+        )
+        candidate_allowed_target_mask = (
+            data.candidate_allowed_target_mask
+            if hasattr(data, "candidate_allowed_target_mask")
+            and isinstance(data.candidate_allowed_target_mask, torch.Tensor)
+            else None
+        )
+        candidate_ids = (
+            data.candidate_ids
+            if hasattr(data, "candidate_ids")
+            and isinstance(data.candidate_ids, (list, tuple))
+            else None
+        )
+        candidate_labels = (
+            data.candidate_labels
+            if hasattr(data, "candidate_labels")
+            and isinstance(data.candidate_labels, (list, tuple))
+            else None
+        )
+
+        slice_dict = getattr(data, "_slice_dict", None)
+        struct_node_to_candidate_index = self._slice_first(struct_node_to_candidate_index, "struct_node_to_candidate_index", slice_dict, dim=0)
+        candidate_class_index = self._slice_first(candidate_class_index, "candidate_class_index", slice_dict, dim=0)
+        candidate_is_unseen = self._slice_first(candidate_is_unseen, "candidate_is_unseen", slice_dict, dim=0)
+
+        if isinstance(candidate_allowed_target_mask, torch.Tensor):
+            if candidate_allowed_target_mask.dim() == 1:
+                slices = (
+                    slice_dict.get("candidate_allowed_target_mask")
+                    if isinstance(slice_dict, dict)
+                    else None
+                )
+                if (
+                    isinstance(slices, torch.Tensor)
+                    and int(slices.numel()) == graph_count + 1
+                    and graph_count > 1
+                ):
+                    starts = slices.detach().cpu().long().tolist()
+                    widths = [int(starts[idx + 1] - starts[idx]) for idx in range(graph_count)]
+                    if widths and len(set(widths)) == 1 and widths[0] > 0:
+                        rows = [
+                            candidate_allowed_target_mask[int(starts[idx]) : int(starts[idx + 1])]
+                            for idx in range(graph_count)
+                        ]
+                        candidate_allowed_target_mask = torch.stack(rows, dim=0)
+                    else:
+                        candidate_allowed_target_mask = candidate_allowed_target_mask.unsqueeze(0)
+                else:
+                    candidate_allowed_target_mask = candidate_allowed_target_mask.unsqueeze(0)
+
+        def get_first_list_attr(val):
+            if val is not None:
+                if len(val) > 0 and isinstance(val[0], (list, tuple)):
+                    return tuple(val[0])
+                return tuple(val)
+            return None
+
+        first_candidate_ids = get_first_list_attr(candidate_ids)
+        first_candidate_labels = get_first_list_attr(candidate_labels)
+
+        return (
+            struct_node_to_candidate_index,
+            candidate_class_index,
+            candidate_is_unseen,
+            candidate_allowed_target_mask,
+            first_candidate_ids,
+            first_candidate_labels,
+        )
+
+    def _data_to_contract(self, data: Data) -> GraphTensorContract:
+        """Convert PyG batch Data to GraphTensorContract for model forward."""
+        edge_type = data.edge_type if hasattr(data, "edge_type") else torch.zeros(data.edge_index.shape[1], dtype=torch.long)
+        num_nodes = int(data.x_cat.size(0))
+        batch_tensor = data.batch if hasattr(data, "batch") and isinstance(data.batch, torch.Tensor) else None
+        if batch_tensor is None or batch_tensor.numel() != num_nodes:
+            batch_tensor = torch.zeros(num_nodes, dtype=torch.long, device=data.x_cat.device)
+        contract = GraphTensorContract(
+            x_cat=data.x_cat,
+            x_num=data.x_num,
+            edge_index=data.edge_index,
+            edge_type=edge_type,
+            y=data.y,
+            batch=batch_tensor,
+            num_nodes=num_nodes,
+        )
+        if hasattr(data, "allowed_target_mask"):
+            mask = data.allowed_target_mask
+            if isinstance(mask, torch.Tensor):
+                contract["allowed_target_mask"] = mask.bool()
+        struct_x, structural_edge_index, structural_edge_weight, struct_node_to_class_index = (
+            self._select_structural_payload_for_forward(
+                data,
+                batch_tensor,
+            )
+        )
+        if isinstance(struct_x, torch.Tensor):
+            contract["struct_x"] = struct_x.float()
+        if isinstance(structural_edge_index, torch.Tensor):
+            contract["structural_edge_index"] = structural_edge_index
+        if isinstance(structural_edge_weight, torch.Tensor):
+            contract["structural_edge_weight"] = structural_edge_weight
+        if isinstance(struct_node_to_class_index, torch.Tensor):
+            contract["struct_node_to_class_index"] = struct_node_to_class_index.long()
+
+        (
+            struct_node_to_candidate_index,
+            candidate_class_index,
+            candidate_is_unseen,
+            candidate_allowed_target_mask,
+            candidate_ids,
+            candidate_labels,
+        ) = self._select_candidate_payload_for_forward(data)
+
+        if isinstance(struct_node_to_candidate_index, torch.Tensor):
+            contract["struct_node_to_candidate_index"] = struct_node_to_candidate_index.long()
+        if isinstance(candidate_class_index, torch.Tensor):
+            contract["candidate_class_index"] = candidate_class_index.long()
+        if isinstance(candidate_is_unseen, torch.Tensor):
+            contract["candidate_is_unseen"] = candidate_is_unseen.bool()
+        if isinstance(candidate_allowed_target_mask, torch.Tensor):
+            contract["candidate_allowed_target_mask"] = candidate_allowed_target_mask.bool()
+        if candidate_ids is not None:
+            contract["candidate_ids"] = candidate_ids
+        if candidate_labels is not None:
+            contract["candidate_labels"] = candidate_labels
+        if hasattr(data, "target_label"):
+            contract["target_label"] = data.target_label
+        graph_count = int(batch_tensor.max().item()) + 1 if batch_tensor.numel() > 0 else int(data.y.view(-1).shape[0])
+        struct_node_count = (
+            int(struct_node_to_class_index.numel())
+            if isinstance(struct_node_to_class_index, torch.Tensor)
+            else (int(struct_x.size(0)) if isinstance(struct_x, torch.Tensor) and struct_x.dim() >= 1 else None)
+        )
+        struct_prefix_state_x = self._select_struct_prefix_state_for_forward(
+            data,
+            graph_count=graph_count,
+            struct_node_count=struct_node_count,
+        )
+        if isinstance(struct_prefix_state_x, torch.Tensor):
+            contract["struct_prefix_state_x"] = struct_prefix_state_x.float()
+        if hasattr(data, "stats_snapshot_version_idx"):
+            snapshot_version_idx = data.stats_snapshot_version_idx
+            if isinstance(snapshot_version_idx, torch.Tensor):
+                version_labels: List[str] = []
+                for idx in snapshot_version_idx.view(-1).long().cpu().tolist():
+                    version_labels.append(self._idx_to_stats_snapshot_version.get(int(idx), f"k{int(idx):06d}"))
+                if version_labels:
+                    contract["stats_snapshot_versions"] = version_labels
+        if hasattr(data, "stats_snapshot_as_of_epoch"):
+            snapshot_as_of_epoch = data.stats_snapshot_as_of_epoch
+            if isinstance(snapshot_as_of_epoch, torch.Tensor):
+                as_of_values: List[str] = []
+                for epoch in snapshot_as_of_epoch.view(-1).double().cpu().tolist():
+                    iso_value = self._epoch_to_iso(epoch)
+                    if iso_value is not None:
+                        as_of_values.append(iso_value)
+                if as_of_values:
+                    contract["stats_snapshot_as_of_ts_batch"] = as_of_values
+        if hasattr(data, "stats_allowed"):
+            stats_allowed = data.stats_allowed
+            if isinstance(stats_allowed, torch.Tensor):
+                flags = [bool(item) for item in stats_allowed.view(-1).long().cpu().tolist()]
+                if flags:
+                    contract["stats_allowed_batch"] = flags
+        if hasattr(data, "stats_missing_asof_snapshot"):
+            stats_missing = data.stats_missing_asof_snapshot
+            if isinstance(stats_missing, torch.Tensor):
+                flags = [bool(item) for item in stats_missing.view(-1).long().cpu().tolist()]
+                if flags:
+                    contract["stats_missing_asof_snapshot_batch"] = flags
+        for attr_name, contract_key in (
+            ("topology_projection_aligned", "topology_projection_aligned_batch"),
+            ("topology_projection_missing_node_metadata", "topology_projection_missing_node_metadata_batch"),
+        ):
+            if hasattr(data, attr_name):
+                raw_tensor = getattr(data, attr_name)
+                if isinstance(raw_tensor, torch.Tensor):
+                    flags = [bool(item) for item in raw_tensor.view(-1).long().cpu().tolist()]
+                    if flags:
+                        contract[contract_key] = flags  # type: ignore[typeddict-unknown-key]
+        for attr_name, contract_key in (
+            ("topology_projection_projected_edge_count", "topology_projection_projected_edge_count_batch"),
+            ("topology_projection_source_path_count", "topology_projection_source_path_count_batch"),
+            ("topology_projection_skipped_edge_count", "topology_projection_skipped_edge_count_batch"),
+            ("topology_projection_missing_vocab_count", "topology_projection_missing_vocab_count_batch"),
+            ("topology_projection_duplicate_label_count", "topology_projection_duplicate_label_count_batch"),
+        ):
+            if hasattr(data, attr_name):
+                raw_tensor = getattr(data, attr_name)
+                if isinstance(raw_tensor, torch.Tensor):
+                    values = [int(item) for item in raw_tensor.view(-1).long().cpu().tolist()]
+                    if values:
+                        contract[contract_key] = values  # type: ignore[typeddict-unknown-key]
+        for attr_name in ("trace_idx", "prefix_idx", "prefix_len", "prefix_last_activity_idx"):
+            if hasattr(data, attr_name):
+                raw_tensor = getattr(data, attr_name)
+                if isinstance(raw_tensor, torch.Tensor):
+                    contract[attr_name] = raw_tensor.detach().long().cpu()  # type: ignore[typeddict-unknown-key]
+        if hasattr(data, "process_version_idx"):
+            raw_tensor = data.process_version_idx
+            if isinstance(raw_tensor, torch.Tensor):
+                labels: List[str] = []
+                for idx in raw_tensor.view(-1).long().cpu().tolist():
+                    labels.append(self._idx_to_version.get(int(idx), f"v{int(idx)}"))
+                if labels:
+                    contract["process_version_labels"] = labels  # type: ignore[typeddict-unknown-key]
+        self._guard_candidate_batch_topology(data, contract)
+        return contract
+
+    def _target_labels_from_contract(
+        self,
+        contract: dict,
+        targets: torch.Tensor,
+    ) -> List[str]:
+        """Extract per-sample target labels from the collated contract.
+
+        PyG DataLoader collates ``target_label`` into a flat list when samples
+        carry this attribute.  Returns a list with one label per sample in the
+        batch, or an empty list when the contract does not contain target labels.
+        """
+        raw = contract.get("target_label")
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            return [raw]
+        if isinstance(raw, (list, tuple)):
+            return [str(item) for item in raw]
+        return []
+
+    def _log_model_and_system_context(self) -> None:
+        """Log model size and runtime memory/device metadata via tracker port."""
+        if self.tracker is None:
+            return
+
+        total_params = 0
+        skipped_uninitialized = 0
+        for param in self.model.parameters():
+            if isinstance(param, UninitializedParameter):
+                skipped_uninitialized += 1
+                continue
+            total_params += int(param.numel())
+        self.tracker.log_param("model_total_parameters", total_params)
+        if skipped_uninitialized > 0:
+            logger.warning(
+                "Skipped %d uninitialized model parameters while logging model size.",
+                skipped_uninitialized,
+            )
+            self.tracker.log_param("model_uninitialized_parameters", skipped_uninitialized)
+        ram_usage_mb = float(psutil.Process().memory_info().rss / (1024.0 * 1024.0))
+        self.tracker.log_param("system_ram_mb_before_train", ram_usage_mb)
+
+        model_cfg = self.config.get("model_config", {})
+        hidden_dim = int(model_cfg.get("hidden_dim", 64))
+        estimated_min_vram_mb = round(((total_params * 16) / 1048576.0) + 500.0 + ((self.batch_size * 100 * hidden_dim * 3 * 8) / 1048576.0), 2)
+        self.tracker.log_param("estimated_min_vram_mb", estimated_min_vram_mb)
+
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            self.tracker.log_tag("system.gpu_name", torch.cuda.get_device_name(0))
+
+    def _log_topology_metrics_and_artifacts(self) -> None:
+        """Log topology summary params and histogram artifacts through tracker port."""
+        if self.tracker is None:
+            return
+
+        for prefix, values in (("nodes", self._topology_nodes), ("edges", self._topology_edges)):
+            if not values:
+                continue
+            arr = np.asarray(values, dtype=np.float64)
+            self.tracker.log_param(f"{prefix}_min", int(np.min(arr)))
+            self.tracker.log_param(f"{prefix}_max", int(np.max(arr)))
+            self.tracker.log_param(f"{prefix}_mean", float(np.mean(arr)))
+            self.tracker.log_param(f"{prefix}_median", float(np.median(arr)))
+
+        try:
+            import matplotlib.pyplot as plt
+
+            if self._topology_nodes and self._topology_edges:
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+                axes[0].hist(self._topology_nodes, bins=30, color="#377eb8", alpha=0.85)
+                axes[0].set_title("Nodes per graph")
+                axes[1].hist(self._topology_edges, bins=30, color="#4daf4a", alpha=0.85)
+                axes[1].set_title("Edges per graph")
+                fig.tight_layout()
+                with tempfile.NamedTemporaryFile(prefix="topology_hist_", suffix=".png", delete=False) as tmp_file:
+                    figure_path = tmp_file.name
+                fig.savefig(figure_path, dpi=160)
+                plt.close(fig)
+                self.tracker.log_artifact(figure_path)
+
+            if self._prefix_lengths:
+                fig, axis = plt.subplots(1, 1, figsize=(7, 5))
+                axis.hist(self._prefix_lengths, bins=30, color="#984ea3", alpha=0.85)
+                axis.set_title("Prefix length distribution")
+                fig.tight_layout()
+                with tempfile.NamedTemporaryFile(prefix="prefix_hist_", suffix=".png", delete=False) as tmp_file:
+                    figure_path = tmp_file.name
+                fig.savefig(figure_path, dpi=160)
+                plt.close(fig)
+                self.tracker.log_artifact(figure_path)
+        except Exception as exc:
+            logger.warning("Failed to generate topology histogram artifacts: %s", exc)
+
+    def _log_data_metrics(self) -> None:
+        """Log parsed data volumes and vocab sizes from prepared artifacts."""
+        if self.tracker is None:
+            return
+        data_metrics = self.config.get("data_metrics", {})
+        if isinstance(data_metrics, dict):
+            for key in (
+                "data_all_num_traces",
+                "data_all_num_events",
+                "data_num_traces",
+                "data_num_events",
+                "vocab_activity_size",
+                "vocab_resource_size",
+                "data_all_versions_count",
+                "data_prepared_versions_count",
+                "data_train_versions_count",
+                "data_val_versions_count",
+                "data_test_versions_count",
+                "data_all_versions",
+                "data_prepared_versions",
+                "data_train_versions",
+                "data_val_versions",
+                "data_test_versions",
+                "data_version_collapse_warning",
+                "train_struct_x_max_abs",
+                "train_struct_x_p99_abs",
+                "train_struct_x_scale_warning",
+                "val_struct_x_max_abs",
+                "val_struct_x_p99_abs",
+                "val_struct_x_scale_warning",
+                "test_struct_x_max_abs",
+                "test_struct_x_p99_abs",
+                "test_struct_x_scale_warning",
+                "train_edge_weight_max_abs",
+                "train_edge_weight_p99_abs",
+                "train_edge_weight_scale_warning",
+            ):
+                if key in data_metrics:
+                    self.tracker.log_param(key, data_metrics[key])
+
+    def _log_params(self) -> None:
+        """Log basic run parameters via tracker when available."""
+        if self.tracker is None:
+            return
+        tracking_model_type = str(self.config.get("tracking_model_type", self.model.__class__.__name__)).strip()
+        self.tracker.log_param("model_type", tracking_model_type or self.model.__class__.__name__)
+        self.tracker.log_param("learning_rate", self.learning_rate)
+        self.tracker.log_param("batch_size", self.batch_size)
+        self.tracker.log_param("epochs", self.epochs)
+        self.tracker.log_param("patience", self.patience)
+        self.tracker.log_param("delta", self.delta)
+        self.tracker.log_param("loss_function", self.loss_function)
+        self.tracker.log_param("seed", self.seed)
+        self.tracker.log_param("dataloader_num_workers", self.dataloader_num_workers)
+        self.tracker.log_param("dataloader_pin_memory", self.dataloader_pin_memory)
+        self.tracker.log_param("dataloader_persistent_workers", self.dataloader_persistent_workers)
+        self.tracker.log_param("dataloader_prefetch_factor", self.dataloader_prefetch_factor)
+        self.tracker.log_param("training.learning_strategy", self.learning_strategy_config.learning_strategy)
+        self.tracker.log_param(
+            "training.learning_strategy_fusion_support",
+            self.learning_strategy_config.fusion_support_level.value,
+        )
+
+    def _log_run_context(self) -> None:
+        """Log extended run context: tags, flattened params, and feature metadata."""
+        experiment_cfg = self.config.get("experiment_config", {})
+        tracking_cfg = self.config.get("tracking_config", {})
+        data_cfg = self.config.get("data_config", {})
+        model_cfg = self.config.get("model_config", {})
+        run_profile_raw = self.config.get("run_profile", {})
+        run_profile = dict(run_profile_raw) if isinstance(run_profile_raw, dict) else {}
+
+        dataset_label = str(self.config.get("dataset_label", data_cfg.get("dataset_label", experiment_cfg.get("dataset", "unknown_data")))).strip()
+        model_label = str(self.config.get("model_label", model_cfg.get("model_label", model_cfg.get("type", "unknown_model")))).strip()
+        model_type = str(model_cfg.get("type", model_cfg.get("model_type", "unknown_model"))).strip() or "unknown_model"
+        model_family = str(run_profile.get("model_family", "eopkg" if model_type.lower().startswith("eopkg") else "baseline"))
+        adapter_kind = str(run_profile.get("adapter_kind", self.config.get("mapping_config", {}).get("adapter", "xes"))).strip() or "xes"
+        graph_features_enabled = bool(run_profile.get("graph_features_enabled", False))
+        node_feature_count = int(run_profile.get("node_feature_count", 0))
+        edge_weight_enabled = bool(run_profile.get("edge_weight_enabled", False))
+        global_process_forward_enabled = bool(run_profile.get("global_process_stats_forward_enabled", False))
+        stats_quality_gate_enabled = bool(run_profile.get("stats_quality_gate_enabled", False))
+        stats_time_policy = str(run_profile.get("stats_time_policy", "latest"))
+        on_missing_asof_snapshot = str(run_profile.get("on_missing_asof_snapshot", "disable_stats"))
+        xes_use_classifier = run_profile.get("xes_use_classifier")
+
+        logger.info("========== TRAINER PROFILE ==========")
+        logger.info(
+            "TRAINER_PROFILE mode=%s model=%s model_family=%s adapter=%s dataset=%s preloaded_data=%s",
+            self.mode,
+            model_type,
+            model_family,
+            adapter_kind,
+            dataset_label or "unknown_data",
+            bool(self.prepared_data is not None),
+        )
+        logger.info(
+            "TRAINER_PROFILE forward struct_nodes=%s(node_features=%d) struct_edges=%s global_process=%s stats_quality_gate=%s stats_time_policy=%s",
+            "on" if graph_features_enabled and node_feature_count > 0 else "off",
+            node_feature_count,
+            "on" if graph_features_enabled and edge_weight_enabled else "off",
+            "on" if global_process_forward_enabled else "off",
+            "on" if stats_quality_gate_enabled else "off",
+            stats_time_policy,
+        )
+        if adapter_kind == "xes":
+            logger.info("TRAINER_PROFILE xes use_classifier=%s", xes_use_classifier if xes_use_classifier is not None else "unknown")
+        logger.info(
+            "TRAINER_CHECKS forward_stats_summary=on mixed_snapshot_guard=on missing_asof_policy=%s",
+            on_missing_asof_snapshot,
+        )
+        logger.info(
+            "TRAINER_RUNTIME dataloader_workers=%d pin_memory=%s persistent_workers=%s prefetch_factor=%d",
+            self.dataloader_num_workers,
+            self.dataloader_pin_memory,
+            self.dataloader_persistent_workers if self.dataloader_num_workers > 0 else False,
+            self.dataloader_prefetch_factor if self.dataloader_num_workers > 0 else 0,
+        )
+        logger.info("=====================================")
+
+        if self.tracker is None:
+            return
+        if dataset_label:
+            self.tracker.log_tag("experiment.dataset_label", dataset_label)
+        if model_label:
+            self.tracker.log_tag("experiment.model_label", model_label)
+
+        custom_tags = tracking_cfg.get("tags", {})
+        if isinstance(custom_tags, dict):
+            for tag_key, tag_value in custom_tags.items():
+                self.tracker.log_tag(str(tag_key), tag_value)
+
+    def _log_epoch_metrics(self, epoch: int, metrics: Dict[str, float]) -> None:
+        """Log train/validation metrics for one epoch via tracker port."""
+        if self.tracker is None:
+            return
+        for key, value in metrics.items():
+            self.tracker.log_metric(key, float(value), step=epoch)
+
+    def _log_test_metrics(self, metrics: Dict[str, Any]) -> None:
+        """Log final test metrics via tracker port."""
+        if self.tracker is None:
+            return
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            self.tracker.log_metric(key, float(value), step=self.epochs)
+
+
+

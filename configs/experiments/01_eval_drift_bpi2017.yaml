@@ -1,0 +1,21 @@
+include:
+  - "../data/bpi2017_Challenge.yaml"
+  - "../model/gatv2_baseline.yaml"
+
+experiment:
+  project: "bpm_prediction_mvp1"
+  name: "MVP1_eval_drift_sl100"
+  mode: "eval_drift"
+  fraction: 1
+  split_strategy: "temporal"
+  train_ratio: 0.01
+  split_ratio: [0.7, 0.2, 0.1]
+  load_checkpoint: "checkpoints/MVP1_Baseline_train_05_bpi2012_GATv2_best.pth"
+  drift_window_size: 500
+  drift_window_sliding: 100
+
+
+training:
+  retrain: false
+
+seed: 42

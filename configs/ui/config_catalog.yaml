@@ -1,0 +1,4663 @@
+fields:
+  data.dataset_label:
+    affects: Input loading and process identity.
+    default: ''
+    description: Human-readable dataset label for logs and tracking.
+    enum:
+    - bpi2012
+    - bpi2012_stage3_4_xes
+    - bpi2012_stage4_2_xes_stat
+    - bpi2020Permit1
+    - camunda_b2bcontracts
+    - camunda_b2bcontracts_stage4_2_stat
+    - camunda_procurement
+    - camunda_procurement_sql
+    - camunda_procurement_stage3_4_sql
+    - camunda_sync_files_file
+    - camunda_sync_files_neo4j
+    - camunda_sync_sql_file
+    - camunda_sync_sql_neo4j
+    - synthetic_drift_4tu
+    - xes_sync_dir_file
+    - xes_sync_dir_neo4j
+    label: Мітка датасету
+    path: data.dataset_label
+    required_in_modes: []
+    required_when: {}
+    section: data
+    ui:
+      group: source
+      order: 2
+      priority: 1
+      tab: input
+  data.dataset_name:
+    affects: Input loading and process identity.
+    default: ''
+    description: Canonical process/dataset identifier used for structure lookup and
+      run profile.
+    enum:
+    - B2BContracts_ApproveProject
+    - BPI_Challenge_2012
+    - bpi2012
+    - camunda_sync
+    - procurement
+    - xes_sync
+    label: Канонічна назва датасету
+    path: data.dataset_name
+    required_in_modes:
+    - train
+    - eval_drift
+    - eval_cross_dataset
+    - eval_topology_mask_uniform
+    - sync-topology
+    - sync-stats
+    - sync-stats-backfill
+    required_when: {}
+    section: data
+    ui:
+      group: source
+      order: 1
+      priority: 1
+      tab: input
+  data.log_path:
+    affects: Input loading and process identity.
+    default: ''
+    description: Path to XES file (or XES directory in sync scenarios).
+    enum: []
+    label: Шлях до XES логу
+    path: data.log_path
+    required_in_modes: []
+    required_when:
+      mapping.adapter: xes
+    section: data
+    ui:
+      group: source
+      order: 4
+      priority: 1
+      tab: input
+  experiment.cache_dir:
+    affects: Reuse of compiled structural tensors between runs.
+    default: .cache/dynamic_graph_builder
+    description: Disk path for persistent structure cache when experiment.cache_policy=full.
+    enum: []
+    label: experiment.cache_dir
+    path: experiment.cache_dir
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 220
+      priority: 20
+      tab: general
+  experiment.cache_policy:
+    affects: Build-graph performance and repeated repository lookups.
+    default: full
+    description: Caching policy for graph build path (off/dto/full).
+    enum:
+    - false
+    - dto
+    - full
+    label: Політика кешування графів
+    path: experiment.cache_policy
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 14
+      priority: 1
+      tab: general
+  experiment.drift_window_size:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Window size (in traces) for drift evaluation.
+    enum:
+    - '1000'
+    - '500'
+    label: 'Експеримент: Drift window size'
+    path: experiment.drift_window_size
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  experiment.drift_window_sliding:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Window sliding step for drift evaluation.
+    enum:
+    - '100'
+    - '200'
+    - '50'
+    label: 'Експеримент: Drift window sliding'
+    path: experiment.drift_window_sliding
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  experiment.fraction:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Trace fraction after cascade filtering (0..1].
+    enum: []
+    label: Частка даних (fraction)
+    path: experiment.fraction
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 4
+      priority: 1
+      tab: general
+  experiment.fraction_strategy:
+    affects: Data split and experiment validity.
+    default: temporal
+    description: Data fraction strategy. temporal preserves chronological sampling;
+      versioned samples independently per process version.
+    enum:
+    - temporal
+    - versioned
+    label: Fraction strategy
+    path: experiment.fraction_strategy
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 5
+      priority: 1
+      tab: general
+  experiment.graph_dataset_cache_dir:
+    affects: Location of reusable train/validation/test graph artifacts.
+    default: .cache/graph_datasets
+    description: Disk path for persistent cache of prepared graph datasets.
+    enum: []
+    label: місце збереження кеша
+    path: experiment.graph_dataset_cache_dir
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 16
+      priority: 1
+      tab: general
+  experiment.graph_dataset_cache_policy:
+    affects: Reuse of prepared train/validation/test graphs between runs.
+    default: 'off'
+    description: Policy for disk cache of built graph datasets (off/read/write/full).
+    enum:
+    - 'off'
+    - read
+    - write
+    - full
+    label: Дозволені операції з кешем графів
+    path: experiment.graph_dataset_cache_policy
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 15
+      priority: 1
+      tab: general
+  experiment.graph_dataset_disk_spill_enabled:
+    affects: Memory usage during graph dataset build and cache write path.
+    default: 'false'
+    description: Enable sharded disk spill for build_graph to keep RAM bounded.
+    enum:
+    - 'false'
+    - 'true'
+    label: experiment.graph_dataset_disk_spill_enabled
+    path: experiment.graph_dataset_disk_spill_enabled
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 17
+      priority: 1
+      tab: general
+  experiment.graph_dataset_shard_size:
+    affects: Balance between disk IO overhead and peak RAM during build_graph.
+    default: 2000
+    description: Target number of graphs per on-disk shard when spill mode is enabled.
+    enum: []
+    label: experiment.graph_dataset_shard_size
+    path: experiment.graph_dataset_shard_size
+    required_in_modes: []
+    required_when:
+      experiment.graph_dataset_disk_spill_enabled: true
+    section: experiment
+    ui:
+      group: advanced
+      order: 225
+      priority: 25
+      tab: general
+  experiment.load_checkpoint:
+    active_when:
+      experiment.mode:
+      - eval_drift
+      - eval_drift_finetune
+      - eval_cross_dataset
+      - train
+    affects: 'Забезпечує тестування правильних навчених ваг. UI інтегрує розумний
+      пошук: фільтрує за поточним experiment.name та сортує за датою оновлення (newest
+      first).'
+    default: ''
+    description: Шлях до checkpoint (.pth), який використовується для оцінки (eval_*)
+      або дрейфу (eval_drift).
+    enum: []
+    label: Завантаження checkpoint
+    path: experiment.load_checkpoint
+    required_in_modes: []
+    required_when:
+      experiment.mode:
+      - eval_drift
+      - eval_drift_finetune
+      - eval_cross_dataset
+    section: experiment
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  experiment.mask_guided_enabled:
+    affects: Enables mask-guided training and inference penalties.
+    default: 'false'
+    description: Convenience toggle mapped to training.mask_guided_enabled.
+    enum:
+    - 'false'
+    - 'true'
+    label: mask_guided_enabled
+    path: experiment.mask_guided_enabled
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 232
+      priority: 30
+      tab: general
+  experiment.rs01_enabled:
+    affects: Controls whether canonical RS-01 v2 common-mask audit policy and payload are attached during evaluation modes.
+    default: 'true'
+    description: Enable or disable canonical RS-01 v2 admissibility audit during evaluation modes.
+    enum:
+    - 'false'
+    - 'true'
+    label: experiment.rs01_enabled
+    path: experiment.rs01_enabled
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 233
+      priority: 30
+      tab: general
+  experiment.max_ram_gb:
+    affects: Upper bound of process memory during graph dataset preparation.
+    default: 0.0
+    description: Soft RSS limit for build_graph spill flushes; 0 disables RAM guard.
+    enum: []
+    label: experiment.max_ram_gb
+    path: experiment.max_ram_gb
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 226
+      priority: 25
+      tab: general
+  experiment.mode:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Pipeline run mode (train/eval/sync commands).
+    enum:
+    - train
+    - eval_drift
+    - eval_drift_finetune
+    - eval_cross_dataset
+    - eval_topology_mask_uniform
+    - sync-topology
+    - sync-stats
+    - sync-stats-backfill
+    label: Режим запуску
+    path: experiment.mode
+    required_in_modes:
+    - train
+    - eval_drift
+    - eval_drift_finetune
+    - eval_cross_dataset
+    - sync-topology
+    - sync-stats
+    - sync-stats-backfill
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 1
+      priority: 1
+      tab: general
+  experiment.uniform_mask_empty_mask_policy:
+    affects: Controls empty topology-mask handling for the uniform baseline.
+    default: raise
+    description: Empty candidate-mask policy for topology-mask uniform evaluation.
+    enum:
+    - raise
+    - record_invalid
+    label: Uniform mask empty policy
+    path: experiment.uniform_mask_empty_mask_policy
+    required_in_modes:
+    - eval_topology_mask_uniform
+    required_when:
+      experiment.mode: eval_topology_mask_uniform
+    section: experiment
+    ui:
+      group: topology_mask_uniform
+      order: 40
+      priority: 2
+      tab: general
+  experiment.uniform_mask_encoder_checkpoint:
+    affects: Provides frozen encoder vocabularies without loading model weights.
+    default: ''
+    description: Reference checkpoint used only for encoder_state in topology-mask uniform evaluation.
+    enum: []
+    label: Uniform mask encoder checkpoint
+    path: experiment.uniform_mask_encoder_checkpoint
+    required_in_modes:
+    - eval_topology_mask_uniform
+    required_when:
+      experiment.mode: eval_topology_mask_uniform
+    section: experiment
+    ui:
+      group: topology_mask_uniform
+      order: 41
+      priority: 2
+      tab: general
+  experiment.uniform_mask_evaluation_seed:
+    affects: Reproducible seeded Monte Carlo draws for the uniform baseline.
+    default: 20260831
+    description: Evaluation seed for canonical uniform draws over allowed topology candidates.
+    enum: []
+    label: Uniform mask evaluation seed
+    path: experiment.uniform_mask_evaluation_seed
+    required_in_modes:
+    - eval_topology_mask_uniform
+    required_when:
+      experiment.mode: eval_topology_mask_uniform
+    section: experiment
+    type: int
+    ui:
+      group: topology_mask_uniform
+      order: 42
+      priority: 2
+      tab: general
+  experiment.uniform_mask_mc_draws:
+    affects: Monte Carlo sampling uncertainty for discrete baseline metrics.
+    default: 200
+    description: Number of seeded uniform draws; valid research reporting range is 100 to 1000.
+    enum: []
+    label: Uniform mask MC draws
+    path: experiment.uniform_mask_mc_draws
+    required_in_modes:
+    - eval_topology_mask_uniform
+    required_when:
+      experiment.mode: eval_topology_mask_uniform
+    section: experiment
+    type: int
+    ui:
+      group: topology_mask_uniform
+      order: 43
+      priority: 2
+      tab: general
+  experiment.name:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Concrete run name.
+    enum: []
+    label: Назва запуску
+    path: experiment.name
+    required_in_modes:
+    - train
+    - eval_drift
+    - eval_cross_dataset
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 3
+      priority: 1
+      tab: general
+  experiment.on_missing_asof_snapshot:
+    affects: Temporal safety and fallback behavior for stats tensors.
+    default: disable_stats
+    description: Runtime policy for strict_asof when no eligible snapshot is found
+      (disable_stats/use_base/raise).
+    enum:
+    - disable_stats
+    - use_base
+    - raise
+    label: Політика при відсутньому as-of snapshot
+    path: experiment.on_missing_asof_snapshot
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  experiment.project:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Tracking project/experiment name.
+    enum:
+    - bpm_prediction_mvp1
+    - bpm_prediction_mvp2
+    - bpm_prediction_mvp2_5
+    label: Проєкт експерименту
+    path: experiment.project
+    required_in_modes:
+    - train
+    - eval_drift
+    - eval_cross_dataset
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 2
+      priority: 1
+      tab: general
+  experiment.retrain:
+    affects: Force training from scratch instead of resume.
+    default: 'false'
+    description: Convenience toggle mapped to training.retrain.
+    enum:
+    - 'false'
+    - 'true'
+    label: retrain
+    path: experiment.retrain
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 233
+      priority: 30
+      tab: general
+  experiment.split_ratio:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Final [train,val,test] split ratio.
+    enum: []
+    label: Співвідношення train/val/test
+    path: experiment.split_ratio
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 8
+      priority: 1
+      tab: general
+  experiment.split_strategy:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Data split strategy. Current canonical value for MVP2.5 is temporal.
+    enum:
+    - temporal
+    - none
+    - versioned
+    label: Стратегія розбиття
+    path: experiment.split_strategy
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 7
+      priority: 1
+      tab: general
+  experiment.statistic_enabled:
+    affects: Whether structural statistics tensors are produced and consumed.
+    default: 'false'
+    description: Convenience toggle mapped to mapping.graph_feature_mapping.enabled.
+    enum:
+    - 'false'
+    - 'true'
+    label: statistic_enabled
+    path: experiment.statistic_enabled
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 231
+      priority: 30
+      tab: general
+  experiment.stats_time_policy:
+    active_when:
+      experiment.statistic_enabled: 'true'
+    affects: 'Визначає, які дані потрапляють в обробку: поточний час або останній
+      доступний. Для швидкого/початкового експерименту підходить latest, для дисертаційного
+      наукового аналізу — лише strict_asof.'
+    default: ''
+    description: 'Політика вибору статистики зі снепшотів: latest або strict_asof.'
+    enum: []
+    label: Політика вибору статистики зі снепшотів
+    path: experiment.stats_time_policy
+    required_in_modes: []
+    required_when:
+      experiment.statistic_enabled: 'true'
+    section: experiment
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  experiment.structural_mode:
+    affects: Clean structural ablation (on versus off) for EOPKG models.
+    default: 'true'
+    description: Enable or disable EOPKG structural attention branch while keeping
+      observed branch unchanged.
+    enum:
+    - 'false'
+    - 'true'
+    label: structural_mode
+    path: experiment.structural_mode
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: advanced
+      order: 230
+      priority: 30
+      tab: general
+  experiment.train_ratio:
+    affects: Execution route, data split, and evaluation mode behavior.
+    default: ''
+    description: Train-cut ratio in cascade preparation.
+    enum:
+    - '0'
+    - '0.01'
+    - '0.4'
+    - '0.5'
+    - '0.7'
+    - '1.0'
+    label: Частка train
+    path: experiment.train_ratio
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 6
+      priority: 1
+      tab: general
+  experiment.version_scope_policy:
+    affects: Data split and future-version leakage control.
+    default: all
+    description: Version leakage control for versioned fraction/split. all uses all
+      selected versions; train_cut restricts train to versions known before train_ratio
+      cut and keeps future versions for eval tail.
+    enum:
+    - all
+    - train_cut
+    label: Version scope policy
+    path: experiment.version_scope_policy
+    required_in_modes: []
+    required_when: {}
+    section: experiment
+    ui:
+      group: core
+      order: 9
+      priority: 1
+      tab: general
+  mapping.adapter:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Data/structure mapping parameter.
+    enum:
+    - xes
+    - camunda
+    label: Адаптер даних
+    path: mapping.adapter
+    required_in_modes:
+    - train
+    - eval_drift
+    - eval_cross_dataset
+    - sync-topology
+    - sync-stats
+    - sync-stats-backfill
+    required_when: {}
+    section: mapping
+    ui:
+      group: source
+      order: 3
+      priority: 1
+      tab: input
+  mapping.camunda_adapter.lookback_hours:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Lookback hours'
+    path: mapping.camunda_adapter.lookback_hours
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.process_filters:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Процес фільтри'
+    path: mapping.camunda_adapter.process_filters
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.process_name:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum:
+    - B2BContracts_ApproveProject
+    - procurement
+    label: 'Мапінг: Процес назва'
+    path: mapping.camunda_adapter.process_name
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.connection_profile:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: Підключення профіль'
+    path: mapping.camunda_adapter.runtime.connection_profile
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.connections_file:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: Підключення файл'
+    path: mapping.camunda_adapter.runtime.connections_file
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.export_dir:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: Export dir'
+    path: mapping.camunda_adapter.runtime.export_dir
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.history_cleanup_aware:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: History cleanup aware'
+    path: mapping.camunda_adapter.runtime.history_cleanup_aware
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.legacy_removal_time_policy:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: Legacy removal time політика'
+    path: mapping.camunda_adapter.runtime.legacy_removal_time_policy
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.mssql.connection_profile:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: Підключення профіль'
+    path: mapping.camunda_adapter.runtime.mssql.connection_profile
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.on_missing_removal_time:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: On missing removal time'
+    path: mapping.camunda_adapter.runtime.on_missing_removal_time
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.runtime.runtime_source:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum:
+    - files
+    - mssql
+    label: 'Мапінг: Runtime джерело'
+    path: mapping.camunda_adapter.runtime.runtime_source
+    required_in_modes: []
+    required_when:
+      mapping.adapter: camunda
+    section: mapping
+    ui:
+      group: source
+      order: 10
+      priority: 2
+      tab: input
+  mapping.camunda_adapter.runtime.sql_dir:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda runtime source/connection/filter parameter.
+    enum: []
+    label: 'Мапінг: Sql dir'
+    path: mapping.camunda_adapter.runtime.sql_dir
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.since:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Since'
+    path: mapping.camunda_adapter.since
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.structure.bpmn_source:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum:
+    - files
+    - mssql
+    label: 'Мапінг: Bpmn джерело'
+    path: mapping.camunda_adapter.structure.bpmn_source
+    required_in_modes: []
+    required_when:
+      mapping.adapter: camunda
+    section: mapping
+    ui:
+      group: structure
+      order: 2
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.call_activity.inference_fallback_strategy:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Inference fallback стратегія'
+    path: mapping.camunda_adapter.structure.call_activity.inference_fallback_strategy
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 50
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.connection_profile:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Підключення профіль'
+    path: mapping.camunda_adapter.structure.connection_profile
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 6
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.connections_file:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Підключення файл'
+    path: mapping.camunda_adapter.structure.connections_file
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 7
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.files.bpmn_dir:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Bpmn dir'
+    path: mapping.camunda_adapter.structure.files.bpmn_dir
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 5
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.files.catalog_file:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Catalog файл'
+    path: mapping.camunda_adapter.structure.files.catalog_file
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 4
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.files.export_dir:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Export dir'
+    path: mapping.camunda_adapter.structure.files.export_dir
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 3
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.mssql.connection_profile:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Підключення профіль'
+    path: mapping.camunda_adapter.structure.mssql.connection_profile
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 50
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.parser_mode:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Parser режим'
+    path: mapping.camunda_adapter.structure.parser_mode
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 9
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.source:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum:
+    - bpmn
+    - logs
+    label: 'Мапінг: Джерело'
+    path: mapping.camunda_adapter.structure.source
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 1
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.sql_dir:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Sql dir'
+    path: mapping.camunda_adapter.structure.sql_dir
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 8
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.structure_from_logs:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Структура from logs'
+    path: mapping.camunda_adapter.structure.structure_from_logs
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 50
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.subprocess_mode:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Subprocess режим'
+    path: mapping.camunda_adapter.structure.subprocess_mode
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 10
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.structure.version_key_format:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda BPMN structure ingestion parameter.
+    enum: []
+    label: 'Мапінг: Версія ключ format'
+    path: mapping.camunda_adapter.structure.version_key_format
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 50
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.subprocess_graph_mode:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Subprocess graph режим'
+    path: mapping.camunda_adapter.subprocess_graph_mode
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: structure
+      order: 11
+      priority: 2
+      tab: eopkg
+  mapping.camunda_adapter.tenant_filters:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Тенант фільтри'
+    path: mapping.camunda_adapter.tenant_filters
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.tenant_id:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Тенант id'
+    path: mapping.camunda_adapter.tenant_id
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.until:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum: []
+    label: 'Мапінг: Until'
+    path: mapping.camunda_adapter.until
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.camunda_adapter.version_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Camunda process/tenant/time filtering parameter.
+    enum:
+    - ''
+    - v5
+    - v6
+    label: 'Мапінг: Версія ключ'
+    path: mapping.camunda_adapter.version_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.graph_feature_mapping.enabled:
+    affects: Whether struct_x/structural stats features are produced in runtime.
+    default: false
+    description: Enables canonical stats_index -> tensor mapping for structural branch.
+    enum:
+    - 'false'
+    - 'true'
+    label: Графове stats-мапінг увімкнено
+    path: mapping.graph_feature_mapping.enabled
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: deprecated
+      order: 9999
+      priority: 999
+      tab: legacy
+  mapping.graph_feature_mapping.stats_quality_gate.enabled:
+    affects: Runtime decision to allow/suppress degraded stats tensors.
+    default: true
+    description: Enables consumer-side stats quality gate in DynamicGraphBuilder.
+    enum:
+    - 'false'
+    - 'true'
+    label: Consumer stats quality gate enabled
+    path: mapping.graph_feature_mapping.stats_quality_gate.enabled
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 4
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.stats_quality_gate.min_history_coverage_percent:
+    affects: Runtime quality gate acceptance.
+    default: 0.0
+    description: Minimal history coverage required by consumer gate.
+    enum: []
+    label: Consumer min history coverage percent
+    path: mapping.graph_feature_mapping.stats_quality_gate.min_history_coverage_percent
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 7
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.stats_quality_gate.min_non_zero_ratio_overall:
+    affects: Runtime quality gate acceptance.
+    default: 0.0
+    description: Minimal overall non-zero ratio required by consumer gate.
+    enum: []
+    label: Consumer min non-zero ratio overall
+    path: mapping.graph_feature_mapping.stats_quality_gate.min_non_zero_ratio_overall
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 6
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.stats_quality_gate.on_fail:
+    affects: Runtime fallback policy for stats tensors.
+    default: ignore_with_warning
+    description: Action on consumer quality gate fail.
+    enum:
+    - ignore_with_warning
+    - allow_with_warning
+    - raise
+    label: Consumer stats quality gate on_fail
+    path: mapping.graph_feature_mapping.stats_quality_gate.on_fail
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 3
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.stats_quality_gate.warn_on_fail:
+    affects: Runtime diagnostics verbosity.
+    default: true
+    description: Emit warning when consumer quality gate rejects or downgrades stats
+      payload.
+    enum:
+    - 'false'
+    - 'true'
+    label: Consumer stats quality gate warn_on_fail
+    path: mapping.graph_feature_mapping.stats_quality_gate.warn_on_fail
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 4
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.stats_quality_gate.zero_dominant_threshold:
+    affects: Runtime quality gate acceptance.
+    default: 0.95
+    description: Threshold above which stats snapshot is considered zero-dominant.
+    enum: []
+    label: Consumer zero-dominant threshold
+    path: mapping.graph_feature_mapping.stats_quality_gate.zero_dominant_threshold
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 5
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.topology_projection.diagnostics_enabled:
+    affects: Runtime diagnostics, forward stats, and strict projection alignment checks.
+    default: true
+    description: Enables post-projection topology alignment diagnostics for structural
+      tensors and allowed_target_mask.
+    enum:
+    - 'false'
+    - 'true'
+    label: Projection diagnostics enabled
+    path: mapping.graph_feature_mapping.topology_projection.diagnostics_enabled
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 2
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.topology_projection.gateway_mode:
+    affects: Structural edge tensor and allowed_target_mask construction.
+    default: collapse_for_prediction
+    description: Controls whether BPMN gateway nodes are preserved or collapsed into
+      task-to-task projection for GNN/mask runtime.
+    enum:
+    - preserve
+    - collapse_for_prediction
+    label: gateways
+    path: mapping.graph_feature_mapping.topology_projection.gateway_mode
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 1
+      priority: 2
+      tab: eopkg
+  mapping.graph_feature_mapping.topology_projection.on_fail:
+    affects: Runtime fail-fast behavior for collapse_for_prediction and structural
+      tensor use.
+    default: warn
+    description: Action when post-projection topology alignment cannot be proven.
+    enum:
+    - warn
+    - raise
+    - disable_struct
+    label: Projection alignment on_fail
+    path: mapping.graph_feature_mapping.topology_projection.on_fail
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: graph_mapping
+      order: 3
+      priority: 2
+      tab: eopkg
+  mapping.knowledge_graph.backend:
+    affects: Persistence mode and runtime loading path for structure/statistics.
+    default: file
+    description: Repository backend for structure/snapshot artifacts.
+    enum:
+    - in_memory
+    - file
+    - neo4j
+    label: Бекенд репозиторію знань
+    path: mapping.knowledge_graph.backend
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 1
+      priority: 1
+      tab: eopkg
+  mapping.knowledge_graph.ingest_split:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Knowledge graph backend/storage/connectivity parameter.
+    enum:
+    - full
+    - train
+    label: 'Мапінг: Ingest розбиття'
+    path: mapping.knowledge_graph.ingest_split
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 7
+      priority: 1
+      tab: eopkg
+  mapping.knowledge_graph.neo4j.connection_profile:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Knowledge graph backend/storage/connectivity parameter.
+    enum: []
+    label: 'Мапінг: Підключення профіль'
+    path: mapping.knowledge_graph.neo4j.connection_profile
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 3
+      priority: 1
+      tab: eopkg
+  mapping.knowledge_graph.neo4j.connections_file:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Knowledge graph backend/storage/connectivity parameter.
+    enum: []
+    label: 'Мапінг: Підключення файл'
+    path: mapping.knowledge_graph.neo4j.connections_file
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 4
+      priority: 1
+      tab: eopkg
+  mapping.knowledge_graph.neo4j.verify_connectivity:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Knowledge graph backend/storage/connectivity parameter.
+    enum: []
+    label: 'Мапінг: Перевірка connectivity'
+    path: mapping.knowledge_graph.neo4j.verify_connectivity
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 5
+      priority: 1
+      tab: eopkg
+  mapping.knowledge_graph.path:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Knowledge graph backend/storage/connectivity parameter.
+    enum: []
+    label: 'Мапінг: Шлях'
+    path: mapping.knowledge_graph.path
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 6
+      priority: 1
+      tab: eopkg
+  mapping.knowledge_graph.strict_load:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: Knowledge graph backend/storage/connectivity parameter.
+    enum:
+    - 'false'
+    - 'true'
+    label: Суворе завантаження структури
+    path: mapping.knowledge_graph.strict_load
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: backend
+      order: 2
+      priority: 1
+      tab: eopkg
+  mapping.xes_adapter.activity_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Activity ключ'
+    path: mapping.xes_adapter.activity_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.case_id_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Case id ключ'
+    path: mapping.xes_adapter.case_id_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.complete_transitions:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Complete transitions'
+    path: mapping.xes_adapter.complete_transitions
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.lifecycle_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Lifecycle ключ'
+    path: mapping.xes_adapter.lifecycle_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.pairing_strategy:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Pairing стратегія'
+    path: mapping.xes_adapter.pairing_strategy
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.resource_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Resource ключ'
+    path: mapping.xes_adapter.resource_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.start_transitions:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Mapping: Start transitions'
+    path: mapping.xes_adapter.start_transitions
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: core
+      order: 4
+      priority: 1
+      tab: input
+  mapping.xes_adapter.timestamp_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Timestamp ключ'
+    path: mapping.xes_adapter.timestamp_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.use_classifier:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Мапінг: Use classifier'
+    path: mapping.xes_adapter.use_classifier
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  mapping.xes_adapter.version_key:
+    affects: Ingestion correctness and structure/stats availability.
+    default: ''
+    description: XES parsing/mapping parameter (case/activity/time/version/lifecycle
+      alignment).
+    enum: []
+    label: 'Мапінг: Версія ключ'
+    path: mapping.xes_adapter.version_key
+    required_in_modes: []
+    required_when: {}
+    section: mapping
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  model.candidate_pooling:
+    affects: Controls duplicate activity handling in topology-conditioned candidate
+      scoring.
+    default: logmeanexp
+    description: Aggregation policy from topology node scores to label-level logits
+      in Stage 1.
+    enum:
+    - logmeanexp
+    - mean
+    - max
+    label: 'Model: duplicate candidate pooling'
+    path: model.candidate_pooling
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: core
+      order: 33
+      priority: 20
+      tab: model
+  model.candidate_scoring:
+    affects: Controls candidate ranking geometry for EOPKGTopologyConditioned.
+    default: cosine
+    description: Scoring function between observed prefix state and topology candidate
+      prototypes.
+    enum:
+    - cosine
+    - bilinear
+    label: 'Model: candidate scoring'
+    path: model.candidate_scoring
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: core
+      order: 32
+      priority: 20
+      tab: model
+  model.candidate_temperature_init:
+    affects: Controls sharpness of candidate-score logits and MIL pooling gradients.
+    default: 0.1
+    description: Fixed or initial temperature for topology candidate cosine scores.
+    enum: []
+    label: 'Model: candidate temperature'
+    path: model.candidate_temperature_init
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1032
+      priority: 100
+      tab: model
+  model.candidate_temperature_max:
+    affects: Prevents candidate scores from becoming too flat when temperature is
+      trainable.
+    default: 2.0
+    description: Upper clamp for trainable candidate temperature.
+    enum: []
+    label: 'Model: candidate temperature max'
+    path: model.candidate_temperature_max
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1034
+      priority: 100
+      tab: model
+  model.candidate_temperature_min:
+    affects: Prevents candidate scores from becoming too sharp when temperature is
+      trainable.
+    default: 0.05
+    description: Lower clamp for trainable candidate temperature.
+    enum: []
+    label: 'Model: candidate temperature min'
+    path: model.candidate_temperature_min
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1033
+      priority: 100
+      tab: model
+  model.candidate_temperature_trainable:
+    affects: Useful for ablation, but may destabilize candidate ranking if enabled.
+    default: false
+    description: Allows candidate temperature to be optimized; canonical Stage 1 keeps
+      it fixed.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Model: train candidate temperature'
+    path: model.candidate_temperature_trainable
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1035
+      priority: 100
+      tab: model
+  model.impulse_activation_enabled:
+    affects: Enables topology-native impulse routing inside EOPKGTopologyConditioned.
+    default: 'false'
+    description: Convenience toggle for model.topology_conditioning_mode=impulse_activation_routing.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Model: impulse activation'
+    path: model.impulse_activation_enabled
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: core
+      order: 35
+      priority: 20
+      tab: model
+  model.impulse_gnn_layers:
+    affects: Controls how far the execution impulse diffuses through topology.
+    default: 1
+    description: Number of structural GNN message-passing layers for impulse routing;
+      first implementation supports 1 or 2.
+    enum:
+    - '1'
+    - '2'
+    label: 'Model: impulse GNN layers'
+    path: model.impulse_gnn_layers
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1040
+      priority: 100
+      tab: model
+  model.impulse_residual_h0:
+    affects: Preserves the pre-message-passing impulse state in candidate embeddings.
+    default: 'true'
+    description: Add h0 back after impulse structural message passing.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Model: impulse residual h0'
+    path: model.impulse_residual_h0
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1041
+      priority: 100
+      tab: model
+  model.impulse_scale_init:
+    affects: Initial strength of prefix-state impulse injection into topology nodes.
+    default: 0.1
+    description: Initial bounded scalar multiplier for normalized impulse projection.
+    enum: []
+    label: 'Model: impulse scale init'
+    path: model.impulse_scale_init
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1038
+      priority: 100
+      tab: model
+  model.impulse_scale_max:
+    affects: Prevents impulse routing from dominating candidate embeddings.
+    default: 2.0
+    description: Upper clamp for the impulse scale parameter.
+    enum: []
+    label: 'Model: impulse scale max'
+    path: model.impulse_scale_max
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1039
+      priority: 100
+      tab: model
+  model.impulse_state_channels:
+    affects: Documents which struct_prefix_state_x channels feed impulse routing.
+    default:
+    - is_last_event
+    - prefix_executed_count_log1p
+    - prefix_recency_norm
+    description: Logical prefix-state channels used by impulse routing; tensor order
+      remains the GraphTensorContract struct_prefix_state_x order.
+    enum: []
+    label: 'Model: impulse state channels'
+    path: model.impulse_state_channels
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1037
+      priority: 100
+      tab: model
+  model.topology_conditioning_mode:
+    affects: Selects static topology candidate scoring or dynamic prefix-state impulse
+      routing.
+    default: static_candidates
+    description: EOPKGTopologyConditioned topology conditioning mode; impulse routing
+      predicts in topology-native candidate space.
+    enum:
+    - static_candidates
+    - impulse_activation_routing
+    label: 'Model: topology conditioning mode'
+    path: model.topology_conditioning_mode
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: core
+      order: 34
+      priority: 20
+      tab: model
+  model.cross_attention_heads:
+    affects: Capacity, compute footprint, and generalization behavior.
+    default: ''
+    description: Model architecture/hyperparameter.
+    enum: []
+    label: 'Модель: Cross attention голови'
+    path: model.cross_attention_heads
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.dropout:
+    affects: Prefix graph construction strategy for model input.
+    default: sequential_prefix
+    description: Currently only sequential_prefix is implemented; prefix events are
+      represented as a sequential event graph.
+    enum:
+    - sequential_prefix
+    label: 'Модель: Dropout'
+    path: model.dropout
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.fusion_mode:
+    affects: How structural context is combined with observed branch in EOPKG mode.
+    default: ClassMeanAttention
+    description: ClassMeanAttention keeps old Attention semantics; ClassMeanConcat
+      keeps old Concat/struct_pool_concat semantics; ClassAwareStructuralScoring adds
+      per-class structural logits to observed logits; TopologyStateEncoder projects
+      observed prefix state onto topology nodes before structural message passing
+      and pools node logits to classes; TopologyStateGraphEncoder projects observed
+      prefix state onto topology nodes, performs topology message passing, then classifies
+      a graph-level topology context; StructuralPriorEncoder uses etalon-like representation-level
+      fusion with observed context plus pooled structural context before classifier;
+      StructXAttn uses token-level structural cross-attention from observed IG nodes
+      to structural nodes before pooling.
+    enum:
+    - ClassMeanAttention
+    - ClassMeanConcat
+    - ClassAwareStructuralScoring
+    - TopologyStateEncoder
+    - TopologyStateGraphEncoder
+    - StructuralPriorEncoder
+    - StructXAttn
+    label: 'Модель: Fusion mode'
+    path: model.fusion_mode
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.graph_strategy:
+    affects: Capacity, compute footprint, and generalization behavior.
+    default: ''
+    description: Model architecture/hyperparameter.
+    enum: []
+    label: 'Модель: Graph стратегія'
+    path: model.graph_strategy
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.hidden_dim:
+    affects: Capacity, compute footprint, and generalization behavior.
+    default: ''
+    description: Model architecture/hyperparameter.
+    enum: []
+    label: 'Модель: Прихований розмірність'
+    path: model.hidden_dim
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.model_label:
+    affects: Capacity, compute footprint, and generalization behavior.
+    default: ''
+    description: Model architecture/hyperparameter.
+    enum:
+    - GATv2
+    - GCN
+    label: 'Модель: Модель мітка'
+    path: model.model_label
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.observed_encoder:
+    affects: Defines how the prefix graph state is encoded before candidate scoring.
+    default: GATv2
+    description: Observed-prefix encoder used by EOPKGTopologyConditioned.
+    enum:
+    - GATv2
+    label: 'Model: observed encoder'
+    path: model.observed_encoder
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1030
+      priority: 100
+      readonly: true
+      tab: model
+  model.pooling_strategy:
+    affects: Capacity, compute footprint, and generalization behavior.
+    default: ''
+    description: Model architecture/hyperparameter.
+    enum: []
+    label: 'Модель: Пулінг стратегія'
+    path: model.pooling_strategy
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.struct_encoder:
+    affects: Defines message passing over topology candidates before scoring.
+    default: GATv2
+    description: Structural encoder used to produce topology candidate prototypes.
+    enum:
+    - GATv2
+    label: 'Model: topology candidate encoder'
+    path: model.struct_encoder
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: model
+    ui:
+      group: advanced
+      order: 1031
+      priority: 100
+      readonly: true
+      tab: model
+  model.struct_encoder_type:
+    affects: Structure branch message-passing behavior in EOPKG mode.
+    default: GATv2Conv
+    description: Encoder type for structural branch of EOPKGGATv2.
+    enum:
+    - GATv2Conv
+    - GCNConv
+    label: 'Модель: Struct encoder type'
+    path: model.struct_encoder_type
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      readonly: true
+      tab: model
+  model.struct_hidden_dim:
+    affects: How observed prefix node embeddings are pooled before classification.
+    default: global_mean
+    description: global_mean pools all prefix node embeddings; last_node uses the
+      final prefix node embedding as the process state.
+    enum:
+    - global_mean
+    - last_node
+    label: 'Модель: Struct прихований розмірність'
+    path: model.struct_hidden_dim
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.struct_xattn_delta_ratio_max:
+    affects: Prevents structural cross-attention delta from overpowering observed
+      node states during drift.
+    default: ''
+    description: Optional cap for mean_abs(delta) divided by mean_abs(observed) in
+      StructXAttn residual merge.
+    enum: []
+    label: 'Model: StructXAttn delta ratio max'
+    path: model.struct_xattn_delta_ratio_max
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1025
+      priority: 100
+      tab: model
+  model.struct_xattn_dropout:
+    affects: Regularization of structural token guidance.
+    default: 0.2
+    description: Dropout used inside and after StructXAttn.
+    enum: []
+    label: 'Model: StructXAttn dropout'
+    path: model.struct_xattn_dropout
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1018
+      priority: 100
+      tab: model
+  model.struct_xattn_gate_init_bias:
+    affects: Negative values start StructXAttn conservatively.
+    default: -2.0
+    description: Initial sigmoid gate bias for structural attention delta.
+    enum: []
+    label: 'Model: StructXAttn gate init bias'
+    path: model.struct_xattn_gate_init_bias
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.struct_xattn_use_gate: 'true'
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1023
+      priority: 100
+      tab: model
+  model.struct_xattn_heads:
+    affects: Capacity and compute cost of observed-node to structure-node attention.
+    default: 4
+    description: Number of heads for token-level structural cross-attention.
+    enum: []
+    label: 'Model: StructXAttn heads'
+    path: model.struct_xattn_heads
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1017
+      priority: 100
+      tab: model
+  model.struct_xattn_layers:
+    affects: post_conv2 is safer; after_each_conv makes observed message passing structurally
+      guided.
+    default: post_conv2
+    description: Injection placement for token-level structural cross-attention.
+    enum:
+    - post_conv2
+    - after_each_conv
+    label: 'Model: StructXAttn layers'
+    path: model.struct_xattn_layers
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1016
+      priority: 100
+      tab: model
+  model.struct_xattn_merge_mode:
+    affects: Controls whether StructXAttn uses legacy post-merge LayerNorm or stable
+      pre-normalized structural context.
+    default: post_norm_residual
+    description: Residual merge semantics for token-level structural cross-attention.
+    enum:
+    - post_norm_residual
+    - pre_norm_context
+    - residual_only
+    label: 'Model: StructXAttn merge mode'
+    path: model.struct_xattn_merge_mode
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1024
+      priority: 100
+      tab: model
+  model.struct_xattn_scale_init:
+    affects: Conservative start for structural guidance.
+    default: 0.1
+    description: Initial gamma multiplier for structural cross-attention delta.
+    enum: []
+    label: 'Model: StructXAttn scale init'
+    path: model.struct_xattn_scale_init
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1019
+      priority: 100
+      tab: model
+  model.struct_xattn_scale_max:
+    affects: Prevents structural attention delta from dominating observed node states.
+    default: 2.0
+    description: Upper clamp for learned StructXAttn gamma.
+    enum: []
+    label: 'Model: StructXAttn scale max'
+    path: model.struct_xattn_scale_max
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1020
+      priority: 100
+      tab: model
+  model.struct_xattn_use_gate:
+    affects: Lets observed nodes suppress noisy structural guidance.
+    default: 'true'
+    description: Use a sigmoid gate over the structural attention delta.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Model: StructXAttn gate'
+    path: model.struct_xattn_use_gate
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1022
+      priority: 100
+      tab: model
+  model.struct_xattn_use_layer_norm:
+    affects: Stabilizes token-level structural updates.
+    default: 'true'
+    description: Apply LayerNorm after residual structural cross-attention update.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Model: StructXAttn layer norm'
+    path: model.struct_xattn_use_layer_norm
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1021
+      priority: 100
+      tab: model
+  model.structural_logit_scale_init:
+    affects: Protects observed logits from structural over-dominance at training start.
+    default: 0.1
+    description: Initial gamma multiplier for normalized structural logits.
+    enum: []
+    label: 'Model: Structural logit scale init'
+    path: model.structural_logit_scale_init
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1002
+      priority: 100
+      tab: model
+  model.structural_logit_scale_max:
+    affects: Prevents the structural branch from dominating observed logits.
+    default: 2.0
+    description: Upper clamp for learned structural logit gamma.
+    enum: []
+    label: 'Model: Structural logit scale max'
+    path: model.structural_logit_scale_max
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1003
+      priority: 100
+      tab: model
+  model.structural_observed_scale_max:
+    affects: Keeps structural-logit scale aligned without inheriting extreme observed-logit
+      magnitudes.
+    default: 10.0
+    description: Upper clamp for detached observed-logit magnitude used to scale structural
+      logits.
+    enum: []
+    label: 'Model: Structural observed scale max'
+    path: model.structural_observed_scale_max
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1005
+      priority: 100
+      tab: model
+  model.structural_observed_scale_min:
+    affects: Keeps normalized structural logits numerically meaningful when observed
+      logits are small.
+    default: 1.0
+    description: Lower clamp for detached observed-logit magnitude used to scale structural
+      logits.
+    enum: []
+    label: 'Model: Structural observed scale min'
+    path: model.structural_observed_scale_min
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1004
+      priority: 100
+      tab: model
+  model.structural_prior_fusion:
+    affects: concat is the direct etalon-like baseline; gated_concat learns how strongly
+      to pass structural context.
+    default: concat
+    description: Fusion operator for observed context and pooled structural context
+      in StructuralPriorEncoder.
+    enum:
+    - concat
+    - gated_concat
+    label: 'Model: Structural prior fusion'
+    path: model.structural_prior_fusion
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructuralPriorEncoder
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1014
+      priority: 100
+      tab: model
+  model.structural_prior_gate_init_bias:
+    affects: Initial strength of structural context in gated StructuralPriorEncoder.
+    default: -1.0
+    description: Initial sigmoid gate bias for gated_concat; negative values start
+      with conservative structural influence.
+    enum: []
+    label: 'Model: Structural prior gate init bias'
+    path: model.structural_prior_gate_init_bias
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructuralPriorEncoder
+      model.structural_prior_fusion: gated_concat
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1015
+      priority: 100
+      tab: model
+  model.structural_prior_pooling:
+    affects: How BPMN/EOPKG node states become one structural context vector before
+      classifier fusion.
+    default: mean
+    description: Pooling strategy for structural node embeddings in StructuralPriorEncoder;
+      mean mirrors etalon global_mean_pool.
+    enum:
+    - mean
+    label: 'Model: Structural prior pooling'
+    path: model.structural_prior_pooling
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructuralPriorEncoder
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1013
+      priority: 100
+      tab: model
+  model.structural_score_mode:
+    affects: Per-class structural logit signal for topology-aware ranking.
+    default: bilinear_with_prior
+    description: Scoring function used by ClassAwareStructuralScoring before node-to-class
+      late pooling.
+    enum:
+    - bilinear_with_prior
+    - cosine
+    label: 'Model: Structural score mode'
+    path: model.structural_score_mode
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1001
+      priority: 100
+      tab: model
+  model.structural_stats_beta:
+    affects: Controls how strongly struct_x statistics enrich structural identity
+      embeddings before structural GNN message passing.
+    default: 0.1
+    description: Fixed beta multiplier for additive stats projection in structural
+      node features.
+    enum: []
+    label: 'Model: Structural stats beta'
+    path: model.structural_stats_beta
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1006
+      priority: 100
+      tab: model
+  model.topology_graph_pooling:
+    affects: How structural node states become one graph-level topology context before
+      classification.
+    default: mean
+    description: Graph-level pooling strategy for TopologyStateGraphEncoder; mean
+      mirrors etalon/article-style global_mean_pool.
+    enum:
+    - mean
+    label: 'Model: Topology graph pooling'
+    path: model.topology_graph_pooling
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: TopologyStateGraphEncoder
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1012
+      priority: 100
+      tab: model
+  model.topology_state_beta:
+    affects: Strength of early observed-state injection into EOPKG topology.
+    default: 0.5
+    description: Scales gated observed prefix-state projection before topology message
+      passing in TopologyStateEncoder and TopologyStateGraphEncoder.
+    enum: []
+    label: 'Model: Topology-state beta'
+    path: model.topology_state_beta
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1007
+      priority: 100
+      tab: model
+  model.topology_state_beta_max:
+    affects: Prevents over-amplification of prefix-state injection.
+    default: 2.0
+    description: Forward-time upper clamp for topology_state_beta.
+    enum: []
+    label: 'Model: Topology-state beta max'
+    path: model.topology_state_beta_max
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1008
+      priority: 100
+      tab: model
+  model.topology_state_class_pooling:
+    affects: Duplicate activity cardinality bias and calibration.
+    default: logmeanexp
+    description: Node-to-class pooling for TopologyStateEncoder; logmeanexp is cardinality-normalized
+      and is the default.
+    enum:
+    - logmeanexp
+    - mean
+    - max
+    - logsumexp
+    label: 'Model: Topology-state class pooling'
+    path: model.topology_state_class_pooling
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: TopologyStateEncoder
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1010
+      priority: 100
+      tab: model
+  model.topology_state_dropout:
+    affects: Regularization of early topology-state fusion.
+    default: 0.2
+    description: Dropout applied to prefix-state projection in TopologyStateEncoder
+      and TopologyStateGraphEncoder.
+    enum: []
+    label: 'Model: Topology-state dropout'
+    path: model.topology_state_dropout
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1011
+      priority: 100
+      tab: model
+  model.topology_state_gate_init_bias:
+    affects: Controls whether early topology-state fusion starts conservative or aggressive.
+    default: -2.0
+    description: Initial bias for sigmoid gate over prefix-state projection.
+    enum: []
+    label: 'Model: Topology-state gate init bias'
+    path: model.topology_state_gate_init_bias
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGGATv2
+    section: model
+    ui:
+      group: advanced
+      order: 1009
+      priority: 100
+      tab: model
+  model.type:
+    affects: Core runtime architecture and availability of structure/statistics branch.
+    default: BaselineGATv2
+    description: Main model type (baseline or EOPKG).
+    enum:
+    - BaselineGATv2
+    - BaselineGCN
+    - LSTM_Baseline
+    - EOPKGGATv2
+    - EOPKGTopologyConditioned
+    label: 'Модель: Type'
+    path: model.type
+    required_in_modes: []
+    required_when: {}
+    section: model
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: model
+  model.recurrent_bidirectional:
+    affects: Controls whether the fixed-vocabulary recurrent baseline reads prefixes in both temporal directions.
+    default: 'false'
+    description: Recurrent baseline bidirectionality. Keep false for causal next-activity prediction unless explicitly ablated.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Model: Recurrent bidirectional'
+    path: model.recurrent_bidirectional
+    required_in_modes: []
+    required_when:
+      model.type: LSTM_Baseline
+    section: model
+    ui:
+      group: advanced
+      order: 1052
+      priority: 100
+      tab: model
+  model.recurrent_layers:
+    affects: Controls depth of the fixed-vocabulary recurrent baseline.
+    default: 1
+    description: Number of LSTM/GRU recurrent layers.
+    enum: []
+    label: 'Model: Recurrent layers'
+    path: model.recurrent_layers
+    required_in_modes: []
+    required_when:
+      model.type: LSTM_Baseline
+    section: model
+    type: int
+    ui:
+      group: advanced
+      order: 1051
+      priority: 100
+      tab: model
+  model.recurrent_type:
+    affects: Selects LSTM or GRU for the fixed-vocabulary logs-only baseline.
+    default: lstm
+    description: Recurrent cell type for LSTM_Baseline.
+    enum:
+    - lstm
+    - gru
+    label: 'Model: Recurrent type'
+    path: model.recurrent_type
+    required_in_modes: []
+    required_when:
+      model.type: LSTM_Baseline
+    section: model
+    ui:
+      group: advanced
+      order: 1050
+      priority: 100
+      tab: model
+  seed:
+    affects: Reproducibility of stochastic components.
+    default: ''
+    description: Global random seed for reproducible runs.
+    enum: []
+    label: Фіксоване зерно (seed)
+    path: seed
+    required_in_modes: []
+    required_when: {}
+    section: seed
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  sync_stats.alignment_gate.candidate_node_fields:
+    affects: Which topology identifiers/names can satisfy the alignment gate.
+    default:
+    - id
+    description: Ordered topology node fields used as activity mapping candidates.
+    enum: []
+    label: Producer alignment candidate fields
+    path: sync_stats.alignment_gate.candidate_node_fields
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 22
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.collapse_separators:
+    affects: Activity mapping tolerance for separator differences.
+    default: false
+    description: Collapse spaces, underscores, and hyphens during normalized matching.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment collapse separators
+    path: sync_stats.alignment_gate.collapse_separators
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 26
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.enabled:
+    affects: Whether weakly aligned stats snapshots are flagged/skipped/raised during
+      sync.
+    default: true
+    description: Enables producer-side activity-to-topology alignment gate in sync-stats.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment gate enabled
+    path: sync_stats.alignment_gate.enabled
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 20
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.fail_on_ambiguity:
+    affects: False-positive prevention for normalized activity matching.
+    default: true
+    description: Reject snapshots when an event activity can map to multiple topology
+      nodes.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment fail on ambiguity
+    path: sync_stats.alignment_gate.fail_on_ambiguity
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 27
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.ignore_structural_only_nodes:
+    affects: Node coverage semantics for BPMN processes with events and gateways.
+    default: false
+    description: Exclude structural-only BPMN nodes from node coverage denominator.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment ignore structural nodes
+    path: sync_stats.alignment_gate.ignore_structural_only_nodes
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 23
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.min_event_match_ratio:
+    affects: Activity-to-topology alignment acceptance for stats snapshots.
+    default: 0.6
+    description: Minimal ratio of runtime events whose activity ids match topology
+      nodes.
+    enum: []
+    label: Producer min event match ratio
+    path: sync_stats.alignment_gate.min_event_match_ratio
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 29
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.min_node_coverage:
+    affects: Activity-to-topology alignment acceptance for stats snapshots.
+    default: 0.0
+    description: Minimal topology node coverage by matched runtime activities.
+    enum: []
+    label: Producer min node coverage
+    path: sync_stats.alignment_gate.min_node_coverage
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 31
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.min_unique_activity_coverage:
+    affects: Activity-to-topology alignment acceptance for stats snapshots.
+    default: 0.6
+    description: Minimal coverage of unique runtime activities by topology nodes.
+    enum: []
+    label: Producer min unique activity coverage
+    path: sync_stats.alignment_gate.min_unique_activity_coverage
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 30
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.normalize_case:
+    affects: Activity mapping tolerance for casing differences.
+    default: false
+    description: Use case-insensitive candidate matching after exact matching.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment normalize case
+    path: sync_stats.alignment_gate.normalize_case
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 25
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.on_fail:
+    affects: Snapshot persistence/fail-fast policy in sync-stats.
+    default: write_with_flag
+    description: Action when producer alignment thresholds are not met.
+    enum:
+    - write_with_flag
+    - skip_snapshot
+    - raise
+    label: Producer alignment gate on_fail
+    path: sync_stats.alignment_gate.on_fail
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 32
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.profile:
+    affects: Alignment denominator, candidate matching strategy, and research strictness.
+    default: legacy_exact
+    description: Matching profile for activity-to-topology alignment.
+    enum:
+    - legacy_exact
+    - safe_normalized
+    - research_strict
+    label: Producer alignment profile
+    path: sync_stats.alignment_gate.profile
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 21
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.strip_classifier_suffix:
+    affects: Activity mapping when logs include classifier-extended names.
+    default: false
+    description: Strip lifecycle classifier suffixes such as +complete or ::complete
+      before matching.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment strip classifier suffix
+    path: sync_stats.alignment_gate.strip_classifier_suffix
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 24
+      priority: 2
+      tab: eopkg
+  sync_stats.alignment_gate.warn_on_fail:
+    affects: Sync diagnostics verbosity for activity-to-topology mismatches.
+    default: true
+    description: Emit warning when producer alignment gate fails.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer alignment gate warn_on_fail
+    path: sync_stats.alignment_gate.warn_on_fail
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 28
+      priority: 2
+      tab: eopkg
+  sync_stats.confidence_weights.coverage:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Coverage'
+    path: sync_stats.confidence_weights.coverage
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.confidence_weights.freshness:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Freshness'
+    path: sync_stats.confidence_weights.freshness
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.confidence_weights.sample_size:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Sample size'
+    path: sync_stats.confidence_weights.sample_size
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.enabled:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Увімкнено'
+    path: sync_stats.enabled
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.freshness_half_life_days:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Freshness half life days'
+    path: sync_stats.freshness_half_life_days
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.process_filters:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Процес фільтри'
+    path: sync_stats.process_filters
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.process_scope_policy:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Процес scope політика'
+    path: sync_stats.process_scope_policy
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.quality_gate.enabled:
+    affects: Whether low-quality snapshots are flagged/skipped during sync.
+    default: true
+    description: Enables producer-side quality gate in sync-stats.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer quality gate enabled
+    path: sync_stats.quality_gate.enabled
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 10
+      priority: 2
+      tab: eopkg
+  sync_stats.quality_gate.min_history_coverage_percent:
+    affects: Producer quality gate acceptance.
+    default: 0.0
+    description: Minimal history coverage required by producer gate.
+    enum: []
+    label: Producer min history coverage percent
+    path: sync_stats.quality_gate.min_history_coverage_percent
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 15
+      priority: 2
+      tab: eopkg
+  sync_stats.quality_gate.min_non_zero_ratio_overall:
+    affects: Producer quality gate acceptance.
+    default: 0.0
+    description: Minimal overall non-zero ratio required by producer gate.
+    enum: []
+    label: Producer min non-zero ratio overall
+    path: sync_stats.quality_gate.min_non_zero_ratio_overall
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 14
+      priority: 2
+      tab: eopkg
+  sync_stats.quality_gate.on_fail:
+    affects: Snapshot persistence policy in sync-stats.
+    default: write_with_flag
+    description: Action when producer quality thresholds are not met.
+    enum:
+    - write_with_flag
+    - skip_snapshot
+    label: Producer quality gate on_fail
+    path: sync_stats.quality_gate.on_fail
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 11
+      priority: 2
+      tab: eopkg
+  sync_stats.quality_gate.warn_on_fail:
+    affects: Sync diagnostics verbosity.
+    default: true
+    description: Emit warning when producer quality gate fails.
+    enum:
+    - 'false'
+    - 'true'
+    label: Producer quality gate warn_on_fail
+    path: sync_stats.quality_gate.warn_on_fail
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 12
+      priority: 2
+      tab: eopkg
+  sync_stats.quality_gate.zero_dominant_threshold:
+    affects: Producer quality gate acceptance.
+    default: 0.95
+    description: Threshold above which snapshot is considered zero-dominant.
+    enum: []
+    label: Producer zero-dominant threshold
+    path: sync_stats.quality_gate.zero_dominant_threshold
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: sync_stats
+      order: 13
+      priority: 2
+      tab: eopkg
+  sync_stats.show_progress:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Show progress'
+    path: sync_stats.show_progress
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.stats_time_policy:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Статистика time політика'
+    path: sync_stats.stats_time_policy
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.tenant_filters:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Тенант фільтри'
+    path: sync_stats.tenant_filters
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  sync_stats.windows_days:
+    affects: Quality and temporal relevance of stats snapshots.
+    default: ''
+    description: sync-stats snapshot generation parameter.
+    enum: []
+    label: 'Синхронізація статистики: Windows days'
+    path: sync_stats.windows_days
+    required_in_modes: []
+    required_when: {}
+    section: sync_stats
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: input
+  tracking.backend:
+    affects: Run observability and experiment comparison.
+    default: mlflow
+    description: Tracking backend. Current supported value in this UI is mlflow.
+    enum:
+    - mlflow
+    label: 'Трекінг: Бекенд'
+    path: tracking.backend
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  tracking.enabled:
+    affects: Run observability and experiment comparison.
+    default: ''
+    description: Experiment tracking parameter.
+    enum: []
+    label: 'Трекінг: Увімкнено'
+    path: tracking.enabled
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  tracking.tags.model_family:
+    affects: Run observability and experiment comparison.
+    default: ''
+    description: Experiment tracking parameter.
+    enum: []
+    label: 'Трекінг: Модель family'
+    path: tracking.tags.model_family
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  tracking.tags.stage:
+    affects: Run observability and experiment comparison.
+    default: ''
+    description: Experiment tracking parameter.
+    enum: []
+    label: 'Трекінг: Stage'
+    path: tracking.tags.stage
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  tracking.tracing.allow_nonzero_rank_fallback:
+    affects: DDP safety for fallback trace files.
+    default: false
+    description: Allow nonzero distributed ranks to write separate JSONL fallback
+      files.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Tracing: allow nonzero rank fallback'
+    path: tracking.tracing.allow_nonzero_rank_fallback
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1021
+      priority: 90
+      tab: general
+  tracking.tracing.enabled:
+    affects: MLflow span recording or JSONL fallback during test/eval_drift inference.
+    default: false
+    description: Enable selective structural prediction traces for qualitative debugging.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Tracing: enabled'
+    path: tracking.tracing.enabled
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1010
+      priority: 90
+      tab: general
+  tracking.tracing.high_confidence_threshold:
+    affects: Which wrong predictions are treated as high-confidence diagnostics.
+    default: 0.8
+    description: Confidence threshold for high-confidence error traces.
+    enum: []
+    label: 'Tracing: high confidence threshold'
+    path: tracking.tracing.high_confidence_threshold
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1017
+      priority: 90
+      tab: general
+  tracking.tracing.log_json_artifact_fallback:
+    affects: Trace availability when MLflow tracing spans are unavailable.
+    default: true
+    description: Write trace events to a rank/PID-scoped JSONL fallback and log it
+      as an artifact.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Tracing: JSONL fallback'
+    path: tracking.tracing.log_json_artifact_fallback
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1020
+      priority: 90
+      tab: general
+  tracking.tracing.low_confidence_threshold:
+    affects: Which correct predictions are traced as unstable-but-right cases.
+    default: 0.4
+    description: Confidence threshold for low-confidence correct traces.
+    enum: []
+    label: 'Tracing: low confidence threshold'
+    path: tracking.tracing.low_confidence_threshold
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1018
+      priority: 90
+      tab: general
+  tracking.tracing.max_traces_per_run:
+    affects: Runtime overhead and MLflow/JSONL artifact size.
+    default: 80
+    description: Hard limit for recorded trace events in one run.
+    enum: []
+    label: 'Tracing: max per run'
+    path: tracking.tracing.max_traces_per_run
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1013
+      priority: 90
+      tab: general
+  tracking.tracing.max_traces_per_stage:
+    affects: Balance of traces across test and drift evaluation stages.
+    default: 40
+    description: Per-stage limit for recorded trace events.
+    enum: []
+    label: 'Tracing: max per stage'
+    path: tracking.tracing.max_traces_per_stage
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1014
+      priority: 90
+      tab: general
+  tracking.tracing.max_traces_per_version:
+    affects: Prevents one version from consuming the whole trace budget.
+    default: 10
+    description: Per process-version limit for recorded trace events.
+    enum: []
+    label: 'Tracing: max per version'
+    path: tracking.tracing.max_traces_per_version
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1015
+      priority: 90
+      tab: general
+  tracking.tracing.random_sample_rate:
+    affects: Trace volume under random sampling.
+    default: 0.0
+    description: Probability for random trace sampling when sample_policy=random.
+    enum: []
+    label: 'Tracing: random sample rate'
+    path: tracking.tracing.random_sample_rate
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1016
+      priority: 90
+      tab: general
+  tracking.tracing.sample_policy:
+    affects: Trace volume and diagnostic focus.
+    default: interesting
+    description: Selects which predictions become traces.
+    enum:
+    - interesting
+    - random
+    - all
+    label: 'Tracing: sample policy'
+    path: tracking.tracing.sample_policy
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1012
+      priority: 90
+      tab: general
+  tracking.tracing.stages:
+    affects: Limits trace collection to test, eval_drift_one_pass, or other supported
+      stages.
+    default: test,eval_drift_one_pass
+    description: Comma-separated stages where selective traces may be recorded.
+    enum: []
+    label: 'Tracing: stages'
+    path: tracking.tracing.stages
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1011
+      priority: 90
+      tab: general
+  tracking.tracing.top_k:
+    affects: Trace payload size and prediction explanation detail.
+    default: 5
+    description: Number of top predicted classes included in trace payload.
+    enum: []
+    label: 'Tracing: top-k classes'
+    path: tracking.tracing.top_k
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1019
+      priority: 90
+      tab: general
+  tracking.uri:
+    affects: Run observability and experiment comparison.
+    default: ''
+    description: Experiment tracking parameter.
+    enum: []
+    label: 'Трекінг: Uri'
+    path: tracking.uri
+    required_in_modes: []
+    required_when: {}
+    section: tracking
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.batch_size:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Batch size'
+    path: training.batch_size
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.candidate_batch_topology_policy:
+    affects: Prevents silent candidate-axis corruption when a batch contains multiple
+      process versions or stats snapshots.
+    default: single_topology_required
+    description: Batch topology policy for candidate_id mode. single_topology_required
+      fails mixed manual batches; group_by_topology builds topology-homogeneous batches
+      by process version and stats snapshot.
+    enum:
+    - single_topology_required
+    - group_by_topology
+    label: 'Training: Candidate batch topology policy'
+    path: training.candidate_batch_topology_policy
+    required_in_modes: []
+    required_when:
+      training.candidate_contract_mode: candidate_id
+    section: training
+    ui:
+      group: advanced
+      order: 1016
+      priority: 100
+      tab: general
+  training.candidate_contract_mode:
+    affects: Controls whether topology candidates are evaluated as fixed labels, compatibility
+      projections, or true topology-local candidate ids.
+    default: fixed_label
+    description: Prediction/loss contract. fixed_label uses the legacy fixed activity
+      head; fixed_projection uses dynamic candidates projected back to fixed labels;
+      candidate_id requires topology-homogeneous batches and is reserved for true
+      candidate-level training/evaluation.
+    enum:
+    - fixed_label
+    - fixed_projection
+    - candidate_id
+    label: 'Training: Candidate contract mode'
+    path: training.candidate_contract_mode
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: training
+    ui:
+      group: advanced
+      order: 1015
+      priority: 100
+      tab: general
+  training.candidate_identity_mode:
+    affects: Controls whether future-version BPMN candidates can exist outside the
+      training activity vocabulary.
+    default: topology_native
+    description: Candidate identity contract for candidate_id mode. topology_native
+      scores candidates from the current BPMN topology and maps unknown train-vocab
+      labels as candidate_class_index=-1; fixed_vocab_bridge keeps legacy compatibility
+      behavior.
+    enum:
+    - fixed_vocab_bridge
+    - topology_native
+    label: 'Training: Candidate identity mode'
+    path: training.candidate_identity_mode
+    required_in_modes: []
+    required_when:
+      training.candidate_contract_mode: candidate_id
+    section: training
+    ui:
+      group: advanced
+      order: 1017
+      priority: 100
+      tab: general
+  training.candidate_missing_target_fail_threshold:
+    affects: Protects true candidate-level loss from silently training on batches
+      where target labels cannot be mapped to topology-local candidates.
+    default: 0.1
+    description: Maximum allowed missing-target rate for candidate_id training before
+      failing as a log/topology mapping error.
+    label: 'Training: Candidate missing-target fail threshold'
+    path: training.candidate_missing_target_fail_threshold
+    required_in_modes: []
+    required_when:
+      training.candidate_contract_mode: candidate_id
+    section: training
+    type: float
+    ui:
+      group: advanced
+      order: 1018
+      priority: 100
+      tab: general
+  training.process_state_mask_enabled:
+    affects: Expands topology-derived masks for parallel/interleaved process states
+      using active tasks reconstructed from lifecycle events.
+    default: false
+    description: Enables process-state-aware mask construction. Intended for XES
+      logs with lifecycle:start/complete events where last-node successors are
+      insufficient for parallel branches.
+    label: 'Training: Process-state mask enabled'
+    path: training.process_state_mask_enabled
+    required_in_modes: []
+    required_when: {}
+    section: training
+    type: bool
+    ui:
+      group: advanced
+      order: 1019
+      priority: 100
+      tab: general
+  training.process_state_mask_source:
+    affects: Selects how active candidates are reconstructed before merging them
+      into allowed-target masks.
+    default: lifecycle_active_set
+    description: Active candidate source for process-state-aware masks. lifecycle_active_set
+      reconstructs active tasks from lifecycle:start/complete; event_active_candidates
+      uses explicit active_activities_after_complete metadata; relaxed_reachability
+      is reserved and currently falls back to direct successors only.
+    enum:
+    - lifecycle_active_set
+    - event_active_candidates
+    - relaxed_reachability
+    label: 'Training: Process-state mask source'
+    path: training.process_state_mask_source
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_enabled: true
+    section: training
+    ui:
+      group: advanced
+      order: 1020
+      priority: 100
+      tab: general
+  training.process_state_mask_include_direct_successors:
+    affects: Controls whether the existing last-node successor mask remains part
+      of the process-state-aware allowed set.
+    default: true
+    description: Include direct successors from the current prefix last activity
+      in addition to reconstructed active candidates.
+    label: 'Training: Process-state include direct successors'
+    path: training.process_state_mask_include_direct_successors
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_enabled: true
+    section: training
+    type: bool
+    ui:
+      group: advanced
+      order: 1021
+      priority: 100
+      tab: general
+  training.process_state_mask_include_active_candidates:
+    affects: Controls whether reconstructed active tasks are merged into allowed-target
+      masks and structural prefix state.
+    default: true
+    description: Include active candidates reconstructed from process state in the
+      class and candidate allowed masks.
+    label: 'Training: Process-state include active candidates'
+    path: training.process_state_mask_include_active_candidates
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_enabled: true
+    section: training
+    type: bool
+    ui:
+      group: advanced
+      order: 1022
+      priority: 100
+      tab: general
+  training.process_state_mask_relaxed_lookback_events:
+    affects: Controls how far back in the completed prefix relaxed reachability
+      searches for possible parallel branch anchors.
+    default: 8
+    description: Number of recent completed prefix events used as relaxed reachability
+      anchors when process_state_mask_source=relaxed_reachability.
+    label: 'Training: Relaxed mask lookback events'
+    path: training.process_state_mask_relaxed_lookback_events
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_source: relaxed_reachability
+    section: training
+    type: int
+    ui:
+      group: advanced
+      order: 1023
+      priority: 100
+      tab: general
+  training.process_state_mask_relaxed_max_depth:
+    affects: Controls the BFS depth over collapsed prediction topology for relaxed
+      mask expansion.
+    default: 1
+    description: Maximum reachability depth from each recent prefix anchor when
+      process_state_mask_source=relaxed_reachability.
+    label: 'Training: Relaxed mask max depth'
+    path: training.process_state_mask_relaxed_max_depth
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_source: relaxed_reachability
+    section: training
+    type: int
+    ui:
+      group: advanced
+      order: 1024
+      priority: 100
+      tab: general
+  training.process_state_mask_relaxed_max_cardinality_ratio:
+    affects: Caps relaxed mask expansion so approximate reachability does not become
+      an almost-full candidate-universe mask.
+    default: 0.35
+    description: Maximum fraction of the candidate universe allowed by relaxed
+      reachability additions.
+    label: 'Training: Relaxed mask max cardinality ratio'
+    path: training.process_state_mask_relaxed_max_cardinality_ratio
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_source: relaxed_reachability
+    section: training
+    type: float
+    ui:
+      group: advanced
+      order: 1025
+      priority: 100
+      tab: general
+  training.process_state_mask_relaxed_suppress_completed:
+    affects: Reduces stale relaxed-only candidates that were already completed
+      earlier in the prefix.
+    default: true
+    description: Suppress already-completed relaxed-only candidates when relaxed
+      reachability expands the process-state mask. Direct successors, explicit
+      active candidates, active instances, and loop/rework paths remain allowed.
+    label: 'Training: Relaxed mask suppress completed'
+    path: training.process_state_mask_relaxed_suppress_completed
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_source: relaxed_reachability
+    section: training
+    type: bool
+    ui:
+      group: advanced
+      order: 1026
+      priority: 100
+      tab: general
+  training.process_state_mask_relaxed_anchor_policy:
+    affects: Controls which recent prefix activities can seed relaxed reachability.
+    default: open_successors
+    description: open_successors skips anchors only when their direct successors
+      are already completed, not active, and have no loop/rework evidence.
+    enum:
+    - recent_prefix
+    - open_successors
+    label: 'Training: Relaxed mask anchor policy'
+    path: training.process_state_mask_relaxed_anchor_policy
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_source: relaxed_reachability
+    section: training
+    type: enum
+    ui:
+      group: advanced
+      order: 1027
+      priority: 100
+      tab: general
+  training.process_state_mask_relaxed_loop_policy:
+    affects: Controls how completed candidates are preserved for repeat/rework
+      paths during relaxed reachability filtering.
+    default: keep_direct_successor_repeats
+    description: Keeps completed candidates when they are direct successors of
+      the current last activity, preserving loop/rework paths while suppressing
+      stale relaxed-only candidates.
+    enum:
+    - keep_direct_successor_repeats
+    label: 'Training: Relaxed mask loop policy'
+    path: training.process_state_mask_relaxed_loop_policy
+    required_in_modes: []
+    required_when:
+      training.process_state_mask_source: relaxed_reachability
+    section: training
+    type: enum
+    ui:
+      group: advanced
+      order: 1028
+      priority: 100
+      tab: general
+  training.class_weight_cap:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Class weight cap'
+    path: training.class_weight_cap
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.dataloader_num_workers:
+    affects: Використання CPU та швидкість ітерації по batches.
+    default: 0
+    description: Кількість паралельних воркерів для підготовки batch під час train/val/test.
+      0 = без мультипроцесності.
+    enum: []
+    label: 'Тренування: DataLoader workers'
+    path: training.dataloader_num_workers
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 90
+      tab: general
+  training.dataloader_persistent_workers:
+    affects: Зменшує накладні витрати старту епох при довгих тренуваннях.
+    default: true
+    description: Якщо true, воркери не перезапускаються між епохами (працює лише коли
+      workers > 0).
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Тренування: DataLoader persistent workers'
+    path: training.dataloader_persistent_workers
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.dataloader_pin_memory:
+    affects: Швидкість input pipeline при CUDA; на CPU режим майже не впливає.
+    default: false
+    description: Якщо true, батчі фіксуються в pinned RAM для швидшої передачі на
+      GPU.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Тренування: DataLoader pin memory'
+    path: training.dataloader_pin_memory
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.dataloader_prefetch_factor:
+    affects: Баланс між пропускною здатністю pipeline та споживанням RAM.
+    default: 2
+    description: Скільки майбутніх батчів наперед готує кожен воркер (працює лише
+      коли workers > 0).
+    enum: []
+    label: 'Тренування: DataLoader prefetch factor'
+    path: training.dataloader_prefetch_factor
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.delta:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Delta'
+    path: training.delta
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.device:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Device'
+    path: training.device
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.dynamic_candidate_contract_enabled:
+    affects: Enables Stage 2 candidate-scoring loss path while preserving existing
+      trainer/evaluator metrics.
+    default: 'false'
+    description: Use model.forward_candidate() for EOPKGTopologyConditioned and train/evaluate
+      through topology-local candidate logits projected back to fixed labels for compatibility.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: Dynamic candidate contract'
+    path: training.dynamic_candidate_contract_enabled
+    required_in_modes: []
+    required_when:
+      model.type: EOPKGTopologyConditioned
+    section: training
+    ui:
+      group: advanced
+      order: 1014
+      priority: 100
+      tab: general
+  training.ece_bins:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Ece bins'
+    path: training.ece_bins
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.epochs:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Epochs'
+    path: training.epochs
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.learning_rate:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Learning rate'
+    path: training.learning_rate
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.finetune_epochs:
+    affects: Controls per-release optimizer updates in eval_drift_finetune.
+    default: 1
+    description: Fixed fine-tuning epochs after each released drift window.
+    enum: []
+    label: Fine-tune epochs
+    path: training.finetune_epochs
+    required_in_modes:
+    - eval_drift_finetune
+    required_when:
+      experiment.mode: eval_drift_finetune
+    section: training
+    type: int
+    ui:
+      group: advanced
+      order: 1001
+      priority: 100
+      tab: general
+  training.finetune_learning_rate:
+    affects: Controls per-release optimizer updates in eval_drift_finetune.
+    default: 0.0001
+    description: Learning rate for released-window updates in eval_drift_finetune.
+    enum: []
+    label: Fine-tune learning rate
+    path: training.finetune_learning_rate
+    required_in_modes:
+    - eval_drift_finetune
+    required_when:
+      experiment.mode: eval_drift_finetune
+    section: training
+    type: float
+    ui:
+      group: advanced
+      order: 1002
+      priority: 100
+      tab: general
+  experiment.finetune_start_ratio:
+    affects: Controls where adaptive fine-tuning may start in eval_drift_finetune.
+    default: 0.38
+    description: First eligible stream ratio for released-window fine-tuning; use
+      the checkpoint training cut to avoid updating on already-trained traces.
+    enum: []
+    label: Fine-tune start ratio
+    path: experiment.finetune_start_ratio
+    required_in_modes:
+    - eval_drift_finetune
+    required_when:
+      experiment.mode: eval_drift_finetune
+    section: experiment
+    type: float
+    ui:
+      group: advanced
+      order: 1003
+      priority: 100
+      tab: general
+  training.learning_strategy:
+    affects: Separates model fusion mode from the methodology used to train topology
+      dependence.
+    default: standard
+    description: Trainer-level methodology. standard preserves current behavior; topology_conditioned
+      adds train-time topology dependency objectives.
+    enum:
+    - standard
+    - topology_conditioned
+    label: 'Training: Learning strategy'
+    path: training.learning_strategy
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1013
+      priority: 100
+      tab: general
+  training.loss_function:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Loss function'
+    path: training.loss_function
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.mask_guided_apply_in_eval:
+    affects: Drift and test metrics sensitivity to impossible transitions.
+    default: 'true'
+    description: Apply mask-guided logits policy during eval/eval_drift inference.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: Apply mask-guided in eval'
+    path: training.mask_guided_apply_in_eval
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: core
+      order: 7
+      priority: 1
+      tab: general
+  training.mask_guided_policy:
+    affects: Controls whether topology masks are ignored, softly penalized, hard-filtered,
+      or selected automatically.
+    default: auto
+    description: Mask policy for logits. Use hard for reviewer-control post-filter
+      baselines.
+    enum:
+    - auto
+    - 'off'
+    - soft
+    - hard
+    label: 'Training: Mask policy'
+    path: training.mask_guided_policy
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: core
+      order: 6
+      priority: 1
+      tab: general
+  training.mask_guided_hard_threshold:
+    affects: Tradeoff between strict topology filtering and robustness to mask noise.
+    default: 1.0
+    description: Use hard masking when estimated target_in_mask_rate is at or above
+      this threshold.
+    enum: []
+    label: 'Training: Mask hard threshold'
+    path: training.mask_guided_hard_threshold
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: core
+      order: 8
+      priority: 1
+      tab: general
+  training.mask_guided_min_samples_for_hard:
+    affects: Stability of auto-switch between hard and soft masking.
+    default: 1
+    description: Minimum observed samples before enabling hard masking from reliability
+      estimate.
+    enum: []
+    label: 'Training: Min samples for hard'
+    path: training.mask_guided_min_samples_for_hard
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.mask_guided_soft_penalty:
+    affects: Ranking pressure away from improbable targets without hard cutoff.
+    default: 2.0
+    description: Logit penalty applied to disallowed classes in soft mode.
+    enum: []
+    label: 'Training: Mask soft penalty'
+    path: training.mask_guided_soft_penalty
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: core
+      order: 9
+      priority: 1
+      tab: general
+  training.patience:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Patience'
+    path: training.patience
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.retrain:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum:
+    - 'false'
+    - 'true'
+    label: Перенавчати з нуля
+    path: training.retrain
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: deprecated
+      order: 9999
+      priority: 999
+      tab: legacy
+  training.sharded_dataset_cached_shards:
+    affects: Memory usage and disk read thrashing during sharded dataset training.
+    default: 2
+    description: Maximum number of shards cached in memory simultaneously. Optimal size is automatically calculated at run time if not configured.
+    enum: []
+    label: Sharded dataset cached shards
+    path: training.sharded_dataset_cached_shards
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.show_progress:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Show progress'
+    path: training.show_progress
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.struct_xattn_contrastive_enabled:
+    affects: Forces StructXAttn to prefer correct topology over corrupted topology
+      during training.
+    default: 'false'
+    description: Enable correct-vs-corrupted topology loss for StructXAttn.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: StructXAttn contrastive enabled'
+    path: training.struct_xattn_contrastive_enabled
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: StructXAttn
+    section: training
+    ui:
+      group: advanced
+      order: 1004
+      priority: 100
+      tab: general
+  training.struct_xattn_contrastive_margin:
+    affects: Margin in the correct-vs-corrupted topology objective.
+    default: 0.05
+    description: Required CE advantage of correct topology over corrupted topology.
+    enum: []
+    label: 'Training: StructXAttn contrastive margin'
+    path: training.struct_xattn_contrastive_margin
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1006
+      priority: 100
+      tab: general
+  training.struct_xattn_contrastive_max_loss:
+    affects: Prevents corrupted-topology objective from dominating training.
+    default: 0.5
+    description: Upper clamp for one-batch contrastive loss before weighting.
+    enum: []
+    label: 'Training: StructXAttn contrastive max loss'
+    path: training.struct_xattn_contrastive_max_loss
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1008
+      priority: 100
+      tab: general
+  training.struct_xattn_contrastive_temperature:
+    affects: Gradient smoothness of the contrastive topology objective.
+    default: 0.1
+    description: Softplus temperature for smoothed contrastive margin.
+    enum: []
+    label: 'Training: StructXAttn contrastive temperature'
+    path: training.struct_xattn_contrastive_temperature
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1007
+      priority: 100
+      tab: general
+  training.struct_xattn_contrastive_warmup_epochs:
+    affects: Lets baseline CE stabilize before structural dependency pressure starts.
+    default: 3
+    description: Number of initial epochs before enabling corrupted-topology forward.
+    enum: []
+    label: 'Training: StructXAttn contrastive warmup'
+    path: training.struct_xattn_contrastive_warmup_epochs
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1009
+      priority: 100
+      tab: general
+  training.struct_xattn_contrastive_weight:
+    affects: Strength of explicit structural dependency pressure.
+    default: 0.03
+    description: Weight for smoothed correct-vs-corrupted topology contrastive loss.
+    enum: []
+    label: 'Training: StructXAttn contrastive weight'
+    path: training.struct_xattn_contrastive_weight
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1005
+      priority: 100
+      tab: general
+  training.struct_xattn_corruption_edge_drop_prob:
+    affects: Strength of edge-level topology corruption.
+    default: 0.15
+    description: Probability of dropping each structural edge in the corrupted topology
+      view.
+    enum: []
+    label: 'Training: StructXAttn edge drop'
+    path: training.struct_xattn_corruption_edge_drop_prob
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+      training.struct_xattn_corruption_policy: edge_drop
+    section: training
+    ui:
+      group: advanced
+      order: 1011
+      priority: 100
+      tab: general
+  training.struct_xattn_corruption_feature_noise_std:
+    affects: Strength of structural feature corruption.
+    default: 0.0
+    description: Gaussian noise std added to struct_x in the corrupted topology view.
+    enum: []
+    label: 'Training: StructXAttn feature noise'
+    path: training.struct_xattn_corruption_feature_noise_std
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1012
+      priority: 100
+      tab: general
+  training.struct_xattn_corruption_policy:
+    affects: Defines the corrupted topology seen by the contrastive objective.
+    default: edge_drop
+    description: Tensor-level structural corruption used as the negative topology
+      view.
+    enum:
+    - none
+    - edge_drop
+    - feature_noise
+    - edge_drop_plus_feature_noise
+    label: 'Training: StructXAttn corruption policy'
+    path: training.struct_xattn_corruption_policy
+    required_in_modes: []
+    required_when:
+      training.struct_xattn_contrastive_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1010
+      priority: 100
+      tab: general
+  training.structural_aux_exact_loss_weight:
+    affects: Keeps strict target pressure while set-aware loss handles parallel allowed
+      candidates.
+    default: 0.01
+    description: Small exact CE component for structural logits.
+    enum: []
+    label: 'Training: Structural auxiliary exact loss weight'
+    path: training.structural_aux_exact_loss_weight
+    required_in_modes: []
+    required_when:
+      training.structural_aux_loss_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1003
+      priority: 100
+      tab: general
+  training.structural_aux_loss_enabled:
+    affects: Gives the structural branch a direct training signal instead of relying
+      only on fused logits.
+    default: 'false'
+    description: Enable auxiliary loss on class-aware structural logits.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: Structural auxiliary loss enabled'
+    path: training.structural_aux_loss_enabled
+    required_in_modes: []
+    required_when:
+      model.fusion_mode: ClassAwareStructuralScoring
+    section: training
+    ui:
+      group: advanced
+      order: 1001
+      priority: 100
+      tab: general
+  training.structural_aux_loss_weight:
+    affects: Strength of topology-compatible structural learning signal.
+    default: 0.05
+    description: Weight for set-aware CE over allowed target candidates using structural
+      logits.
+    enum: []
+    label: 'Training: Structural auxiliary set loss weight'
+    path: training.structural_aux_loss_weight
+    required_in_modes: []
+    required_when:
+      training.structural_aux_loss_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1002
+      priority: 100
+      tab: general
+  training.topology_conditioning_allowed_set_loss_enabled:
+    affects: Adds mask-aware learning pressure independent from mask-guided inference
+      logits.
+    default: 'true'
+    description: Enable train-time topology consistency loss over allowed target candidates.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: TC allowed-set loss'
+    path: training.topology_conditioning_allowed_set_loss_enabled
+    required_in_modes: []
+    required_when:
+      training.learning_strategy: topology_conditioned
+    section: training
+    ui:
+      group: advanced
+      order: 1021
+      priority: 100
+      tab: general
+  training.topology_conditioning_allowed_set_loss_weight:
+    affects: Strength of topology-compatible target-set pressure.
+    default: 0.05
+    description: Weight for topology allowed-set loss.
+    enum: []
+    label: 'Training: TC allowed-set weight'
+    path: training.topology_conditioning_allowed_set_loss_weight
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_allowed_set_loss_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1022
+      priority: 100
+      tab: general
+  training.topology_conditioning_current_version_policy:
+    affects: Determines version distance for retention weights.
+    default: latest_in_train
+    description: Rule for identifying the current/latest seen version in retention
+      weighting.
+    enum:
+    - latest_in_train
+    label: 'Training: TC current version policy'
+    path: training.topology_conditioning_current_version_policy
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_retention_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1030
+      priority: 100
+      tab: general
+  training.topology_conditioning_drop_edges_margin:
+    affects: Minimum local corruption sensitivity expected from the model.
+    default: 0.1
+    description: Required CE gap between correct topology and dropped-edge topology.
+    enum: []
+    label: 'Training: TC drop-edges margin'
+    path: training.topology_conditioning_drop_edges_margin
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_drop_edges_negative_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1019
+      priority: 100
+      tab: general
+  training.topology_conditioning_drop_edges_negative_enabled:
+    affects: Tests whether model predictions react to local topology corruption.
+    default: 'true'
+    description: Enable same-version physically dropped structural edge negative loss.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: TC drop-edges negative'
+    path: training.topology_conditioning_drop_edges_negative_enabled
+    required_in_modes: []
+    required_when:
+      training.learning_strategy: topology_conditioned
+    section: training
+    ui:
+      group: advanced
+      order: 1017
+      priority: 100
+      tab: general
+  training.topology_conditioning_drop_edges_negative_weight:
+    affects: Strength of local topology corruption pressure.
+    default: 0.05
+    description: Weight for same-version dropped-edge topology negative margin loss.
+    enum: []
+    label: 'Training: TC drop-edges weight'
+    path: training.topology_conditioning_drop_edges_negative_weight
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_drop_edges_negative_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1018
+      priority: 100
+      tab: general
+  training.topology_conditioning_drop_edges_ratio:
+    affects: Severity of topology corruption; high values can break BPM reachability.
+    default: 0.15
+    description: Fraction of structural edges physically removed in the negative topology
+      view.
+    enum: []
+    label: 'Training: TC drop-edges ratio'
+    path: training.topology_conditioning_drop_edges_ratio
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_drop_edges_negative_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1020
+      priority: 100
+      tab: general
+  training.topology_conditioning_retention_enabled:
+    affects: Controls how strongly older versions are retained while newer versions
+      dominate.
+    default: 'true'
+    description: Enable version-weighted CE/rehearsal for already seen versions.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: TC retention'
+    path: training.topology_conditioning_retention_enabled
+    required_in_modes: []
+    required_when:
+      training.learning_strategy: topology_conditioned
+    section: training
+    ui:
+      group: advanced
+      order: 1028
+      priority: 100
+      tab: general
+  training.topology_conditioning_retention_obsolete_weight:
+    affects: Future extension point for business lifecycle retention policy.
+    default: 0.0
+    description: Reserved weight for versions considered obsolete by future policies.
+    enum: []
+    label: 'Training: TC obsolete weight'
+    path: training.topology_conditioning_retention_obsolete_weight
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_retention_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1029
+      priority: 100
+      tab: general
+  training.topology_conditioning_retention_old_weight:
+    affects: Long-tail retention pressure for stale process versions.
+    default: 0.15
+    description: Sample weight for older seen versions outside the recent window.
+    enum: []
+    label: 'Training: TC old weight'
+    path: training.topology_conditioning_retention_old_weight
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_retention_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1028
+      priority: 100
+      tab: general
+  training.topology_conditioning_retention_policy:
+    affects: Defines how known older process versions contribute to topology_conditioned
+      training.
+    default: version_decay
+    description: Policy for per-version retention sample weights.
+    enum:
+    - version_decay
+    label: 'Training: TC retention policy'
+    path: training.topology_conditioning_retention_policy
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_retention_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1029
+      priority: 100
+      tab: general
+  training.topology_conditioning_retention_recent_versions:
+    affects: Width of the rehearsal window for older versions.
+    default: 1
+    description: Number of previous versions treated as recent for retention weighting.
+    enum: []
+    label: 'Training: TC recent versions'
+    path: training.topology_conditioning_retention_recent_versions
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_retention_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1026
+      priority: 100
+      tab: general
+  training.topology_conditioning_retention_recent_weight:
+    affects: Retention pressure for versions close to the current one.
+    default: 0.5
+    description: Sample weight for recent previous versions.
+    enum: []
+    label: 'Training: TC recent weight'
+    path: training.topology_conditioning_retention_recent_weight
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_retention_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1027
+      priority: 100
+      tab: general
+  training.topology_conditioning_wrong_version_margin:
+    affects: Minimum pressure for topology-sensitive learning.
+    default: 0.2
+    description: Required CE gap between correct topology and wrong known-version
+      topology.
+    enum: []
+    label: 'Training: TC wrong-version margin'
+    path: training.topology_conditioning_wrong_version_margin
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_wrong_version_negative_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1016
+      priority: 100
+      tab: general
+  training.topology_conditioning_wrong_version_negative_enabled:
+    affects: Forces the model to prefer the correct known topology over another known
+      version.
+    default: 'true'
+    description: Enable known wrong-version topology negative loss for topology_conditioned
+      learning.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: TC wrong-version negative'
+    path: training.topology_conditioning_wrong_version_negative_enabled
+    required_in_modes: []
+    required_when:
+      training.learning_strategy: topology_conditioned
+    section: training
+    ui:
+      group: advanced
+      order: 1014
+      priority: 100
+      tab: general
+  training.topology_conditioning_wrong_version_negative_weight:
+    affects: Strength of contrastive topology dependency pressure.
+    default: 0.1
+    description: Weight for wrong-version topology negative margin loss.
+    enum: []
+    label: 'Training: TC wrong-version weight'
+    path: training.topology_conditioning_wrong_version_negative_weight
+    required_in_modes: []
+    required_when:
+      training.topology_conditioning_wrong_version_negative_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1015
+      priority: 100
+      tab: general
+  training.topology_flow_penalty_enabled:
+    affects: Adds direct pressure against assigning probability mass to candidates
+      disallowed by the current process topology flow.
+    default: 'false'
+    description: Enable candidate-level topology-flow penalty for candidate_id training.
+      Uses topology-local candidates projected from the current allowed_target_mask.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: topology flow penalty'
+    path: training.topology_flow_penalty_enabled
+    required_in_modes: []
+    required_when:
+      training.candidate_contract_mode: candidate_id
+    section: training
+    ui:
+      group: advanced
+      order: 1023
+      priority: 100
+      tab: general
+  training.topology_flow_penalty_fail_on_missing_mask:
+    affects: Protects topology-flow loss from silently becoming a no-op because topology
+      masks were not built.
+    default: 'true'
+    description: Fail candidate_id training when topology_flow_penalty_enabled but
+      allowed_target_mask is missing.
+    enum:
+    - 'false'
+    - 'true'
+    label: 'Training: topology flow fail on missing mask'
+    path: training.topology_flow_penalty_fail_on_missing_mask
+    required_in_modes: []
+    required_when:
+      training.topology_flow_penalty_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1027
+      priority: 100
+      tab: general
+  training.topology_flow_penalty_margin:
+    affects: Minimum required separation between best valid and best invalid candidate
+      logits.
+    default: 0.1
+    description: Margin used when topology_flow_penalty_type=margin.
+    enum: []
+    label: 'Training: topology flow penalty margin'
+    path: training.topology_flow_penalty_margin
+    required_in_modes: []
+    required_when:
+      training.topology_flow_penalty_type: margin
+    section: training
+    ui:
+      group: advanced
+      order: 1026
+      priority: 100
+      tab: general
+  training.topology_flow_penalty_type:
+    affects: Changes the shape of candidate-level topology-flow learning pressure.
+    default: invalid_probability_mass
+    description: Penalty objective for invalid topology-flow candidates. invalid_probability_mass
+      is bounded and stable; margin enforces invalid logits below valid logits.
+    enum:
+    - invalid_probability_mass
+    - margin
+    label: 'Training: topology flow penalty type'
+    path: training.topology_flow_penalty_type
+    required_in_modes: []
+    required_when:
+      training.topology_flow_penalty_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1025
+      priority: 100
+      tab: general
+  training.topology_flow_penalty_weight:
+    affects: Controls how strongly candidate_id training penalizes invalid topology-flow
+      probability mass.
+    default: 0.0
+    description: Weight for candidate-level topology-flow penalty.
+    enum: []
+    label: 'Training: topology flow penalty weight'
+    path: training.topology_flow_penalty_weight
+    required_in_modes: []
+    required_when:
+      training.topology_flow_penalty_enabled: 'true'
+    section: training
+    ui:
+      group: advanced
+      order: 1024
+      priority: 100
+      tab: general
+  training.torch_num_interop_threads:
+    affects: Поведінка CPU scheduler при складних графах обчислень.
+    default: ''
+    description: Кількість inter-op потоків PyTorch для паралелізації між операціями.
+      Порожнє значення = системний дефолт.
+    enum: []
+    label: 'Тренування: Torch interop threads'
+    path: training.torch_num_interop_threads
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.torch_num_threads:
+    affects: Завантаження CPU під час обчислень PyTorch.
+    default: ''
+    description: Обмеження для кількості внутрішніх CPU потоків PyTorch (intra-op).
+      Порожнє значення = системний дефолт.
+    enum: []
+    label: 'Тренування: Torch CPU threads'
+    path: training.torch_num_threads
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.tqdm_disable:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Tqdm disable'
+    path: training.tqdm_disable
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+  training.tqdm_leave:
+    affects: Training stability, speed, and final quality metrics.
+    default: ''
+    description: Training loop hyperparameter.
+    enum: []
+    label: 'Тренування: Tqdm leave'
+    path: training.tqdm_leave
+    required_in_modes: []
+    required_when: {}
+    section: training
+    ui:
+      group: advanced
+      order: 1000
+      priority: 100
+      tab: general
+version: 1
