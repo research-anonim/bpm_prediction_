@@ -1,0 +1,813 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_loan_v1" targetNamespace="http://bpm_prediction/simulation/loan_v1" exporter="Camunda Web Modeler" exporterVersion="8cca9cf" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.9.0">
+  <process id="loan_v1_process" name="Loan V1 Process" isExecutable="true">
+    <startEvent id="start_evt" name="Start" />
+    <endEvent id="end_reject" name="End Reject" />
+    <endEvent id="end_cancel" name="End Cancel">
+      <incoming>Flow_0r6sy1j</incoming>
+    </endEvent>
+    <endEvent id="end_approve" name="End Approve" />
+    <exclusiveGateway id="gw_merge_receive" name="Merge Receive">
+      <incoming>Flow_0v5c7g2</incoming>
+      <incoming>Flow_1wnhlfz</incoming>
+      <incoming>Flow_0feqwym</incoming>
+    </exclusiveGateway>
+    <exclusiveGateway id="gw_form_ok" name="Form OK" />
+    <parallelGateway id="gw_precheck_split" name="Precheck Split" />
+    <parallelGateway id="gw_precheck_join" name="Precheck Join" />
+    <exclusiveGateway id="gw_eligible" name="Eligible" />
+    <exclusiveGateway id="gw_send_choice" name="Send Choice">
+      <incoming>Flow_0fn6ut5</incoming>
+    </exclusiveGateway>
+    <exclusiveGateway id="gw_send_merge" name="Send Merge" />
+    <exclusiveGateway id="gw_client_ok" name="Client OK" />
+    <exclusiveGateway id="gw_large_loop" name="Large Loop" />
+    <exclusiveGateway id="gw_final_decision" name="Final Decision" />
+    <task id="t_receive_update" name="Receive Update">
+      <outgoing>Flow_1wnhlfz</outgoing>
+    </task>
+    <userTask id="t_check_form" name="Check Form" />
+    <task id="t_return_form" name="Return Form" />
+    <userTask id="t_credit_collect" name="Credit Collect" />
+    <serviceTask id="t_risk_assess" name="Risk Assess" />
+    <serviceTask id="t_property_check" name="Property Check" />
+    <task id="t_assess_eligibility" name="Assess Eligibility" />
+    <task id="t_reject_loan" name="Reject Loan" />
+    <task id="t_prepare_pack" name="Prepare Pack" />
+    <task id="t_check_quote" name="Check Quote">
+      <outgoing>Flow_1a9u135</outgoing>
+    </task>
+    <task id="t_send_quote" name="Send Quote" />
+    <task id="t_send_offer" name="Send Offer" />
+    <task id="t_revise_offer" name="Revise Offer" />
+    <task id="t_collect_docs" name="Collect Docs" />
+    <serviceTask id="t_create_account" name="Create Account">
+      <incoming>Flow_1jqa1zq</incoming>
+      <outgoing>Flow_1u33k54</outgoing>
+    </serviceTask>
+    <serviceTask id="t_reserve_funds" name="Reserve Funds">
+      <incoming>Flow_1u33k54</incoming>
+    </serviceTask>
+    <task id="t_check_funding" name="Check Funding" />
+    <serviceTask id="t_confirm_payout" name="Confirm Payout">
+      <outgoing>Flow_1f54aco</outgoing>
+    </serviceTask>
+    <task id="t_plan_setup" name="Plan Setup">
+      <outgoing>Flow_0rto5xu</outgoing>
+    </task>
+    <task id="t_send_notice" name="Send Notice">
+      <outgoing>Flow_1sl8ttk</outgoing>
+    </task>
+    <task id="t_book_loan" name="Book Loan">
+      <incoming>Flow_18y3nak</incoming>
+      <outgoing>Flow_0zf0kns</outgoing>
+    </task>
+    <scriptTask id="t_audit_case" name="Audit Case">
+      <incoming>Flow_1mpz582</incoming>
+      <outgoing>Flow_107ezet</outgoing>
+    </scriptTask>
+    <task id="t_monitor_one" name="Monitor One">
+      <incoming>Flow_1lrsbky</incoming>
+      <outgoing>Flow_05ov117</outgoing>
+    </task>
+    <task id="t_monitor_two" name="Monitor Two">
+      <incoming>Flow_05ov117</incoming>
+      <outgoing>Flow_1lyyivr</outgoing>
+    </task>
+    <task id="t_monitor_three" name="Monitor Three">
+      <incoming>Flow_1lyyivr</incoming>
+      <outgoing>Flow_1ghytln</outgoing>
+    </task>
+    <task id="t_monitor_four" name="Monitor Four">
+      <incoming>Flow_1tdmx2o</incoming>
+    </task>
+    <task id="t_monitor_five" name="Monitor Five" />
+    <task id="t_monitor_six" name="Monitor Six">
+      <outgoing>Flow_09t7uai</outgoing>
+    </task>
+    <task id="t_monitor_seven" name="Monitor Seven">
+      <incoming>Flow_107ezet</incoming>
+      <outgoing>Flow_1m1w58w</outgoing>
+    </task>
+    <task id="t_monitor_eight" name="Monitor Eight">
+      <incoming>Flow_1m1w58w</incoming>
+      <outgoing>Flow_19c82pp</outgoing>
+    </task>
+    <task id="t_monitor_nine" name="Monitor Nine">
+      <incoming>Flow_19c82pp</incoming>
+      <outgoing>Flow_1r4cdje</outgoing>
+    </task>
+    <task id="t_update_risk" name="Update Risk">
+      <incoming>Flow_0r8mvu7</incoming>
+    </task>
+    <task id="t_call_client" name="Call Client" />
+    <task id="t_add_notes" name="Add Notes">
+      <outgoing>Flow_05e753g</outgoing>
+    </task>
+    <userTask id="t_final_review" name="Final Review">
+      <incoming>Flow_05e753g</incoming>
+    </userTask>
+    <task id="t_reopen_case" name="Reopen Case">
+      <outgoing>Flow_0v5c7g2</outgoing>
+    </task>
+    <task id="t_cancel_loan" name="Cancel Loan" />
+    <task id="t_approve_loan" name="Approve Loan" />
+    <sequenceFlow id="sf001" sourceRef="start_evt" targetRef="SaveCase_action" />
+    <sequenceFlow id="sf003" sourceRef="gw_merge_receive" targetRef="t_check_form" />
+    <sequenceFlow id="sf004" sourceRef="t_check_form" targetRef="gw_form_ok" />
+    <sequenceFlow id="sf005" sourceRef="gw_form_ok" targetRef="t_return_form" />
+    <sequenceFlow id="sf006" sourceRef="t_return_form" targetRef="t_receive_update" />
+    <sequenceFlow id="sf007" sourceRef="gw_form_ok" targetRef="gw_precheck_split" />
+    <sequenceFlow id="sf008" sourceRef="gw_precheck_split" targetRef="t_credit_collect" />
+    <sequenceFlow id="sf009" sourceRef="gw_precheck_split" targetRef="t_property_check" />
+    <sequenceFlow id="sf010" sourceRef="gw_precheck_split" targetRef="t_identity_check" />
+    <sequenceFlow id="sf011" sourceRef="t_credit_collect" targetRef="t_risk_assess" />
+    <sequenceFlow id="sf012" sourceRef="t_risk_assess" targetRef="gw_precheck_join" />
+    <sequenceFlow id="sf013" sourceRef="t_property_check" targetRef="gw_precheck_join" />
+    <sequenceFlow id="sf014" sourceRef="t_identity_check" targetRef="gw_precheck_join" />
+    <sequenceFlow id="sf015" sourceRef="gw_precheck_join" targetRef="t_assess_eligibility" />
+    <sequenceFlow id="sf016" sourceRef="t_assess_eligibility" targetRef="gw_eligible" />
+    <sequenceFlow id="sf017" sourceRef="gw_eligible" targetRef="t_reject_loan" />
+    <sequenceFlow id="sf018" sourceRef="t_reject_loan" targetRef="end_reject" />
+    <sequenceFlow id="sf019" sourceRef="gw_eligible" targetRef="t_prepare_pack" />
+    <sequenceFlow id="sf020" sourceRef="t_prepare_pack" targetRef="t_check_quote" />
+    <sequenceFlow id="sf022" sourceRef="gw_send_choice" targetRef="t_send_quote" />
+    <sequenceFlow id="sf023" sourceRef="gw_send_choice" targetRef="t_send_offer" />
+    <sequenceFlow id="sf024" sourceRef="t_send_quote" targetRef="gw_send_merge" />
+    <sequenceFlow id="sf025" sourceRef="t_send_offer" targetRef="gw_send_merge" />
+    <sequenceFlow id="sf026" sourceRef="gw_send_merge" targetRef="t_verify_terms" />
+    <sequenceFlow id="sf027" sourceRef="t_verify_terms" targetRef="gw_client_ok" />
+    <sequenceFlow id="sf028" sourceRef="gw_client_ok" targetRef="t_revise_offer" />
+    <sequenceFlow id="sf029" sourceRef="t_revise_offer" targetRef="Gateway_1aey4io" />
+    <sequenceFlow id="sf030" sourceRef="gw_client_ok" targetRef="t_collect_docs" />
+    <sequenceFlow id="sf031" sourceRef="t_collect_docs" targetRef="t_verify_docs" />
+    <sequenceFlow id="sf034" sourceRef="t_reserve_funds" targetRef="t_check_funding" />
+    <sequenceFlow id="sf035" sourceRef="t_check_funding" targetRef="t_confirm_payout" />
+    <sequenceFlow id="sf036" sourceRef="Gateway_1nwy75l" targetRef="t_plan_setup" />
+    <sequenceFlow id="sf037" sourceRef="Gateway_1nwy75l" targetRef="t_send_notice" />
+    <sequenceFlow id="sf044" sourceRef="t_monitor_four" targetRef="t_monitor_five" />
+    <sequenceFlow id="sf045" sourceRef="t_monitor_five" targetRef="t_monitor_six" />
+    <sequenceFlow id="sf051" sourceRef="t_update_risk" targetRef="t_call_client" />
+    <sequenceFlow id="sf052" sourceRef="t_call_client" targetRef="t_add_notes" />
+    <sequenceFlow id="sf054" sourceRef="t_final_review" targetRef="gw_large_loop" />
+    <sequenceFlow id="sf055" sourceRef="gw_large_loop" targetRef="t_reopen_case" />
+    <sequenceFlow id="sf057" sourceRef="gw_large_loop" targetRef="gw_final_decision" />
+    <sequenceFlow id="sf058" sourceRef="gw_final_decision" targetRef="t_cancel_loan" />
+    <sequenceFlow id="sf059" sourceRef="gw_final_decision" targetRef="t_approve_loan" />
+    <sequenceFlow id="sf060" sourceRef="t_cancel_loan" targetRef="t_Notify_Client" />
+    <sequenceFlow id="sf061" sourceRef="t_approve_loan" targetRef="end_approve" />
+    <sequenceFlow id="Flow_0v5c7g2" sourceRef="t_reopen_case" targetRef="gw_merge_receive" />
+    <sequenceFlow id="Flow_1wnhlfz" sourceRef="t_receive_update" targetRef="gw_merge_receive" />
+    <exclusiveGateway id="Gateway_1aey4io">
+      <incoming>Flow_1a9u135</incoming>
+      <incoming>sf029</incoming>
+      <outgoing>Flow_0fn6ut5</outgoing>
+    </exclusiveGateway>
+    <sequenceFlow id="Flow_1a9u135" sourceRef="t_check_quote" targetRef="Gateway_1aey4io" />
+    <sequenceFlow id="Flow_0fn6ut5" sourceRef="Gateway_1aey4io" targetRef="gw_send_choice" />
+    <sequenceFlow id="Flow_1u33k54" sourceRef="t_create_account" targetRef="t_reserve_funds" />
+    <sequenceFlow id="Flow_1jqa1zq" sourceRef="t_verify_docs" targetRef="t_create_account" />
+    <task id="t_verify_docs" name="Verify Docs">
+      <incoming>sf031</incoming>
+      <outgoing>Flow_1jqa1zq</outgoing>
+    </task>
+    <task id="t_verify_terms" name="Verify Terms">
+      <incoming>sf026</incoming>
+      <outgoing>sf027</outgoing>
+    </task>
+    <task id="t_identity_check" name="Identity Check">
+      <incoming>sf010</incoming>
+      <outgoing>sf014</outgoing>
+    </task>
+    <exclusiveGateway id="Gateway_1nwy75l">
+      <incoming>Flow_1f54aco</incoming>
+      <outgoing>sf036</outgoing>
+      <outgoing>sf037</outgoing>
+      <outgoing>Flow_18y3nak</outgoing>
+      <outgoing>Flow_1mpz582</outgoing>
+    </exclusiveGateway>
+    <sequenceFlow id="Flow_1f54aco" sourceRef="t_confirm_payout" targetRef="Gateway_1nwy75l" />
+    <sequenceFlow id="Flow_18y3nak" sourceRef="Gateway_1nwy75l" targetRef="t_book_loan" />
+    <sequenceFlow id="Flow_1mpz582" sourceRef="Gateway_1nwy75l" targetRef="t_audit_case" />
+    <exclusiveGateway id="Gateway_1vrc5r2">
+      <incoming>Flow_0rto5xu</incoming>
+      <incoming>Flow_0zf0kns</incoming>
+      <incoming>Flow_1sl8ttk</incoming>
+      <incoming>Flow_1r4cdje</incoming>
+      <outgoing>Flow_02ogu8o</outgoing>
+    </exclusiveGateway>
+    <sequenceFlow id="Flow_0rto5xu" sourceRef="t_plan_setup" targetRef="Gateway_1vrc5r2" />
+    <sequenceFlow id="Flow_0zf0kns" sourceRef="t_book_loan" targetRef="Gateway_1vrc5r2" />
+    <sequenceFlow id="Flow_1sl8ttk" sourceRef="t_send_notice" targetRef="Gateway_1vrc5r2" />
+    <sequenceFlow id="Flow_02ogu8o" sourceRef="Gateway_1vrc5r2" targetRef="Gateway_0o2t3y3" />
+    <sequenceFlow id="Flow_1lrsbky" sourceRef="Gateway_0o2t3y3" targetRef="t_monitor_one" />
+    <parallelGateway id="Gateway_0o2t3y3">
+      <incoming>Flow_02ogu8o</incoming>
+      <outgoing>Flow_1lrsbky</outgoing>
+      <outgoing>Flow_1tdmx2o</outgoing>
+    </parallelGateway>
+    <parallelGateway id="Gateway_12kjk7i">
+      <incoming>Flow_1ghytln</incoming>
+      <incoming>Flow_09t7uai</incoming>
+      <outgoing>Flow_0r8mvu7</outgoing>
+    </parallelGateway>
+    <sequenceFlow id="Flow_1m1w58w" sourceRef="t_monitor_seven" targetRef="t_monitor_eight" />
+    <sequenceFlow id="Flow_05ov117" sourceRef="t_monitor_one" targetRef="t_monitor_two" />
+    <sequenceFlow id="Flow_1lyyivr" sourceRef="t_monitor_two" targetRef="t_monitor_three" />
+    <sequenceFlow id="Flow_19c82pp" sourceRef="t_monitor_eight" targetRef="t_monitor_nine" />
+    <sequenceFlow id="Flow_1ghytln" sourceRef="t_monitor_three" targetRef="Gateway_12kjk7i" />
+    <sequenceFlow id="Flow_09t7uai" sourceRef="t_monitor_six" targetRef="Gateway_12kjk7i" />
+    <sequenceFlow id="Flow_0r8mvu7" sourceRef="Gateway_12kjk7i" targetRef="t_update_risk" />
+    <sequenceFlow id="Flow_05e753g" sourceRef="t_add_notes" targetRef="t_final_review" />
+    <sequenceFlow id="Flow_1tdmx2o" sourceRef="Gateway_0o2t3y3" targetRef="t_monitor_four" />
+    <sequenceFlow id="Flow_107ezet" sourceRef="t_audit_case" targetRef="t_monitor_seven" />
+    <sequenceFlow id="Flow_1r4cdje" sourceRef="t_monitor_nine" targetRef="Gateway_1vrc5r2" />
+    <task id="t_Notify_Client" name="Notify Client">
+      <incoming>sf060</incoming>
+      <outgoing>Flow_0r6sy1j</outgoing>
+    </task>
+    <sequenceFlow id="Flow_0r6sy1j" sourceRef="t_Notify_Client" targetRef="end_cancel" />
+    <serviceTask id="SaveCase_action" name="SaveCase">
+      <incoming>sf001</incoming>
+      <outgoing>Flow_0feqwym</outgoing>
+    </serviceTask>
+    <sequenceFlow id="Flow_0feqwym" sourceRef="SaveCase_action" targetRef="gw_merge_receive" />
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="loan_v1_process">
+      <bpmndi:BPMNShape id="Shape_end_reject" bpmnElement="end_reject">
+        <dc:Bounds x="1562" y="252" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1553" y="288" width="55" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_end_cancel" bpmnElement="end_cancel">
+        <dc:Bounds x="6102" y="338" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="6092" y="374" width="57" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_end_approve" bpmnElement="end_approve">
+        <dc:Bounds x="5930" y="588" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="5916" y="624" width="64" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_merge_receive" bpmnElement="gw_merge_receive" isMarkerVisible="true">
+        <dc:Bounds x="255" y="331" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="191.5" y="284" width="75" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_form_ok" bpmnElement="gw_form_ok" isMarkerVisible="true">
+        <dc:Bounds x="495" y="365" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="439" y="383" width="46" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_precheck_split" bpmnElement="gw_precheck_split">
+        <dc:Bounds x="620" y="365" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="679.5" y="383" width="71" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_precheck_join" bpmnElement="gw_precheck_join">
+        <dc:Bounds x="1015" y="365" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1075" y="383" width="70" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_eligible" bpmnElement="gw_eligible" isMarkerVisible="true">
+        <dc:Bounds x="1260" y="365" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1319.5" y="383" width="37" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_send_choice" bpmnElement="gw_send_choice" isMarkerVisible="true">
+        <dc:Bounds x="1685" y="465" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1745" y="483" width="64" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_send_merge" bpmnElement="gw_send_merge" isMarkerVisible="true">
+        <dc:Bounds x="1965" y="465" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1893.5" y="483" width="61" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_client_ok" bpmnElement="gw_client_ok" isMarkerVisible="true">
+        <dc:Bounds x="2211" y="465" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2212" y="441" width="48" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_large_loop" bpmnElement="gw_large_loop" isMarkerVisible="true">
+        <dc:Bounds x="5435" y="430" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="5369" y="448" width="56" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_gw_final_decision" bpmnElement="gw_final_decision" isMarkerVisible="true">
+        <dc:Bounds x="5625" y="430" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="5685" y="448" width="70" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_receive_update" bpmnElement="t_receive_update">
+        <dc:Bounds x="226" y="606" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_check_form" bpmnElement="t_check_form">
+        <dc:Bounds x="335" y="135" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_return_form" bpmnElement="t_return_form">
+        <dc:Bounds x="465" y="607" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_credit_check" bpmnElement="t_credit_collect">
+        <dc:Bounds x="720" y="220" width="110" height="70" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_risk_assess" bpmnElement="t_risk_assess">
+        <dc:Bounds x="885" y="220" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_property_check" bpmnElement="t_property_check">
+        <dc:Bounds x="755" y="357" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_assess_eligibility" bpmnElement="t_assess_eligibility">
+        <dc:Bounds x="1120" y="355" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_reject_loan" bpmnElement="t_reject_loan">
+        <dc:Bounds x="1380" y="235" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_prepare_pack" bpmnElement="t_prepare_pack">
+        <dc:Bounds x="1305" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_check_quote" bpmnElement="t_check_quote">
+        <dc:Bounds x="1455" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_send_quote" bpmnElement="t_send_quote">
+        <dc:Bounds x="1775" y="355" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_send_offer" bpmnElement="t_send_offer">
+        <dc:Bounds x="1825" y="563" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_revise_offer" bpmnElement="t_revise_offer">
+        <dc:Bounds x="2055" y="655" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_collect_docs" bpmnElement="t_collect_docs">
+        <dc:Bounds x="2305" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_create_account" bpmnElement="t_create_account">
+        <dc:Bounds x="2615" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_reserve_funds" bpmnElement="t_reserve_funds">
+        <dc:Bounds x="2785" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_check_funding" bpmnElement="t_check_funding">
+        <dc:Bounds x="2860" y="340" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_confirm_payout" bpmnElement="t_confirm_payout">
+        <dc:Bounds x="2985" y="505" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_plan_setup" bpmnElement="t_plan_setup">
+        <dc:Bounds x="3099" y="235" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_send_notice" bpmnElement="t_send_notice">
+        <dc:Bounds x="3105" y="655" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_book_loan" bpmnElement="t_book_loan">
+        <dc:Bounds x="3295" y="563" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_audit_case" bpmnElement="t_audit_case">
+        <dc:Bounds x="3195" y="398" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_one" bpmnElement="t_monitor_one">
+        <dc:Bounds x="4125" y="250" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_two" bpmnElement="t_monitor_two">
+        <dc:Bounds x="4335" y="250" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_three" bpmnElement="t_monitor_three">
+        <dc:Bounds x="4565" y="250" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_four" bpmnElement="t_monitor_four">
+        <dc:Bounds x="3965" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_five" bpmnElement="t_monitor_five">
+        <dc:Bounds x="4205" y="455" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_six" bpmnElement="t_monitor_six">
+        <dc:Bounds x="4395" y="460" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_seven" bpmnElement="t_monitor_seven">
+        <dc:Bounds x="3271" y="305" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_eight" bpmnElement="t_monitor_eight">
+        <dc:Bounds x="3425" y="305" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_monitor_nine" bpmnElement="t_monitor_nine">
+        <dc:Bounds x="3565" y="305" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_update_risk" bpmnElement="t_update_risk">
+        <dc:Bounds x="4825" y="470" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_call_client" bpmnElement="t_call_client">
+        <dc:Bounds x="4995" y="470" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_add_notes" bpmnElement="t_add_notes">
+        <dc:Bounds x="5165" y="470" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_final_review" bpmnElement="t_final_review">
+        <dc:Bounds x="5385" y="563" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_reopen_case" bpmnElement="t_reopen_case">
+        <dc:Bounds x="5345" y="155" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_cancel_loan" bpmnElement="t_cancel_loan">
+        <dc:Bounds x="5745" y="305" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_t_approve_loan" bpmnElement="t_approve_loan">
+        <dc:Bounds x="5735" y="571" width="110" height="70" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_1aey4io_di" bpmnElement="Gateway_1aey4io" isMarkerVisible="true">
+        <dc:Bounds x="1600" y="465" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_0pyvuzm_di" bpmnElement="t_verify_docs">
+        <dc:Bounds x="2455" y="455" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_0klrmru_di" bpmnElement="t_verify_terms">
+        <dc:Bounds x="2075" y="455" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Activity_1h4u8av_di" bpmnElement="t_identity_check">
+        <dc:Bounds x="765" y="505" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_1nwy75l_di" bpmnElement="Gateway_1nwy75l" isMarkerVisible="true">
+        <dc:Bounds x="3129" y="515" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_1vrc5r2_di" bpmnElement="Gateway_1vrc5r2" isMarkerVisible="true">
+        <dc:Bounds x="3695" y="500" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_1bubwgd_di" bpmnElement="Gateway_0o2t3y3">
+        <dc:Bounds x="3775" y="495" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_18vshse_di" bpmnElement="Gateway_12kjk7i">
+        <dc:Bounds x="4715" y="480" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_0wmk0lv" bpmnElement="t_Notify_Client">
+        <dc:Bounds x="5915" y="305" width="110" height="70" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Shape_start_evt" bpmnElement="start_evt">
+        <dc:Bounds x="-8" y="338" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="-2" y="390" width="24" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BPMNShape_12qeg3h" bpmnElement="SaveCase_action">
+        <dc:Bounds x="65" y="321" width="110" height="70" />
+        <bpmndi:BPMNLabel />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Edge_sf001" bpmnElement="sf001">
+        <di:waypoint x="28" y="356" />
+        <di:waypoint x="65" y="356" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf003" bpmnElement="sf003">
+        <di:waypoint x="300" y="351" />
+        <di:waypoint x="300" y="170" />
+        <di:waypoint x="335" y="170" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf004" bpmnElement="sf004">
+        <di:waypoint x="445" y="170" />
+        <di:waypoint x="520" y="170" />
+        <di:waypoint x="520" y="365" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf005" bpmnElement="sf005">
+        <di:waypoint x="520" y="415" />
+        <di:waypoint x="520" y="607" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf006" bpmnElement="sf006">
+        <di:waypoint x="465" y="642" />
+        <di:waypoint x="401" y="642" />
+        <di:waypoint x="401" y="641" />
+        <di:waypoint x="336" y="641" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf007" bpmnElement="sf007">
+        <di:waypoint x="545" y="390" />
+        <di:waypoint x="620" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf008" bpmnElement="sf008">
+        <di:waypoint x="645" y="365" />
+        <di:waypoint x="645" y="255" />
+        <di:waypoint x="720" y="255" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf009" bpmnElement="sf009">
+        <di:waypoint x="670" y="390" />
+        <di:waypoint x="713" y="390" />
+        <di:waypoint x="713" y="392" />
+        <di:waypoint x="755" y="392" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf010" bpmnElement="sf010">
+        <di:waypoint x="645" y="415" />
+        <di:waypoint x="645" y="540" />
+        <di:waypoint x="765" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf011" bpmnElement="sf011">
+        <di:waypoint x="830" y="255" />
+        <di:waypoint x="885" y="255" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf012" bpmnElement="sf012">
+        <di:waypoint x="995" y="255" />
+        <di:waypoint x="1040" y="255" />
+        <di:waypoint x="1040" y="365" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf013" bpmnElement="sf013">
+        <di:waypoint x="865" y="392" />
+        <di:waypoint x="940" y="392" />
+        <di:waypoint x="940" y="390" />
+        <di:waypoint x="1015" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf014" bpmnElement="sf014">
+        <di:waypoint x="865" y="540" />
+        <di:waypoint x="1040" y="540" />
+        <di:waypoint x="1040" y="415" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf015" bpmnElement="sf015">
+        <di:waypoint x="1065" y="390" />
+        <di:waypoint x="1120" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf016" bpmnElement="sf016">
+        <di:waypoint x="1230" y="390" />
+        <di:waypoint x="1260" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf017" bpmnElement="sf017">
+        <di:waypoint x="1285" y="365" />
+        <di:waypoint x="1285" y="270" />
+        <di:waypoint x="1380" y="270" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf018" bpmnElement="sf018">
+        <di:waypoint x="1490" y="270" />
+        <di:waypoint x="1562" y="270" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf019" bpmnElement="sf019">
+        <di:waypoint x="1285" y="415" />
+        <di:waypoint x="1285" y="490" />
+        <di:waypoint x="1305" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf020" bpmnElement="sf020">
+        <di:waypoint x="1415" y="490" />
+        <di:waypoint x="1455" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf022" bpmnElement="sf022">
+        <di:waypoint x="1710" y="465" />
+        <di:waypoint x="1710" y="390" />
+        <di:waypoint x="1775" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf023" bpmnElement="sf023">
+        <di:waypoint x="1710" y="515" />
+        <di:waypoint x="1710" y="598" />
+        <di:waypoint x="1825" y="598" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf024" bpmnElement="sf024">
+        <di:waypoint x="1885" y="390" />
+        <di:waypoint x="1990" y="390" />
+        <di:waypoint x="1990" y="465" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf025" bpmnElement="sf025">
+        <di:waypoint x="1935" y="598" />
+        <di:waypoint x="1990" y="598" />
+        <di:waypoint x="1990" y="515" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf026" bpmnElement="sf026">
+        <di:waypoint x="2015" y="490" />
+        <di:waypoint x="2075" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf027" bpmnElement="sf027">
+        <di:waypoint x="2175" y="490" />
+        <di:waypoint x="2211" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf028" bpmnElement="sf028">
+        <di:waypoint x="2236" y="515" />
+        <di:waypoint x="2236" y="690" />
+        <di:waypoint x="2165" y="690" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf029" bpmnElement="sf029">
+        <di:waypoint x="2055" y="690" />
+        <di:waypoint x="1625" y="690" />
+        <di:waypoint x="1625" y="515" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf030" bpmnElement="sf030">
+        <di:waypoint x="2261" y="490" />
+        <di:waypoint x="2305" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf031" bpmnElement="sf031">
+        <di:waypoint x="2415" y="490" />
+        <di:waypoint x="2455" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf034" bpmnElement="sf034">
+        <di:waypoint x="2840" y="455" />
+        <di:waypoint x="2840" y="433" />
+        <di:waypoint x="2915" y="433" />
+        <di:waypoint x="2915" y="410" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf035" bpmnElement="sf035">
+        <di:waypoint x="2915" y="410" />
+        <di:waypoint x="2915" y="458" />
+        <di:waypoint x="3040" y="458" />
+        <di:waypoint x="3040" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf036" bpmnElement="sf036">
+        <di:waypoint x="3154" y="515" />
+        <di:waypoint x="3154" y="305" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf037" bpmnElement="sf037">
+        <di:waypoint x="3154" y="565" />
+        <di:waypoint x="3154" y="595" />
+        <di:waypoint x="3160" y="595" />
+        <di:waypoint x="3160" y="655" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf044" bpmnElement="sf044">
+        <di:waypoint x="4075" y="490" />
+        <di:waypoint x="4205" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf045" bpmnElement="sf045">
+        <di:waypoint x="4315" y="490" />
+        <di:waypoint x="4355" y="490" />
+        <di:waypoint x="4355" y="495" />
+        <di:waypoint x="4395" y="495" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf051" bpmnElement="sf051">
+        <di:waypoint x="4935" y="505" />
+        <di:waypoint x="4995" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf052" bpmnElement="sf052">
+        <di:waypoint x="5105" y="505" />
+        <di:waypoint x="5165" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf054" bpmnElement="sf054">
+        <di:waypoint x="5440" y="563" />
+        <di:waypoint x="5440" y="503" />
+        <di:waypoint x="5460" y="503" />
+        <di:waypoint x="5460" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf055" bpmnElement="sf055">
+        <di:waypoint x="5460" y="430" />
+        <di:waypoint x="5460" y="348" />
+        <di:waypoint x="5400" y="348" />
+        <di:waypoint x="5400" y="225" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf057" bpmnElement="sf057">
+        <di:waypoint x="5485" y="455" />
+        <di:waypoint x="5625" y="455" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf058" bpmnElement="sf058">
+        <di:waypoint x="5650" y="430" />
+        <di:waypoint x="5650" y="340" />
+        <di:waypoint x="5745" y="340" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf059" bpmnElement="sf059">
+        <di:waypoint x="5650" y="480" />
+        <di:waypoint x="5650" y="606" />
+        <di:waypoint x="5735" y="606" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf060" bpmnElement="sf060">
+        <di:waypoint x="5855" y="340" />
+        <di:waypoint x="5915" y="340" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Edge_sf061" bpmnElement="sf061">
+        <di:waypoint x="5845" y="606" />
+        <di:waypoint x="5930" y="606" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0v5c7g2_di" bpmnElement="Flow_0v5c7g2">
+        <di:waypoint x="5345" y="189" />
+        <di:waypoint x="280" y="80" />
+        <di:waypoint x="280" y="331" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1wnhlfz_di" bpmnElement="Flow_1wnhlfz">
+        <di:waypoint x="281" y="606" />
+        <di:waypoint x="281" y="494" />
+        <di:waypoint x="280" y="494" />
+        <di:waypoint x="280" y="381" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1a9u135_di" bpmnElement="Flow_1a9u135">
+        <di:waypoint x="1565" y="490" />
+        <di:waypoint x="1600" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0fn6ut5_di" bpmnElement="Flow_0fn6ut5">
+        <di:waypoint x="1650" y="490" />
+        <di:waypoint x="1685" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1u33k54_di" bpmnElement="Flow_1u33k54">
+        <di:waypoint x="2725" y="490" />
+        <di:waypoint x="2785" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1jqa1zq_di" bpmnElement="Flow_1jqa1zq">
+        <di:waypoint x="2555" y="490" />
+        <di:waypoint x="2615" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1f54aco_di" bpmnElement="Flow_1f54aco">
+        <di:waypoint x="3095" y="540" />
+        <di:waypoint x="3129" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_18y3nak_di" bpmnElement="Flow_18y3nak">
+        <di:waypoint x="3179" y="540" />
+        <di:waypoint x="3225" y="540" />
+        <di:waypoint x="3225" y="598" />
+        <di:waypoint x="3295" y="598" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1mpz582_di" bpmnElement="Flow_1mpz582">
+        <di:waypoint x="3154" y="515" />
+        <di:waypoint x="3154" y="433" />
+        <di:waypoint x="3195" y="433" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0rto5xu_di" bpmnElement="Flow_0rto5xu">
+        <di:waypoint x="3209" y="270" />
+        <di:waypoint x="3720" y="270" />
+        <di:waypoint x="3720" y="500" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0zf0kns_di" bpmnElement="Flow_0zf0kns">
+        <di:waypoint x="3405" y="598" />
+        <di:waypoint x="3720" y="598" />
+        <di:waypoint x="3720" y="550" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1sl8ttk_di" bpmnElement="Flow_1sl8ttk">
+        <di:waypoint x="3215" y="690" />
+        <di:waypoint x="3720" y="690" />
+        <di:waypoint x="3720" y="550" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_02ogu8o_di" bpmnElement="Flow_02ogu8o">
+        <di:waypoint x="3745" y="525" />
+        <di:waypoint x="3760" y="525" />
+        <di:waypoint x="3760" y="520" />
+        <di:waypoint x="3775" y="520" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1lrsbky_di" bpmnElement="Flow_1lrsbky">
+        <di:waypoint x="3800" y="495" />
+        <di:waypoint x="3800" y="285" />
+        <di:waypoint x="4125" y="285" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1m1w58w_di" bpmnElement="Flow_1m1w58w">
+        <di:waypoint x="3381" y="340" />
+        <di:waypoint x="3425" y="340" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_05ov117_di" bpmnElement="Flow_05ov117">
+        <di:waypoint x="4235" y="285" />
+        <di:waypoint x="4335" y="285" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1lyyivr_di" bpmnElement="Flow_1lyyivr">
+        <di:waypoint x="4445" y="285" />
+        <di:waypoint x="4565" y="285" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_19c82pp_di" bpmnElement="Flow_19c82pp">
+        <di:waypoint x="3535" y="340" />
+        <di:waypoint x="3565" y="340" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1ghytln_di" bpmnElement="Flow_1ghytln">
+        <di:waypoint x="4675" y="285" />
+        <di:waypoint x="4740" y="285" />
+        <di:waypoint x="4740" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_09t7uai_di" bpmnElement="Flow_09t7uai">
+        <di:waypoint x="4505" y="495" />
+        <di:waypoint x="4610" y="495" />
+        <di:waypoint x="4610" y="505" />
+        <di:waypoint x="4715" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0r8mvu7_di" bpmnElement="Flow_0r8mvu7">
+        <di:waypoint x="4765" y="505" />
+        <di:waypoint x="4825" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_05e753g_di" bpmnElement="Flow_05e753g">
+        <di:waypoint x="5275" y="505" />
+        <di:waypoint x="5330" y="505" />
+        <di:waypoint x="5330" y="598" />
+        <di:waypoint x="5385" y="598" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1tdmx2o_di" bpmnElement="Flow_1tdmx2o">
+        <di:waypoint x="3825" y="520" />
+        <di:waypoint x="3895" y="520" />
+        <di:waypoint x="3895" y="490" />
+        <di:waypoint x="3965" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_107ezet_di" bpmnElement="Flow_107ezet">
+        <di:waypoint x="3250" y="398" />
+        <di:waypoint x="3250" y="387" />
+        <di:waypoint x="3326" y="387" />
+        <di:waypoint x="3326" y="375" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_1r4cdje_di" bpmnElement="Flow_1r4cdje">
+        <di:waypoint x="3675" y="340" />
+        <di:waypoint x="3720" y="340" />
+        <di:waypoint x="3720" y="500" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0r6sy1j_di" bpmnElement="Flow_0r6sy1j">
+        <di:waypoint x="6025" y="340" />
+        <di:waypoint x="6064" y="340" />
+        <di:waypoint x="6064" y="356" />
+        <di:waypoint x="6102" y="356" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_0feqwym_di" bpmnElement="Flow_0feqwym">
+        <di:waypoint x="175" y="356" />
+        <di:waypoint x="255" y="356" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>
